@@ -1,0 +1,38 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 240 200" role="img" aria-label="Primewave">
+  <defs>
+    <linearGradient id="pw-grad" x1="0" y1="200" x2="240" y2="0" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#5B2A9E"/>
+      <stop offset="35%" stop-color="#3E5FCC"/>
+      <stop offset="70%" stop-color="#2F8FD6"/>
+      <stop offset="100%" stop-color="#2BC8E5"/>
+    </linearGradient>
+    <linearGradient id="pw-grad-light" x1="0" y1="200" x2="240" y2="0" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#7B49B5" stop-opacity="0.55"/>
+      <stop offset="60%" stop-color="#4FA3DD" stop-opacity="0.45"/>
+      <stop offset="100%" stop-color="#5FD5EC" stop-opacity="0.55"/>
+    </linearGradient>
+  </defs>
+
+  <!-- Stylised ribbon "A" — placeholder for the Primewave mark.
+       Replace frontend/assets/logo.svg (or logo.png and update index.html) with the real asset. -->
+  <g transform="translate(10,5)">
+    <path d="
+      M 18 180
+      L 95 22
+      Q 110 -2 132 14
+      Q 196 60 210 130
+      Q 200 168 156 168
+      Q 120 165 98 138
+      L 78 110
+      Z"
+      fill="url(#pw-grad)"/>
+    <path d="
+      M 95 22
+      Q 110 -2 132 14
+      Q 165 38 188 80
+      Q 168 92 138 78
+      Q 118 64 102 40
+      Z"
+      fill="url(#pw-grad-light)"/>
+  </g>
+</svg>

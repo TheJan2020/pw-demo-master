@@ -1,0 +1,14 @@
+# Default: normalise to LF in repo, OS-native on checkout via core.autocrlf
+* text=auto eol=lf
+
+# Windows-only scripts must keep CRLF on disk
+*.bat text eol=crlf
+*.ps1 text eol=crlf
+*.cmd text eol=crlf
+
+# Binary files
+*.png  binary
+*.jpg  binary
+*.jpeg binary
+*.mp4  binary
+*.svg  text

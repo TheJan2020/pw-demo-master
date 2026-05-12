@@ -1,0 +1,162 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="light">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Primewave · Demo Master</title>
+  <link rel="icon" type="image/svg+xml" href="/assets/favicon.svg" />
+  <link rel="stylesheet" href="/styles.css" />
+</head>
+<body>
+  <div class="app">
+    <aside class="sidebar" id="sidebar">
+      <div class="brand">
+        <img class="brand-logo" src="/assets/logo.svg" alt="Primewave" />
+        <div class="brand-text">
+          <div class="brand-title">Primewave</div>
+          <div class="brand-sub">Demo Master</div>
+        </div>
+      </div>
+
+      <nav class="nav">
+        <a href="#/home" class="nav-item" data-route="home" title="Home">
+          <span class="nav-icon" aria-hidden="true">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 11l9-8 9 8"/><path d="M5 10v10h14V10"/></svg>
+          </span>
+          <span class="nav-label">Home</span>
+        </a>
+
+        <div class="nav-group" data-group="frigate">
+          <button class="nav-item nav-toggle" data-toggle="frigate" title="Frigate">
+            <span class="nav-icon" aria-hidden="true">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="6" width="14" height="12" rx="2"/><path d="M16 10l6-3v10l-6-3z"/></svg>
+            </span>
+            <span class="nav-label">Frigate</span>
+            <span class="nav-caret" aria-hidden="true">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="6 9 12 15 18 9"/></svg>
+            </span>
+          </button>
+          <div class="nav-children">
+            <a href="#/frigate/home" class="nav-item nav-child" data-route="frigate/home">
+              <span class="nav-label">Home</span>
+            </a>
+            <a href="#/frigate/events" class="nav-item nav-child" data-route="frigate/events">
+              <span class="nav-label">Events</span>
+            </a>
+          </div>
+        </div>
+
+        <div class="nav-group" data-group="ai-camera">
+          <button class="nav-item nav-toggle" data-toggle="ai-camera" title="AI-Camera">
+            <span class="nav-icon" aria-hidden="true">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="6" width="14" height="12" rx="2"/><circle cx="10" cy="12" r="3"/><path d="M17 9l4-2v10l-4-2z"/></svg>
+            </span>
+            <span class="nav-label">AI-Camera</span>
+            <span class="nav-caret" aria-hidden="true">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="6 9 12 15 18 9"/></svg>
+            </span>
+          </button>
+          <div class="nav-children">
+            <a href="#/ai-camera/main"       class="nav-item nav-child" data-route="ai-camera/main"><span class="nav-label">Main</span></a>
+            <a href="#/ai-camera/rules"      class="nav-item nav-child" data-route="ai-camera/rules"><span class="nav-label">Rules</span></a>
+            <a href="#/ai-camera/playground" class="nav-item nav-child" data-route="ai-camera/playground"><span class="nav-label">Playground</span></a>
+          </div>
+        </div>
+
+        <div class="nav-group" data-group="smart-home">
+          <button class="nav-item nav-toggle" data-toggle="smart-home" title="Smart Home">
+            <span class="nav-icon" aria-hidden="true">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 11l9-8 9 8"/><path d="M5 10v10h14V10"/><path d="M10 20v-6h4v6"/></svg>
+            </span>
+            <span class="nav-label">Smart Home</span>
+            <span class="nav-caret" aria-hidden="true">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="6 9 12 15 18 9"/></svg>
+            </span>
+          </button>
+          <div class="nav-children">
+            <a href="#/smart-home/main" class="nav-item nav-child" data-route="smart-home/main">
+              <span class="nav-label">Main</span>
+            </a>
+            <a href="#/smart-home/test" class="nav-item nav-child" data-route="smart-home/test">
+              <span class="nav-label">Test</span>
+            </a>
+            <a href="#/smart-home/live-agent" class="nav-item nav-child" data-route="smart-home/live-agent">
+              <span class="nav-label">Live Agent</span>
+            </a>
+          </div>
+        </div>
+
+        <a href="#/settings" class="nav-item" data-route="settings" title="Settings">
+          <span class="nav-icon" aria-hidden="true">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.7 1.7 0 0 0 .3 1.8l.1.1a2 2 0 1 1-2.8 2.8l-.1-.1a1.7 1.7 0 0 0-1.8-.3 1.7 1.7 0 0 0-1 1.5V21a2 2 0 1 1-4 0v-.1a1.7 1.7 0 0 0-1-1.5 1.7 1.7 0 0 0-1.8.3l-.1.1a2 2 0 1 1-2.8-2.8l.1-.1a1.7 1.7 0 0 0 .3-1.8 1.7 1.7 0 0 0-1.5-1H3a2 2 0 1 1 0-4h.1a1.7 1.7 0 0 0 1.5-1 1.7 1.7 0 0 0-.3-1.8l-.1-.1a2 2 0 1 1 2.8-2.8l.1.1a1.7 1.7 0 0 0 1.8.3 1.7 1.7 0 0 0 1-1.5V3a2 2 0 1 1 4 0v.1a1.7 1.7 0 0 0 1 1.5 1.7 1.7 0 0 0 1.8-.3l.1-.1a2 2 0 1 1 2.8 2.8l-.1.1a1.7 1.7 0 0 0-.3 1.8 1.7 1.7 0 0 0 1.5 1H21a2 2 0 1 1 0 4h-.1a1.7 1.7 0 0 0-1.5 1z"/></svg>
+          </span>
+          <span class="nav-label">Settings</span>
+        </a>
+      </nav>
+
+      <div class="sidebar-footer">
+        <button class="icon-btn" id="sidebar-toggle" title="Collapse sidebar" aria-label="Collapse sidebar">
+          <svg class="ic-collapse" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="15 18 9 12 15 6"/></svg>
+          <svg class="ic-expand" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="9 18 15 12 9 6"/></svg>
+        </button>
+        <span class="footer-version">v0.2</span>
+      </div>
+    </aside>
+
+    <div class="main">
+      <header class="topbar">
+        <div class="topbar-left">
+          <button class="icon-btn" id="sidebar-toggle-mobile" title="Toggle sidebar" aria-label="Toggle sidebar">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="3" y1="6" x2="21" y2="6"/><line x1="3" y1="12" x2="21" y2="12"/><line x1="3" y1="18" x2="21" y2="18"/></svg>
+          </button>
+          <div class="topbar-title" id="page-title">Home</div>
+        </div>
+        <div class="topbar-right">
+          <div class="status-pill" id="frigate-status">
+            <span class="status-dot" id="frigate-dot"></span>
+            <span class="status-label">Frigate:</span>
+            <span class="status-text" id="frigate-status-text">Not configured</span>
+          </div>
+          <div class="status-pill" id="ha-status">
+            <span class="status-dot" id="ha-dot"></span>
+            <span class="status-label">HA:</span>
+            <span class="status-text" id="ha-status-text">Not configured</span>
+          </div>
+          <div class="status-pill" id="mqtt-status">
+            <span class="status-dot" id="mqtt-dot"></span>
+            <span class="status-label">MQTT:</span>
+            <span class="status-text" id="mqtt-status-text">Not configured</span>
+          </div>
+          <button class="icon-btn" id="theme-toggle" title="Toggle theme" aria-label="Toggle theme">
+            <svg class="ic-sun" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.93 4.93l1.41 1.41M17.66 17.66l1.41 1.41M2 12h2M20 12h2M4.93 19.07l1.41-1.41M17.66 6.34l1.41-1.41"/></svg>
+            <svg class="ic-moon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/></svg>
+          </button>
+        </div>
+      </header>
+
+      <main class="content" id="content"></main>
+    </div>
+  </div>
+
+  <div class="modal-backdrop" id="modal-backdrop" hidden>
+    <div class="modal" role="dialog" aria-modal="true" aria-labelledby="modal-title">
+      <header class="modal-header">
+        <div>
+          <div class="modal-title" id="modal-title">Camera</div>
+          <div class="modal-sub" id="modal-sub"></div>
+        </div>
+        <div class="modal-actions">
+          <a class="btn secondary" id="modal-open-frigate" target="_blank" rel="noopener">Open in Frigate</a>
+          <button class="icon-btn" id="modal-close" title="Close" aria-label="Close">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
+          </button>
+        </div>
+      </header>
+      <div class="modal-body" id="modal-body"></div>
+    </div>
+  </div>
+
+  <script src="/live-agent.js"></script>
+  <script src="/app.js"></script>
+</body>
+</html>
