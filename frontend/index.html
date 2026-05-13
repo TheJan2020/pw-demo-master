@@ -60,6 +60,7 @@
             <a href="#/ai-camera/main"       class="nav-item nav-child" data-route="ai-camera/main"><span class="nav-label">Main</span></a>
             <a href="#/ai-camera/rules"      class="nav-item nav-child" data-route="ai-camera/rules"><span class="nav-label">Rules</span></a>
             <a href="#/ai-camera/playground" class="nav-item nav-child" data-route="ai-camera/playground"><span class="nav-label">Playground</span></a>
+            <a href="#/ai-camera/test-model"  class="nav-item nav-child" data-route="ai-camera/test-model"><span class="nav-label">Test AI Model</span></a>
           </div>
         </div>
 
@@ -83,6 +84,21 @@
             <a href="#/smart-home/live-agent" class="nav-item nav-child" data-route="smart-home/live-agent">
               <span class="nav-label">Live Agent</span>
             </a>
+          </div>
+        </div>
+
+        <div class="nav-group" data-group="sip">
+          <button class="nav-item nav-toggle" data-toggle="sip" title="SIP Phone">
+            <span class="nav-icon" aria-hidden="true">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M22 16.92v3a2 2 0 0 1-2.18 2 19.79 19.79 0 0 1-8.63-3.07 19.5 19.5 0 0 1-6-6 19.79 19.79 0 0 1-3.07-8.67A2 2 0 0 1 4.11 2h3a2 2 0 0 1 2 1.72c.13.96.37 1.9.7 2.81a2 2 0 0 1-.45 2.11L8.09 9.91a16 16 0 0 0 6 6l1.27-1.27a2 2 0 0 1 2.11-.45c.91.33 1.85.57 2.81.7A2 2 0 0 1 22 16.92z"/></svg>
+            </span>
+            <span class="nav-label">SIP Phone</span>
+            <span class="nav-caret" aria-hidden="true">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="6 9 12 15 18 9"/></svg>
+            </span>
+          </button>
+          <div class="nav-children">
+            <a href="#/sip/extension" class="nav-item nav-child" data-route="sip/extension"><span class="nav-label">Extension</span></a>
           </div>
         </div>
 
@@ -127,6 +143,11 @@
             <span class="status-label">MQTT:</span>
             <span class="status-text" id="mqtt-status-text">Not configured</span>
           </div>
+          <div class="status-pill" id="sip-status">
+            <span class="status-dot" id="sip-dot"></span>
+            <span class="status-label">SIP:</span>
+            <span class="status-text" id="sip-status-text">Not configured</span>
+          </div>
           <button class="icon-btn" id="theme-toggle" title="Toggle theme" aria-label="Toggle theme">
             <svg class="ic-sun" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.93 4.93l1.41 1.41M17.66 17.66l1.41 1.41M2 12h2M20 12h2M4.93 19.07l1.41-1.41M17.66 6.34l1.41-1.41"/></svg>
             <svg class="ic-moon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/></svg>
@@ -156,6 +177,10 @@
     </div>
   </div>
 
+  <!-- JsSIP — browser-side SIP client used by the SIP Phone → Extension page.
+       Pinned to a specific minor so a CDN side-effect can't break the demo. -->
+  <script src="https://cdn.jsdelivr.net/npm/jssip@3.10.1/dist/jssip.min.js"></script>
+  <script src="/sip-phone.js"></script>
   <script src="/live-agent.js"></script>
   <script src="/app.js"></script>
 </body>

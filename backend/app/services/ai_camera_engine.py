@@ -104,6 +104,10 @@ _DEFAULT_RULE_FIELDS: dict[str, Any] = {
     # "use Gemini auto-resolved" (back-compat with rules created before
     # multi-provider support landed).
     "model": "",
+    # Sustained-trigger duration: the action only fires when the model has
+    # said triggered=true continuously for this many seconds. 0 = legacy
+    # behaviour (fire on first true verdict).
+    "min_duration_s": 0,
 }
 
 
@@ -127,6 +131,10 @@ def _normalize_rule(rule: dict) -> dict:
         out["cooldown_s"] = float(out.get("cooldown_s") or 0)
     except (TypeError, ValueError):
         out["cooldown_s"] = 0.0
+    try:
+        out["min_duration_s"] = max(0, int(out.get("min_duration_s") or 0))
+    except (TypeError, ValueError):
+        out["min_duration_s"] = 0
     return out
 
 
@@ -221,6 +229,35 @@ def _append_jsonl(path: Path, entry: dict) -> None:
             f.write(json.dumps(entry, separators=(",", ":")) + "\n")
     except Exception:
         logger.exception("append jsonl failed: %s", path)
+
+
+def _replace_last_jsonl(path: Path, entry: dict) -> None:
+    """Replace the last line of a JSONL file with `entry`. Used to grow a
+    trigger episode in place as new sustained iterations come in. Atomic via
+    a side-by-side rewrite.
+
+    No-op (falls back to append) if the file doesn't yet exist."""
+    line = json.dumps(entry, separators=(",", ":")) + "\n"
+    if not path.exists():
+        try:
+            with path.open("w", encoding="utf-8") as f:
+                f.write(line)
+        except Exception:
+            logger.exception("replace_last jsonl create failed: %s", path)
+        return
+    try:
+        with path.open("r", encoding="utf-8") as f:
+            lines = f.readlines()
+        if not lines:
+            lines = [line]
+        else:
+            lines[-1] = line
+        tmp = path.with_suffix(path.suffix + ".tmp")
+        with tmp.open("w", encoding="utf-8") as f:
+            f.writelines(lines)
+        tmp.replace(path)
+    except Exception:
+        logger.exception("replace_last jsonl failed: %s", path)
 
 
 def _read_jsonl_desc(path: Path, offset: int, limit: int) -> tuple[list[dict], int]:
@@ -429,6 +466,13 @@ class _RulesRunContext:
         self.cameras = list(cameras or [])
         self.mode = (scan.get("mode") or "periodic").lower()
         self.period_s = max(1, int(scan.get("period_s") or 30))
+        # Faster scan rate used while a sustained candidate is in flight, so
+        # we don't miss the moment the condition flips back off and we don't
+        # take ages to confirm continuity.
+        self.quick_period_s = max(2, min(5, self.period_s))
+        # Flipped on by _rule_session whenever the sustained-state machine has
+        # an open candidate. _rules_trigger_stream reads this on each tick.
+        self.sustained_candidate: bool = False
 
         # periodic
         self.last_scan_monotonic: Optional[float] = None
@@ -467,7 +511,18 @@ async def _rules_trigger_stream(ctx: _RulesRunContext):
         ctx.last_scan_monotonic = time.monotonic()
         yield "initial"
         while True:
-            await asyncio.sleep(ctx.period_s)
+            # Sleep in 0.5s slices so a sustained candidate can shorten the
+            # next iteration without waiting out the original full period.
+            sleep_until = time.monotonic() + (
+                ctx.quick_period_s if ctx.sustained_candidate else ctx.period_s
+            )
+            while time.monotonic() < sleep_until:
+                await asyncio.sleep(0.5)
+                # If a candidate just opened/closed, recompute the deadline.
+                target = ctx.quick_period_s if ctx.sustained_candidate else ctx.period_s
+                new_deadline = (ctx.last_scan_monotonic or time.monotonic()) + target
+                if new_deadline < sleep_until:
+                    sleep_until = new_deadline
             ctx.last_scan_monotonic = time.monotonic()
             yield "periodic"
         return
@@ -571,6 +626,20 @@ async def _rule_session(rule_id: str) -> None:
     iter_id = _next_iteration_id(rule_id)
     last_action_ts = 0.0
 
+    # Sustained-trigger state machine.
+    #   triggered_since: monotonic when the *current run* of true verdicts began
+    #   sustained_fired: True once the action has fired for this run (prevents
+    #                    re-firing every subsequent confirming scan).
+    #   current_episode: while triggered=true continues, buffer the per-
+    #                    iteration metadata here. The trigger row in
+    #                    triggers.jsonl is the same dict; we rewrite its
+    #                    tail line as the episode grows so reload-from-disk
+    #                    matches what the live UI sees.
+    # A single triggered=false verdict resets all three.
+    triggered_since: Optional[float] = None
+    sustained_fired: bool = False
+    current_episode: Optional[dict] = None
+
     countdown_task = asyncio.create_task(
         _emit_countdown_loop(rule_id, ctx),
         name=f"ai_rule_countdown:{rule_id}",
@@ -644,8 +713,136 @@ async def _rule_session(rule_id: str) -> None:
                 "ts": entry["ts"],
             })
 
+            # ----- Sustained-trigger state machine -----------------------
+            # Pull min_duration_s live so changes via the API take effect on
+            # the very next iteration without restarting the task.
+            try:
+                min_duration_s = max(0, int(rule.get("min_duration_s") or 0))
+            except (TypeError, ValueError):
+                min_duration_s = 0
+
+            now_m = time.monotonic()
+
             if triggered:
-                _append_jsonl(_rule_dir(rule_id) / "triggers.jsonl", entry)
+                if triggered_since is None:
+                    triggered_since = now_m
+                    sustained_fired = False
+                elapsed = now_m - triggered_since
+                # We treat the rule as "sustained" the moment we've seen the
+                # condition true for min_duration_s of monotonic time. With
+                # min_duration_s == 0 this is true on the first hit, matching
+                # legacy behaviour.
+                is_sustained = elapsed >= min_duration_s
+                # Open a candidate when we need confirmation; close it the
+                # moment we've fired so the scan rate can relax.
+                ctx.sustained_candidate = (min_duration_s > 0) and not is_sustained
+            else:
+                triggered_since = None
+                sustained_fired = False
+                ctx.sustained_candidate = False
+                is_sustained = False
+
+            # Broadcast per-iteration progress so the UI can show "candidate
+            # detected, sustaining for Ns / Ms".
+            if triggered and min_duration_s > 0 and triggered_since is not None:
+                _broadcast({
+                    "type": "sustained_progress",
+                    "rule_id": rule_id,
+                    "rule_name": rule.get("name") or rule_id,
+                    "iteration_id": iter_id,
+                    "min_duration_s": min_duration_s,
+                    "elapsed_s": int(round(now_m - triggered_since)),
+                    "remaining_s": max(0, int(round(min_duration_s - (now_m - triggered_since)))),
+                    "sustained": bool(is_sustained),
+                    "ts": entry["ts"],
+                })
+            elif not triggered and triggered_since is None and min_duration_s > 0:
+                # Explicit "reset" event lets the UI clear any candidate chip.
+                _broadcast({
+                    "type": "sustained_reset",
+                    "rule_id": rule_id,
+                    "ts": entry["ts"],
+                })
+
+            # ----- Trigger episode (one row per continuous run of trues) ---
+            triggers_path = _rule_dir(rule_id) / "triggers.jsonl"
+
+            # Per-iteration record we attach to the episode. Includes the
+            # bbox the model returned (if any) so the UI can draw it later.
+            parsed_bbox = parsed.get("bbox") if isinstance(parsed, dict) else None
+            iter_entry = {
+                "iteration_id": iter_id,
+                "ts": entry["ts"],
+                "trigger_reason": reason,
+                "verdict_reason": verdict_reason,
+                "cameras": entry["cameras"],
+                "snap_cams": saved_cams,
+                "bbox": parsed_bbox,
+            }
+
+            if not triggered:
+                # Run ended (or was never started). Reset episode state so the
+                # next true verdict starts a fresh row.
+                if current_episode is not None:
+                    _broadcast({
+                        "type": "trigger_complete",
+                        "rule_id": rule_id,
+                        "episode_id": current_episode["episode_id"],
+                        "iterations": len(current_episode.get("sequence") or []),
+                        "ts": entry["ts"],
+                    })
+                current_episode = None
+            elif not is_sustained:
+                # Candidate phase — model says true but we haven't crossed
+                # min_duration_s yet. Don't write a trigger row yet, just
+                # buffer the iteration so it becomes part of the row when we
+                # do cross the threshold.
+                if current_episode is None:
+                    current_episode = {
+                        "episode_id": f"ep_{int(time.time()*1000)}_{iter_id}",
+                        "rule_id": rule_id,
+                        "rule_name": rule.get("name") or rule_id,
+                        "started_ts": entry["ts"],
+                        "trigger_reason": reason,
+                        "verdict_reason": verdict_reason,
+                        "min_duration_s": min_duration_s,
+                        "provider": result.get("provider"),
+                        "model": result.get("model"),
+                        "sequence": [],
+                    }
+                current_episode["sequence"].append(iter_entry)
+            elif is_sustained and not sustained_fired:
+                # Threshold reached — write the trigger row for the first time
+                # (with the full candidate sequence already inside), fire the
+                # action, broadcast the trigger event.
+                sustained_fired = True
+                if current_episode is None:
+                    # min_duration_s == 0 path: episode begins and fires in
+                    # the same iteration.
+                    current_episode = {
+                        "episode_id": f"ep_{int(time.time()*1000)}_{iter_id}",
+                        "rule_id": rule_id,
+                        "rule_name": rule.get("name") or rule_id,
+                        "started_ts": entry["ts"],
+                        "trigger_reason": reason,
+                        "verdict_reason": verdict_reason,
+                        "min_duration_s": min_duration_s,
+                        "provider": result.get("provider"),
+                        "model": result.get("model"),
+                        "sequence": [],
+                    }
+                current_episode["sequence"].append(iter_entry)
+                # Fields kept up to date on every confirming iteration so the
+                # most recent reason / iteration_id is always at the top level.
+                current_episode["fired_ts"]      = entry["ts"]
+                current_episode["last_ts"]       = entry["ts"]
+                current_episode["iteration_id"]  = iter_id
+                current_episode["verdict_reason"] = verdict_reason
+                current_episode["cameras"]       = entry["cameras"]
+                current_episode["snap_cams"]     = saved_cams
+                current_episode["bbox"]          = parsed_bbox
+
+                _append_jsonl(triggers_path, current_episode)
                 rule["trigger_count"] = int(rule.get("trigger_count", 0)) + 1
                 state.save()
 
@@ -654,12 +851,15 @@ async def _rule_session(rule_id: str) -> None:
                     "rule_id": rule_id,
                     "rule_name": rule.get("name") or rule_id,
                     "fire_alarm": bool(rule.get("fire_alarm")),
+                    "episode_id": current_episode["episode_id"],
                     "iteration_id": iter_id,
                     "trigger_reason": reason,
                     "verdict_reason": verdict_reason,
                     "cameras": entry["cameras"],
                     "snap_cams": saved_cams,
                     "ts": entry["ts"],
+                    "min_duration_s": min_duration_s,
+                    "sequence": current_episode["sequence"],
                 })
 
                 action = rule.get("action")
@@ -675,6 +875,28 @@ async def _rule_session(rule_id: str) -> None:
                             logger.info("rule %s action fired", rule_id)
                         except Exception:
                             logger.exception("rule %s action failed", rule_id)
+            else:
+                # Already-fired episode that's still going. Append this
+                # iteration to the sequence and grow the row in place.
+                if current_episode is not None:
+                    current_episode["sequence"].append(iter_entry)
+                    current_episode["last_ts"]      = entry["ts"]
+                    current_episode["iteration_id"] = iter_id
+                    current_episode["verdict_reason"] = verdict_reason
+                    current_episode["cameras"]      = entry["cameras"]
+                    current_episode["snap_cams"]    = saved_cams
+                    if parsed_bbox:
+                        current_episode["bbox"] = parsed_bbox
+
+                    _replace_last_jsonl(triggers_path, current_episode)
+
+                    _broadcast({
+                        "type": "trigger_update",
+                        "rule_id": rule_id,
+                        "episode_id": current_episode["episode_id"],
+                        "iteration": iter_entry,
+                        "ts": entry["ts"],
+                    })
     finally:
         countdown_task.cancel()
         try:

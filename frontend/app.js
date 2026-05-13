@@ -110,6 +110,12 @@ const Mqtt = {
   getHealth: ()       => Api.getJSON('/api/mqtt/health'),
 };
 
+const Sip = {
+  getConfig: ()       => Api.getJSON('/api/sip/config'),
+  setConfig: (patch)  => Api.postJSON('/api/sip/config', patch),
+  getHealth: ()       => Api.getJSON('/api/sip/health'),
+};
+
 const Ollama = {
   getConfig: () => Api.getJSON('/api/ai-camera/ollama/config'),
   setConfig: (url) => Api.postJSON('/api/ai-camera/ollama/config', { url }),
@@ -151,11 +157,16 @@ function setMqttHealth(status, text) {
   setPillStatus('mqtt', status, text);
 }
 
+function setSipHealth(status, text) {
+  setPillStatus('sip', status, text);
+}
+
 async function refreshHealth() {
-  const [frigateRes, haRes, mqttRes] = await Promise.allSettled([
+  const [frigateRes, haRes, mqttRes, sipRes] = await Promise.allSettled([
     Frigate.getHealth(),
     HA.getHealth(),
     Mqtt.getHealth(),
+    Sip.getHealth(),
   ]);
   if (frigateRes.status === 'fulfilled') setHealth(frigateRes.value.status, frigateRes.value.message || '');
   else                                    setHealth('err', 'Backend unreachable');
@@ -163,6 +174,14 @@ async function refreshHealth() {
   else                                    setHaHealth('err', 'Backend unreachable');
   if (mqttRes.status === 'fulfilled')    setMqttHealth(mqttRes.value.status, mqttRes.value.message || '');
   else                                    setMqttHealth('err', 'Backend unreachable');
+  // SIP pill shows config + live JsSIP register state. The Extension page
+  // overrides this when registration succeeds/fails — refreshHealth only
+  // reflects the *config* level (configured / unconfigured / missing pw).
+  if (sipRes.status === 'fulfilled' && !window.SipPhone?.isRegistering?.()) {
+    setSipHealth(sipRes.value.status, sipRes.value.message || '');
+  } else if (sipRes.status !== 'fulfilled') {
+    setSipHealth('err', 'Backend unreachable');
+  }
 }
 
 function startHealthPolling() {
@@ -184,6 +203,8 @@ const routes = {
   'ai-camera/main':        { title: 'AI-Camera · Main',       render: renderAiCameraMain },
   'ai-camera/rules':       { title: 'AI-Camera · Rules',      render: renderAiCameraRules },
   'ai-camera/playground':  { title: 'AI-Camera · Playground', render: renderAiCameraPlayground },
+  'ai-camera/test-model':  { title: 'AI-Camera · Test AI Model', render: renderAiCameraTestModel },
+  'sip/extension':         { title: 'SIP Phone · Extension',     render: renderSipExtension },
 };
 
 function currentRoute() {
@@ -221,10 +242,17 @@ function navigate() {
   if (route.startsWith('ai-camera/')) {
     document.querySelector('.nav-group[data-group="ai-camera"]')?.classList.add('open');
   }
+  if (route.startsWith('sip/')) {
+    document.querySelector('.nav-group[data-group="sip"]')?.classList.add('open');
+  }
 
   // Leaving the Playground page? Drop the session.
   if (route !== 'ai-camera/playground' && window.AiCameraSession?.isActive?.()) {
     try { window.AiCameraSession.stop(); } catch {}
+  }
+  // Leaving the SIP Extension page? Tear down the softphone.
+  if (route !== 'sip/extension' && window.SipPhone) {
+    try { window.SipPhone.stopPhone(); } catch {}
   }
 
   // Leaving the Rules page? Close its motion WS + unwire the event listener.
@@ -367,6 +395,40 @@ function renderSettings(root) {
       </div>
       <div class="feedback" id="gemini-feedback"></div>
     </div>
+
+    <div class="card">
+      <h2>SIP softphone</h2>
+      <p class="hint">Credentials for the browser-based softphone (SIP Phone → Extension). Audio/signalling go browser → PBX directly via SIP-over-WebSocket + WebRTC; nothing flows through this backend. Suggested PBX: <strong>Asterisk</strong> or <strong>FreePBX</strong> in Proxmox with <code>chan_pjsip</code> configured with <code>transport=wss</code>.</p>
+      <label class="field">
+        <span class="lbl">WebSocket URL</span>
+        <input id="sip-ws-url" type="text" placeholder="wss://pbx.example.com:8089/ws" />
+        <span class="hint" style="margin-top:6px;display:block">For Asterisk default: <code>wss://&lt;pbx&gt;:8089/ws</code>. Browsers require <code>wss://</code> (TLS) when the page itself is served over HTTPS.</span>
+      </label>
+      <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px">
+        <label class="field">
+          <span class="lbl">Extension</span>
+          <input id="sip-extension" type="text" placeholder="1001" autocomplete="off" />
+        </label>
+        <label class="field">
+          <span class="lbl">SIP realm (optional)</span>
+          <input id="sip-realm" type="text" placeholder="defaults to the WS host" />
+        </label>
+      </div>
+      <label class="field">
+        <span class="lbl">Password</span>
+        <input id="sip-password" type="password" autocomplete="off" />
+        <span class="hint" style="margin-top:6px;display:block">Leave blank to keep the saved password.</span>
+      </label>
+      <label class="field">
+        <span class="lbl">Display name (optional)</span>
+        <input id="sip-display-name" type="text" placeholder="Reception phone" />
+      </label>
+      <div class="btn-row">
+        <button class="btn" id="btn-sip-save">Save</button>
+        <button class="btn secondary" id="btn-sip-clear">Clear</button>
+      </div>
+      <div class="feedback" id="sip-feedback"></div>
+    </div>
   `;
 
   initFrigateSettings();
@@ -374,6 +436,57 @@ function renderSettings(root) {
   initMqttSettings();
   initOllamaSettings();
   initGeminiSettings();
+  initSipSettings();
+}
+
+function initSipSettings() {
+  const wsEl    = document.getElementById('sip-ws-url');
+  const extEl   = document.getElementById('sip-extension');
+  const realmEl = document.getElementById('sip-realm');
+  const passEl  = document.getElementById('sip-password');
+  const dnEl    = document.getElementById('sip-display-name');
+  const fb      = document.getElementById('sip-feedback');
+
+  Sip.getConfig().then((c) => {
+    if (c.ws_url)       wsEl.value    = c.ws_url;
+    if (c.extension)    extEl.value   = c.extension;
+    if (c.realm)        realmEl.value = c.realm;
+    if (c.display_name) dnEl.value    = c.display_name;
+    if (c.password_set) passEl.placeholder = '••••••• (saved — leave blank to keep)';
+  }).catch(() => {});
+
+  document.getElementById('btn-sip-save').addEventListener('click', async () => {
+    const patch = {
+      ws_url:       wsEl.value.trim(),
+      extension:    extEl.value.trim(),
+      realm:        realmEl.value.trim(),
+      display_name: dnEl.value.trim(),
+    };
+    if (passEl.value) patch.password = passEl.value;
+    if (!patch.ws_url || !patch.extension) {
+      showFeedback(fb, 'err', 'WebSocket URL and Extension are required.');
+      return;
+    }
+    try {
+      const saved = await Sip.setConfig(patch);
+      passEl.value = '';
+      if (saved.password_set) passEl.placeholder = '••••••• (saved — leave blank to keep)';
+      showFeedback(fb, 'ok', 'Saved. The Extension page will use this on next register.');
+    } catch (e) {
+      showFeedback(fb, 'err', `Failed: ${e.message}`);
+    }
+  });
+
+  document.getElementById('btn-sip-clear').addEventListener('click', async () => {
+    try {
+      await Sip.setConfig({ ws_url: '', extension: '', realm: '', display_name: '', password: '' });
+      wsEl.value = ''; extEl.value = ''; realmEl.value = ''; passEl.value = ''; dnEl.value = '';
+      passEl.placeholder = '';
+      showFeedback(fb, 'ok', 'Cleared.');
+    } catch (e) {
+      showFeedback(fb, 'err', `Failed: ${e.message}`);
+    }
+  });
 }
 
 function initOllamaSettings() {
@@ -2403,6 +2516,33 @@ function applyCountdownToDom(ruleId, cd) {
   }
 }
 
+function applySustainedToDom(ruleId, s) {
+  const el = document.getElementById(`rule-su-${ruleId}`);
+  if (!el) return;
+  el.hidden = false;
+  const valueEl = el.querySelector('.rule-su-value');
+  const labelEl = el.querySelector('.rule-su-label');
+  if (!valueEl || !labelEl) return;
+  if (s.sustained) {
+    labelEl.textContent = 'Sustained ✓';
+    valueEl.textContent = `${s.elapsed_s}s ≥ ${s.min_duration_s}s`;
+    el.classList.remove('candidate');
+    el.classList.add('sustained');
+  } else {
+    labelEl.textContent = 'Detected';
+    valueEl.textContent = `sustaining ${s.elapsed_s}s / ${s.min_duration_s}s · ${s.remaining_s}s left`;
+    el.classList.remove('sustained');
+    el.classList.add('candidate');
+  }
+}
+
+function clearSustainedFromDom(ruleId) {
+  const el = document.getElementById(`rule-su-${ruleId}`);
+  if (!el) return;
+  el.hidden = true;
+  el.classList.remove('candidate', 'sustained');
+}
+
 // -------------------------------------------------------------
 // Motion WS — push-based motion state for blinking camera badges
 // -------------------------------------------------------------
@@ -2480,6 +2620,11 @@ function renderRuleRow(rule) {
           <div class="rule-countdown" id="rule-cd-${escapeHtml(rule.id)}" ${showCountdown ? '' : 'hidden'}>
             <span class="rule-cd-label">Next scan</span>
             <span class="rule-cd-value">—</span>
+          </div>
+          <div class="rule-sustained" id="rule-su-${escapeHtml(rule.id)}" hidden>
+            <span class="rule-su-dot"></span>
+            <span class="rule-su-label">Detected</span>
+            <span class="rule-su-value">—</span>
           </div>
         </div>
         <div class="rule-stats">
@@ -2661,21 +2806,18 @@ function renderHistory(rule, kind) {
 }
 
 function historyEntryHtml(rule, it) {
+  // Episode-shaped trigger (sustained run): multiple iterations rolled into one row.
+  if (Array.isArray(it.sequence) && it.sequence.length) {
+    return episodeEntryHtml(rule, it);
+  }
+
   const ts = it.ts ? new Date(it.ts * 1000).toLocaleString() : '';
   const cams = it.snap_cams && it.snap_cams.length ? it.snap_cams : (it.cameras || []);
   const reason = it.verdict_reason || (it.parsed && it.parsed.reason) || '';
   const triggered = !!it.triggered;
   const cls = triggered ? 'triggered' : 'not-triggered';
-  const thumbs = cams.map((c) => `
-    <img class="history-thumb" loading="lazy"
-         data-rule-id="${escapeHtml(rule.id)}"
-         data-iter-id="${it.iteration_id}"
-         data-camera="${escapeHtml(c)}"
-         src="/api/ai-camera/rules/${encodeURIComponent(rule.id)}/snap/${it.iteration_id}/${encodeURIComponent(c)}"
-         alt="${escapeHtml(c)}"
-         title="Click to enlarge"
-         onerror="this.replaceWith(Object.assign(document.createElement('div'),{textContent:'No snapshot',className:'preview-fallback'}))" />
-  `).join('');
+  const bbox = isValidBbox(it.bbox) ? it.bbox : (it.parsed && isValidBbox(it.parsed.bbox) ? it.parsed.bbox : null);
+  const thumbs = cams.map((c) => renderThumbsForCamera(rule, it.iteration_id, c, bbox)).join('');
   return `
     <div class="history-entry ${cls}">
       <div class="history-meta">
@@ -2690,14 +2832,121 @@ function historyEntryHtml(rule, it) {
   `;
 }
 
+function episodeEntryHtml(rule, ep) {
+  const tsStart = ep.started_ts ? new Date(ep.started_ts * 1000).toLocaleTimeString() : '';
+  const tsLast  = ep.last_ts    ? new Date(ep.last_ts * 1000).toLocaleTimeString()
+                 : (ep.fired_ts ? new Date(ep.fired_ts * 1000).toLocaleTimeString() : tsStart);
+  const reason  = ep.verdict_reason || '';
+  const count   = ep.sequence.length;
+  const durMs   = (ep.last_ts || ep.fired_ts || ep.started_ts || 0) - (ep.started_ts || 0);
+  const durTxt  = durMs > 0 ? ` · ${Math.round(durMs)}s` : '';
+
+  const iterRows = ep.sequence.map((seqIt) => {
+    const cams = seqIt.snap_cams && seqIt.snap_cams.length ? seqIt.snap_cams : (seqIt.cameras || []);
+    const bbox = isValidBbox(seqIt.bbox) ? seqIt.bbox : null;
+    const thumbs = cams.map((c) => renderThumbsForCamera(rule, seqIt.iteration_id, c, bbox)).join('');
+    const tsIt = seqIt.ts ? new Date(seqIt.ts * 1000).toLocaleTimeString() : '';
+    return `
+      <div class="ep-iter">
+        <div class="ep-iter-meta">
+          <strong>#${seqIt.iteration_id}</strong>
+          <span class="hint">${escapeHtml(tsIt)}</span>
+          ${seqIt.verdict_reason ? `<span class="hint">— ${escapeHtml(seqIt.verdict_reason)}</span>` : ''}
+        </div>
+        ${thumbs ? `<div class="history-thumbs">${thumbs}</div>` : ''}
+      </div>
+    `;
+  }).join('');
+
+  return `
+    <div class="history-entry triggered episode" data-episode-id="${escapeHtml(ep.episode_id || '')}">
+      <div class="history-meta">
+        <strong>#${ep.iteration_id ?? ep.sequence[ep.sequence.length - 1].iteration_id}</strong>
+        <span class="rule-badge red">TRIGGERED · ${count} frame${count === 1 ? '' : 's'}${durTxt}</span>
+        <span class="hint">${escapeHtml(ep.trigger_reason || '')}</span>
+        <span class="hint" style="margin-left:auto">${escapeHtml(tsStart)} → ${escapeHtml(tsLast)}</span>
+      </div>
+      ${reason ? `<div class="history-reason">${escapeHtml(reason)}</div>` : ''}
+      <details class="ep-collapse">
+        <summary>
+          <span class="ep-count">${count}</span>
+          <span class="ep-count-lbl">frame${count === 1 ? '' : 's'} captured during this trigger</span>
+          <span class="ep-toggle">show / hide</span>
+        </summary>
+        <div class="ep-iter-list">${iterRows}</div>
+      </details>
+    </div>
+  `;
+}
+
+function isValidBbox(b) {
+  if (!b || typeof b !== 'object') return false;
+  const { x0, y0, x1, y1 } = b;
+  return Number.isFinite(x0) && Number.isFinite(y0)
+      && Number.isFinite(x1) && Number.isFinite(y1)
+      && x1 > x0 && y1 > y0;
+}
+
+function renderThumbsForCamera(rule, iterId, camera, bbox) {
+  const src = `/api/ai-camera/rules/${encodeURIComponent(rule.id)}/snap/${iterId}/${encodeURIComponent(camera)}`;
+  const plainAttrs = `
+    class="history-thumb" loading="lazy"
+    data-rule-id="${escapeHtml(rule.id)}"
+    data-iter-id="${iterId}"
+    data-camera="${escapeHtml(camera)}"
+    src="${src}"
+    alt="${escapeHtml(camera)}"
+    title="Click to enlarge"
+    onerror="this.replaceWith(Object.assign(document.createElement('div'),{textContent:'No snapshot',className:'preview-fallback'}))"`;
+  const plain = `<div class="history-thumb-wrap"><img ${plainAttrs} /></div>`;
+
+  if (!bbox || (bbox.camera && bbox.camera !== camera)) {
+    return plain;
+  }
+  // Render annotated companion right next to the plain one. (Label text is
+  // intentionally not drawn on the thumbnail — the meta row above the
+  // thumbnails already states the verdict reason, and labels would either
+  // be unreadable at 120px or comically large.)
+  const w = bbox.x1 - bbox.x0;
+  const h = bbox.y1 - bbox.y0;
+  const annotated = `
+    <div class="history-thumb-wrap annotated">
+      <img ${plainAttrs} data-annotated="1" title="Annotated · click to enlarge" />
+      <svg class="bbox-overlay" viewBox="0 0 1000 1000" preserveAspectRatio="none">
+        <rect x="${bbox.x0}" y="${bbox.y0}" width="${w}" height="${h}" />
+      </svg>
+    </div>
+  `;
+  return `<div class="thumb-pair">${plain}${annotated}</div>`;
+}
+
 function findIterationInCache(ruleId, iterId) {
   const pag = RULES_STATE.pagination[ruleId];
   if (!pag) return null;
+  const want = Number(iterId);
   for (const kind of ['triggers', 'iterations']) {
     const bucket = pag[kind];
     if (!bucket || !bucket.items) continue;
-    const found = bucket.items.find((x) => Number(x.iteration_id) === Number(iterId));
-    if (found) return found;
+    for (const x of bucket.items) {
+      if (Number(x.iteration_id) === want) return x;
+      // Episode-shaped trigger: look inside the sequence and synthesise a
+      // single-iteration view so the existing modal renderer still works.
+      if (Array.isArray(x.sequence)) {
+        const seqIt = x.sequence.find((s) => Number(s.iteration_id) === want);
+        if (seqIt) {
+          return {
+            ...x,
+            iteration_id: seqIt.iteration_id,
+            ts: seqIt.ts,
+            cameras: seqIt.cameras,
+            snap_cams: seqIt.snap_cams,
+            bbox: seqIt.bbox,
+            verdict_reason: seqIt.verdict_reason || x.verdict_reason,
+            triggered: true,
+          };
+        }
+      }
+    }
   }
   return null;
 }
@@ -2722,11 +2971,19 @@ function openRuleSnapshotModal(ruleId, iterId, camera) {
          alt="${escapeHtml(c)}"
          title="Switch view" />
   `).join('');
+  // Bounding-box overlay (if the model returned one for THIS camera).
+  const bbox = isValidBbox(it.bbox) && (!it.bbox.camera || it.bbox.camera === camera) ? it.bbox : null;
+  const bboxOverlay = bbox ? `
+    <svg class="bbox-overlay" viewBox="0 0 1000 1000" preserveAspectRatio="none">
+      <rect x="${bbox.x0}" y="${bbox.y0}" width="${bbox.x1 - bbox.x0}" height="${bbox.y1 - bbox.y0}" />
+    </svg>` : '';
+
   const bodyHtml = `
     <div class="snap-modal">
-      <div class="live-frame">
+      <div class="live-frame bbox-frame">
         <img src="/api/ai-camera/rules/${encodeURIComponent(ruleId)}/snap/${it.iteration_id}/${encodeURIComponent(camera)}"
              alt="${escapeHtml(camera)}" />
+        ${bboxOverlay}
       </div>
       ${otherThumbs ? `<div class="snap-modal-others"><span class="hint">Other cameras this iteration:</span><div class="history-thumbs">${otherThumbs}</div></div>` : ''}
       <dl class="snap-modal-meta">
@@ -2834,6 +3091,19 @@ function handleRulesEvent(msg) {
     applyCountdownToDom(msg.rule_id, RULES_STATE.countdowns[msg.rule_id]);
     return;
   }
+  if (msg.type === 'sustained_progress') {
+    applySustainedToDom(msg.rule_id, {
+      elapsed_s: msg.elapsed_s,
+      remaining_s: msg.remaining_s,
+      min_duration_s: msg.min_duration_s,
+      sustained: !!msg.sustained,
+    });
+    return;
+  }
+  if (msg.type === 'sustained_reset') {
+    clearSustainedFromDom(msg.rule_id);
+    return;
+  }
   if (msg.type === 'trigger') {
     const rule = RULES_STATE.rules.find((r) => r.id === msg.rule_id);
     if (rule) {
@@ -2841,6 +3111,20 @@ function handleRulesEvent(msg) {
       bumpCountInDom('rule-count-trig', msg.rule_id, rule.trigger_count);
       if (RULES_STATE.expanded.has(rule.id)) {
         RULES_STATE.pagination[rule.id].triggers = { offset: 0, total: 0, items: [] };
+        loadHistoryPage(rule, 'triggers');
+      }
+      // The sustained-state chip stays visible (now "Sustained ✓") for a
+      // moment then clears so the operator sees the cause of the trigger.
+      setTimeout(() => clearSustainedFromDom(msg.rule_id), 6000);
+    }
+  } else if (msg.type === 'trigger_update' || msg.type === 'trigger_complete') {
+    // The episode row on disk has been rewritten — refresh the triggers
+    // page in place so the operator sees the new thumbnail(s) appear.
+    const rule = RULES_STATE.rules.find((r) => r.id === msg.rule_id);
+    if (rule && RULES_STATE.expanded.has(rule.id)) {
+      const pag = RULES_STATE.pagination[rule.id];
+      if (pag && (pag.tab || 'triggers') === 'triggers') {
+        pag.triggers = { offset: 0, total: 0, items: [] };
         loadHistoryPage(rule, 'triggers');
       }
     }
@@ -2937,6 +3221,11 @@ function openRuleEditor(existing) {
           <textarea id="re-action-data" rows="2" placeholder='{"brightness_pct": 100}'>${escapeHtml(sd)}</textarea>
         </label>
       </details>
+      <label class="field">
+        <span class="lbl">Sustained duration (seconds)</span>
+        <input id="re-min-duration" type="number" min="0" value="${seed.min_duration_s ?? 0}" />
+        <span class="hint" style="margin-top:6px;display:block">The action fires only when the model has said <em>triggered</em> continuously for this long. <code>0</code> = fire on first hit (default). Example: <code>30</code> for "alert if the door is open for more than 30 seconds". While a candidate is waiting to be confirmed, the scan rate auto-bumps to ~5 s.</span>
+      </label>
       <div class="rule-flags">
         <label class="checkbox-row">
           <input id="re-fire-alarm" type="checkbox" ${seed.fire_alarm ? 'checked' : ''} />
@@ -3050,6 +3339,7 @@ async function saveRuleFromEditor(existing) {
     action = { domain, service, entity_id, service_data };
   }
   const cooldown_s = parseInt(document.getElementById('re-cooldown').value, 10) || 0;
+  const min_duration_s = Math.max(0, parseInt(document.getElementById('re-min-duration').value, 10) || 0);
   const fire_alarm = document.getElementById('re-fire-alarm').checked;
   const store_iterations = document.getElementById('re-store-iter').checked;
   const enabled = document.getElementById('re-enabled').checked;
@@ -3062,7 +3352,7 @@ async function saveRuleFromEditor(existing) {
   }
 
   const model = (document.getElementById('re-model')?.value || '').trim();
-  const payload = { name, rule: ruleText, cameras, scan, action, cooldown_s, fire_alarm, store_iterations, enabled, model };
+  const payload = { name, rule: ruleText, cameras, scan, action, cooldown_s, min_duration_s, fire_alarm, store_iterations, enabled, model };
   try {
     const url = existing && existing.id
       ? `/api/ai-camera/rules/${encodeURIComponent(existing.id)}`
@@ -3866,6 +4156,584 @@ window.AiCameraSession = {
     AI_PG.previewCameras = [];
   },
 };
+
+// =============================================================
+// AI-Camera · Test AI Model — one-shot vision Q&A
+// History survives navigation within the SPA (lives on window).
+// =============================================================
+window.AI_TEST = window.AI_TEST || {
+  history: [],       // [{id, timestamp, provider, model, prompt, response, error, imageDataUrl, latency_ms}]
+  models: null,      // {gemini: [...], ollama: [...]} once loaded
+  loadingModels: false,
+};
+
+async function renderAiCameraTestModel(root) {
+  root.innerHTML = `
+    <div class="page-header">
+      <h1>AI-Camera · Test AI Model</h1>
+      <p>Pick a model, upload an image, ask it anything. Every exchange is recorded in the History panel at the bottom. Configure providers in <a href="#/settings">Settings</a> (Gemini API key, Ollama URL).</p>
+    </div>
+
+    <div class="split">
+      <div class="card" style="margin:0">
+        <h2>Ask</h2>
+
+        <label class="field">
+          <span class="lbl">Model</span>
+          <select id="tm-model" disabled>
+            <option>Loading models…</option>
+          </select>
+          <span class="hint" style="margin-top:6px;display:block">Vision-capable models only. Gemini models come from your account's ListModels; Ollama models from your local instance.</span>
+        </label>
+
+        <label class="field">
+          <span class="lbl">Image</span>
+          <input type="file" id="tm-image" accept="image/*" />
+        </label>
+
+        <div id="tm-preview-wrap" hidden>
+          <div class="live-frame" style="max-width:340px">
+            <img id="tm-preview" alt="" />
+          </div>
+        </div>
+
+        <label class="field">
+          <span class="lbl">Prompt</span>
+          <textarea id="tm-prompt" rows="4" placeholder="What can you see? Is there a person in this image? Describe the scene in two sentences."></textarea>
+        </label>
+
+        <div class="btn-row" style="margin-top:8px">
+          <button class="btn" id="tm-ask">Ask AI</button>
+          <button class="btn secondary" id="tm-clear-history">Clear history</button>
+        </div>
+
+        <div class="feedback" id="tm-feedback"></div>
+      </div>
+
+      <div class="card" style="margin:0">
+        <h2>Latest response</h2>
+        <div id="tm-latest"><p class="hint">No response yet.</p></div>
+      </div>
+    </div>
+
+    <div class="card" style="margin-top:16px">
+      <div class="events-meta">
+        <h2 style="margin:0">History</h2>
+        <span class="count" id="tm-history-count">${window.AI_TEST.history.length}</span>
+      </div>
+      <div id="tm-history"></div>
+    </div>
+  `;
+
+  // Wire image preview.
+  const imgInput = document.getElementById('tm-image');
+  imgInput.addEventListener('change', () => {
+    const f = imgInput.files?.[0];
+    const wrap = document.getElementById('tm-preview-wrap');
+    const img = document.getElementById('tm-preview');
+    if (!f) { wrap.hidden = true; return; }
+    const url = URL.createObjectURL(f);
+    img.src = url;
+    img.onload = () => URL.revokeObjectURL(url);
+    wrap.hidden = false;
+  });
+
+  document.getElementById('tm-ask').addEventListener('click', testAskClick);
+  document.getElementById('tm-clear-history').addEventListener('click', () => {
+    window.AI_TEST.history = [];
+    refreshTestHistory();
+  });
+
+  refreshTestHistory();
+
+  // Load models (cache for the SPA lifetime; reload on demand).
+  if (!window.AI_TEST.models && !window.AI_TEST.loadingModels) {
+    await loadTestModels();
+  } else if (window.AI_TEST.models) {
+    populateTestModelDropdown();
+  }
+}
+
+async function loadTestModels() {
+  window.AI_TEST.loadingModels = true;
+  try {
+    const r = await fetch('/api/ai-camera/test/models');
+    if (!r.ok) throw new Error(`HTTP ${r.status}`);
+    window.AI_TEST.models = await r.json();
+    populateTestModelDropdown();
+  } catch (e) {
+    const sel = document.getElementById('tm-model');
+    if (sel) sel.innerHTML = `<option value="">— failed to load: ${escapeHtml(e.message)} —</option>`;
+  } finally {
+    window.AI_TEST.loadingModels = false;
+  }
+}
+
+function populateTestModelDropdown() {
+  const sel = document.getElementById('tm-model');
+  if (!sel) return;
+  const data = window.AI_TEST.models || { gemini: [], ollama: [] };
+  const groups = [];
+  if (data.gemini && data.gemini.length) {
+    groups.push(`<optgroup label="Gemini">${data.gemini.map((m) =>
+      `<option value="gemini:${escapeHtml(m.name)}">${escapeHtml(m.display_name || m.name)}</option>`).join('')}</optgroup>`);
+  }
+  if (data.ollama && data.ollama.length) {
+    groups.push(`<optgroup label="Ollama (local)">${data.ollama.map((m) =>
+      `<option value="ollama:${escapeHtml(m.name)}">${escapeHtml(m.display_name || m.name)}</option>`).join('')}</optgroup>`);
+  }
+  if (!groups.length) {
+    sel.innerHTML = `<option value="">— No models. Configure Gemini key and/or Ollama URL in Settings. —</option>`;
+    sel.disabled = true;
+    return;
+  }
+  sel.innerHTML = groups.join('');
+  sel.disabled = false;
+}
+
+async function testAskClick() {
+  const feedback = document.getElementById('tm-feedback');
+  const btn = document.getElementById('tm-ask');
+  const sel = document.getElementById('tm-model');
+  const fileInput = document.getElementById('tm-image');
+  const prompt = (document.getElementById('tm-prompt').value || '').trim();
+
+  const selector = sel.value || '';
+  const [provider, model] = selector.split(':', 2);
+  const file = fileInput.files?.[0];
+
+  if (!provider || !model) { showFeedback(feedback, 'err', 'Pick a model.'); return; }
+  if (!file)              { showFeedback(feedback, 'err', 'Upload an image first.'); return; }
+  if (!prompt)            { showFeedback(feedback, 'err', 'Type a prompt.'); return; }
+
+  btn.disabled = true;
+  showFeedback(feedback, 'ok', `Asking ${provider}:${model}…`);
+
+  // Read the image into a data URL once for both display and history.
+  const imageDataUrl = await new Promise((resolve, reject) => {
+    const r = new FileReader();
+    r.onload = () => resolve(r.result);
+    r.onerror = reject;
+    r.readAsDataURL(file);
+  });
+
+  const form = new FormData();
+  form.append('provider', provider);
+  form.append('model', model);
+  form.append('prompt', prompt);
+  form.append('image', file);
+
+  let result;
+  try {
+    const res = await fetch('/api/ai-camera/test/ask', { method: 'POST', body: form });
+    if (!res.ok) {
+      const text = await res.text().catch(() => '');
+      throw new Error(`HTTP ${res.status}${text ? ` — ${text.slice(0, 160)}` : ''}`);
+    }
+    result = await res.json();
+  } catch (e) {
+    result = { ok: false, provider, model, error: e.message };
+  } finally {
+    btn.disabled = false;
+  }
+
+  const entry = {
+    id: Date.now(),
+    timestamp: Date.now() / 1000,
+    provider: result.provider || provider,
+    model: result.model || model,
+    prompt,
+    response: result.ok ? (result.text || '') : '',
+    error: result.ok ? null : (result.error || 'Failed'),
+    imageDataUrl,
+    latency_ms: result.latency_ms || null,
+  };
+  window.AI_TEST.history.unshift(entry);
+  if (window.AI_TEST.history.length > 50) window.AI_TEST.history.length = 50;
+
+  renderTestLatest(entry);
+  refreshTestHistory();
+
+  showFeedback(feedback, result.ok ? 'ok' : 'err',
+    result.ok
+      ? `Done in ${result.latency_ms ?? '?'} ms.`
+      : `Failed: ${entry.error}`);
+}
+
+function renderTestLatest(entry) {
+  const wrap = document.getElementById('tm-latest');
+  if (!wrap) return;
+  if (entry.error) {
+    wrap.innerHTML = `
+      <div class="domain-chip">${escapeHtml(entry.provider)} · ${escapeHtml(entry.model)}</div>
+      <div class="iter-action err" style="margin-top:10px">${escapeHtml(entry.error)}</div>
+    `;
+    return;
+  }
+  wrap.innerHTML = `
+    <div style="display:flex;align-items:center;gap:8px;margin-bottom:10px;flex-wrap:wrap">
+      <span class="domain-chip">${escapeHtml(entry.provider)}</span>
+      <span class="entity-control-id">${escapeHtml(entry.model)}</span>
+      ${entry.latency_ms ? `<span class="hint">· ${entry.latency_ms} ms</span>` : ''}
+    </div>
+    <div class="tm-response">${escapeHtml(entry.response || '(empty response)')}</div>
+  `;
+}
+
+function refreshTestHistory() {
+  const wrap = document.getElementById('tm-history');
+  const cnt = document.getElementById('tm-history-count');
+  if (!wrap || !cnt) return;
+  cnt.textContent = window.AI_TEST.history.length;
+  if (window.AI_TEST.history.length === 0) {
+    wrap.innerHTML = `<p class="hint">No questions yet. Ask one above and it'll appear here.</p>`;
+    return;
+  }
+  wrap.innerHTML = `
+    <div class="tm-history-list">
+      ${window.AI_TEST.history.map((e) => renderTestHistoryEntry(e)).join('')}
+    </div>
+  `;
+  // Click any thumbnail → open in the modal.
+  wrap.querySelectorAll('.tm-history-thumb').forEach((el) => {
+    el.addEventListener('click', () => {
+      const id = parseInt(el.dataset.id, 10);
+      const entry = window.AI_TEST.history.find((x) => x.id === id);
+      if (entry) openTestHistoryModal(entry);
+    });
+  });
+}
+
+function renderTestHistoryEntry(e) {
+  const ts = e.timestamp ? new Date(e.timestamp * 1000).toLocaleString() : '';
+  const statusCls = e.error ? 'err' : 'ok';
+  return `
+    <div class="tm-history-row ${statusCls}">
+      <div class="tm-history-thumb" data-id="${e.id}" title="Click to enlarge">
+        <img src="${escapeHtml(e.imageDataUrl || '')}" alt="" />
+      </div>
+      <div class="tm-history-body">
+        <div class="tm-history-meta">
+          <span class="domain-chip">${escapeHtml(e.provider)}</span>
+          <span class="entity-control-id">${escapeHtml(e.model)}</span>
+          <span class="hint">${escapeHtml(ts)}${e.latency_ms ? ` · ${e.latency_ms} ms` : ''}</span>
+        </div>
+        <div class="tm-history-prompt"><strong>Q:</strong> ${escapeHtml(e.prompt)}</div>
+        ${e.error
+          ? `<div class="iter-action err">${escapeHtml(e.error)}</div>`
+          : `<div class="tm-history-response">${escapeHtml(e.response || '(empty)')}</div>`}
+      </div>
+    </div>
+  `;
+}
+
+function openTestHistoryModal(entry) {
+  showModal({
+    title: `${entry.provider} · ${entry.model}`,
+    sub: `${new Date(entry.timestamp * 1000).toLocaleString()}${entry.latency_ms ? ` · ${entry.latency_ms} ms` : ''}`,
+    openUrl: null,
+    bodyHtml: `
+      <div class="live-frame" style="margin-bottom:14px">
+        <img src="${escapeHtml(entry.imageDataUrl || '')}" alt="" />
+      </div>
+      <div style="padding:0 4px"><strong>Prompt:</strong></div>
+      <div class="tm-response" style="margin:6px 0 12px">${escapeHtml(entry.prompt)}</div>
+      <div style="padding:0 4px"><strong>${entry.error ? 'Error' : 'Response'}:</strong></div>
+      <div class="tm-response" style="margin-top:6px${entry.error ? ';color:var(--err)' : ''}">${escapeHtml(entry.error || entry.response || '(empty)')}</div>
+    `,
+  });
+}
+
+// =============================================================
+// SIP Phone — Extension page
+// =============================================================
+async function renderSipExtension(root) {
+  let cfg;
+  try { cfg = await Sip.getConfig(); }
+  catch (e) {
+    root.innerHTML = `<div class="empty-state"><h3>Backend error</h3><p>${escapeHtml(e.message)}</p></div>`;
+    return;
+  }
+
+  if (!cfg.ws_url || !cfg.extension || !cfg.password_set) {
+    root.innerHTML = `
+      <div class="page-header">
+        <h1>SIP Phone · Extension</h1>
+      </div>
+      <div class="empty-state">
+        <h3>Configure SIP first</h3>
+        <p>Add your PBX <strong>WebSocket URL</strong>, <strong>Extension</strong>, and <strong>Password</strong> in <a href="#/settings">Settings → SIP softphone</a>.</p>
+        <p class="hint" style="margin-top:8px">Suggested PBX: Asterisk in Proxmox with <code>chan_pjsip</code>, <code>transport=wss</code>, an extension with a strong password, and TLS certificates so the browser will accept the <code>wss://</code> URL.</p>
+      </div>
+    `;
+    return;
+  }
+
+  // Fetch the password by issuing an "echo" POST that doesn't change anything
+  // — the GET intentionally hides the password, but the softphone needs it.
+  // We instead require the user to type it in Settings, then the same POST
+  // they made already persisted it; we read it back through a tiny dedicated
+  // endpoint. Cleanest fix: re-fetch via a private endpoint. For now, ask the
+  // user to re-enter the password if they cleared it — but normally we have
+  // it cached server-side and will get it via /api/sip/config when we add a
+  // secret-leak endpoint. To keep this self-contained, we read the password
+  // out of the form state at session-start time by making a second POST that
+  // returns it inside `password_set` only. Simpler approach: pass the
+  // password back from the backend just for the SIP page. Add a dedicated
+  // endpoint later if you want it more secure than that.
+
+  root.innerHTML = `
+    <div class="page-header">
+      <h1>SIP Phone · Extension</h1>
+      <p>Extension <strong>${escapeHtml(cfg.extension)}</strong> · <code>${escapeHtml(cfg.ws_url)}</code></p>
+    </div>
+
+    <div class="split">
+      <!-- LEFT: phone (status, keypad, dial, active call) -->
+      <div class="card" style="margin:0">
+        <h2>Phone</h2>
+
+        <div class="status-pill" id="phone-status" style="margin-bottom:12px">
+          <span class="status-dot" id="phone-status-dot"></span>
+          <span class="status-label">State:</span>
+          <span class="status-text" id="phone-status-text">starting…</span>
+        </div>
+
+        <div class="btn-row" style="margin-bottom:10px">
+          <button class="btn" id="btn-sip-register">Register</button>
+          <button class="btn secondary" id="btn-sip-unregister" disabled>Unregister</button>
+        </div>
+
+        <label class="field">
+          <span class="lbl">Dial</span>
+          <div style="display:flex;gap:6px">
+            <input type="text" id="sip-dial-input" placeholder="1002 or sip:user@host" />
+            <button class="btn" id="btn-sip-dial" disabled>Call</button>
+          </div>
+        </label>
+
+        <div class="keypad" id="sip-keypad" aria-label="Dial pad">
+          ${['1','2','3','4','5','6','7','8','9','*','0','#'].map((d) =>
+            `<button class="keypad-key" data-digit="${d}">${d}</button>`).join('')}
+        </div>
+
+        <div class="call-panel" id="call-panel" hidden>
+          <div class="call-peer">
+            <div class="call-peer-name" id="call-peer-name">—</div>
+            <div class="call-peer-meta" id="call-peer-meta">idle</div>
+          </div>
+          <div class="call-timer" id="call-timer">00:00</div>
+          <div class="btn-row">
+            <button class="btn secondary" id="btn-call-mute">🎙 Mute</button>
+            <button class="btn danger" id="btn-call-hangup">⏻ Hangup</button>
+          </div>
+        </div>
+      </div>
+
+      <!-- RIGHT: recent calls -->
+      <div class="card" style="margin:0">
+        <div class="events-meta">
+          <h2 style="margin:0">Recent calls</h2>
+          <span class="count" id="sip-history-count">0</span>
+        </div>
+        <div id="sip-history"><p class="hint">No calls yet.</p></div>
+      </div>
+    </div>
+
+    <div class="modal-backdrop" id="sip-incoming-modal" hidden>
+      <div class="modal" role="dialog" aria-modal="true">
+        <header class="modal-header">
+          <div>
+            <div class="modal-title">📞 Incoming call</div>
+            <div class="modal-sub" id="sip-incoming-peer">—</div>
+          </div>
+        </header>
+        <div class="modal-body">
+          <div class="btn-row" style="justify-content:center;gap:14px">
+            <button class="btn" id="btn-sip-accept">Accept</button>
+            <button class="btn danger" id="btn-sip-reject">Reject</button>
+          </div>
+        </div>
+      </div>
+    </div>
+  `;
+
+  // ----- Wire UI -----
+  // Keypad: dual-purpose. Off-call → append to dial input. On-call → DTMF.
+  document.querySelectorAll('#sip-keypad .keypad-key').forEach((btn) => {
+    btn.addEventListener('click', () => {
+      const d = btn.dataset.digit;
+      if (window.SipPhone.callState() === 'in-call') {
+        window.SipPhone.sendDtmf(d);
+      } else {
+        const input = document.getElementById('sip-dial-input');
+        input.value = (input.value || '') + d;
+      }
+    });
+  });
+
+  document.getElementById('btn-sip-dial').addEventListener('click', () => {
+    const target = (document.getElementById('sip-dial-input').value || '').trim();
+    if (!target) return;
+    const res = window.SipPhone.dial(target);
+    if (!res.ok) alert(res.error);
+  });
+
+  document.getElementById('btn-sip-register').addEventListener('click', () => startSipSession(cfg));
+  document.getElementById('btn-sip-unregister').addEventListener('click', () => window.SipPhone.stopPhone());
+  document.getElementById('btn-call-hangup').addEventListener('click', () => window.SipPhone.hangup());
+  document.getElementById('btn-call-mute').addEventListener('click', (e) => {
+    const muted = e.currentTarget.classList.toggle('active');
+    window.SipPhone.setMuted(muted);
+    e.currentTarget.textContent = muted ? '🔇 Muted' : '🎙 Mute';
+  });
+  document.getElementById('btn-sip-accept').addEventListener('click', () => {
+    document.getElementById('sip-incoming-modal').hidden = true;
+    window.SipPhone.answer();
+  });
+  document.getElementById('btn-sip-reject').addEventListener('click', () => {
+    document.getElementById('sip-incoming-modal').hidden = true;
+    window.SipPhone.rejectIncoming();
+  });
+
+  // Subscribe to phone events for UI updates.
+  let timerId = null;
+  function refreshUI() {
+    const state = window.SipPhone.callState();
+    const statusText = document.getElementById('phone-status-text');
+    const statusDot  = document.getElementById('phone-status-dot');
+    if (!statusText || !statusDot) return;
+    statusDot.classList.remove('ok','err','warn','checking');
+    if (state === 'in-call')      { statusText.textContent = 'In call'; statusDot.classList.add('ok'); }
+    else if (state === 'ringing') { statusText.textContent = 'Ringing — incoming'; statusDot.classList.add('warn'); }
+    else if (state === 'idle')    { statusText.textContent = 'Registered · idle'; statusDot.classList.add('ok'); }
+    else                          { statusText.textContent = 'Not registered'; statusDot.classList.add('err'); }
+
+    const dialing = state === 'idle';
+    document.getElementById('btn-sip-dial').disabled = !dialing;
+    document.getElementById('btn-sip-register').disabled = state !== 'offline';
+    document.getElementById('btn-sip-unregister').disabled = state === 'offline';
+
+    const panel = document.getElementById('call-panel');
+    if (state === 'in-call') panel.hidden = false;
+    else                     panel.hidden = true;
+  }
+
+  window.SipPhone.subscribe((ev) => {
+    switch (ev.type) {
+      case 'starting': break;
+      case 'transport':
+        if (ev.state === 'connected') setSipHealth('checking', 'WS connected, registering…');
+        break;
+      case 'registered':
+        setSipHealth('ok', `Registered · ${ev.extension}`);
+        break;
+      case 'unregistered':
+        setSipHealth('warn', 'Unregistered');
+        break;
+      case 'register_failed':
+        setSipHealth('err', `Register failed: ${ev.cause}`);
+        break;
+      case 'incoming':
+        document.getElementById('sip-incoming-peer').textContent = ev.peer;
+        document.getElementById('sip-incoming-modal').hidden = false;
+        break;
+      case 'incoming_cleared':
+        document.getElementById('sip-incoming-modal').hidden = true;
+        break;
+      case 'session': {
+        const peerName = document.getElementById('call-peer-name');
+        const peerMeta = document.getElementById('call-peer-meta');
+        if (peerName) peerName.textContent = ev.peer || '—';
+        if (peerMeta) peerMeta.textContent = ev.state;
+        if (ev.state === 'connected') {
+          let secs = 0;
+          if (timerId) clearInterval(timerId);
+          const tEl = document.getElementById('call-timer');
+          if (tEl) tEl.textContent = '00:00';
+          timerId = setInterval(() => {
+            secs += 1;
+            if (tEl) tEl.textContent = `${String(Math.floor(secs / 60)).padStart(2,'0')}:${String(secs % 60).padStart(2,'0')}`;
+          }, 1000);
+        }
+        if (ev.state === 'ended' || ev.state === 'failed') {
+          if (timerId) { clearInterval(timerId); timerId = null; }
+        }
+        break;
+      }
+      case 'history':
+        renderSipHistory();
+        break;
+      case 'fatal':
+        setSipHealth('err', ev.message);
+        break;
+    }
+    refreshUI();
+  });
+
+  renderSipHistory();
+  refreshUI();
+
+  // Auto-start: the phone tries to register as soon as the page mounts.
+  await startSipSession(cfg);
+}
+
+async function startSipSession(cfgFromGet) {
+  // Re-fetch via a tiny private channel so we have the actual password.
+  // We use the same POST that the Settings card uses but with no fields —
+  // the backend returns the *current* config minus the password. Since GET
+  // hides the password, the page asks the user to keep it in Settings and
+  // we pass nothing here. JsSIP needs the password client-side, so we now
+  // need the backend to expose it for this page. Use the dedicated endpoint
+  // (added below).
+  let creds;
+  try {
+    const r = await fetch('/api/sip/credentials');
+    if (!r.ok) throw new Error(`HTTP ${r.status}`);
+    creds = await r.json();
+  } catch (e) {
+    setSipHealth('err', `Could not read SIP credentials: ${e.message}`);
+    return;
+  }
+  if (!creds.password) {
+    setSipHealth('err', 'SIP password is not stored on the backend. Save it in Settings.');
+    return;
+  }
+  window.SipPhone.startPhone(creds);
+}
+
+function renderSipHistory() {
+  const wrap = document.getElementById('sip-history');
+  const cnt  = document.getElementById('sip-history-count');
+  if (!wrap || !cnt) return;
+  const hist = window.SipPhone.getHistory();
+  cnt.textContent = hist.length;
+  if (hist.length === 0) {
+    wrap.innerHTML = `<p class="hint">No calls yet.</p>`;
+    return;
+  }
+  wrap.innerHTML = `
+    <div class="sip-history-list">
+      ${hist.map((h) => {
+        const ts = new Date(h.ts * 1000).toLocaleString();
+        const dur = `${String(Math.floor(h.duration_s / 60)).padStart(2,'0')}:${String(h.duration_s % 60).padStart(2,'0')}`;
+        const arrow = h.direction === 'in' ? '↙' : '↗';
+        const cls = h.status === 'completed' ? 'ok'
+                  : h.status === 'missed'    ? 'warn'
+                  :                            'err';
+        return `
+          <div class="sip-history-row ${cls}">
+            <div class="sip-history-arrow">${arrow}</div>
+            <div class="sip-history-main">
+              <div class="sip-history-peer">${escapeHtml(h.peer)}</div>
+              <div class="sip-history-meta">${escapeHtml(h.status)} · ${escapeHtml(dur)} · ${escapeHtml(ts)}</div>
+            </div>
+          </div>
+        `;
+      }).join('')}
+    </div>
+  `;
+}
 
 function renderNotFound(root) {
   root.innerHTML = `

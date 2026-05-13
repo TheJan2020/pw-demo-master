@@ -32,6 +32,15 @@ class State:
         # runtime engine that consumes these. Each entry is a plain dict; the
         # rules router owns the schema, this layer only round-trips the list.
         self.ai_camera_rules: list[dict[str, Any]] = []
+        # SIP softphone — settings the browser-side JsSIP client uses to
+        # register with the PBX. ws_url is the WebSocket endpoint (ws:// or
+        # wss://). realm is the SIP domain part of the AOR; falls back to the
+        # host in ws_url if blank.
+        self.sip_ws_url: Optional[str] = None
+        self.sip_extension: Optional[str] = None
+        self.sip_password: Optional[str] = None
+        self.sip_realm: Optional[str] = None
+        self.sip_display_name: Optional[str] = None
         self._load()
 
     def _load(self) -> None:
@@ -53,6 +62,11 @@ class State:
             rules = data.get("ai_camera_rules")
             if isinstance(rules, list):
                 self.ai_camera_rules = [r for r in rules if isinstance(r, dict)]
+            self.sip_ws_url       = data.get("sip_ws_url") or None
+            self.sip_extension    = data.get("sip_extension") or None
+            self.sip_password     = data.get("sip_password") or None
+            self.sip_realm        = data.get("sip_realm") or None
+            self.sip_display_name = data.get("sip_display_name") or None
         except Exception:
             pass
 
@@ -74,6 +88,11 @@ class State:
                         "mqtt_topic_prefix": self.mqtt_topic_prefix,
                         "ollama_url": self.ollama_url,
                         "ai_camera_rules": self.ai_camera_rules,
+                        "sip_ws_url":       self.sip_ws_url,
+                        "sip_extension":    self.sip_extension,
+                        "sip_password":     self.sip_password,
+                        "sip_realm":        self.sip_realm,
+                        "sip_display_name": self.sip_display_name,
                     },
                     indent=2,
                 )

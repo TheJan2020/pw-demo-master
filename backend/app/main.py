@@ -8,7 +8,7 @@ from fastapi import FastAPI
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 
-from .routers import ai_camera, ai_camera_rules, frigate, homeassistant, live_agent, mqtt
+from .routers import ai_camera, ai_camera_rules, frigate, homeassistant, live_agent, mqtt, sip
 from .services import ai_camera_engine
 from .services.mqtt import mqtt_service
 
@@ -38,6 +38,7 @@ app.include_router(live_agent.router,     prefix="/api/live-agent",     tags=["l
 app.include_router(ai_camera.router,      prefix="/api/ai-camera",      tags=["ai-camera"])
 app.include_router(ai_camera_rules.router, prefix="/api/ai-camera",     tags=["ai-camera-rules"])
 app.include_router(mqtt.router,           prefix="/api/mqtt",           tags=["mqtt"])
+app.include_router(sip.router,            prefix="/api/sip",            tags=["sip"])
 
 
 @app.get("/api/health")

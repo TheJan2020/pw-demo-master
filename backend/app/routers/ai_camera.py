@@ -32,7 +32,7 @@ import time
 from typing import Any, Optional
 
 import httpx
-from fastapi import APIRouter, WebSocket, WebSocketDisconnect
+from fastapi import APIRouter, File, Form, HTTPException, UploadFile, WebSocket, WebSocketDisconnect
 
 from google import genai
 from google.genai import types
@@ -380,9 +380,17 @@ def _build_system_instruction(rule: str) -> str:
         "Be conservative. Reply with `triggered: true` ONLY if you can clearly "
         "see the condition in the frame. If unsure, reply `false`.\n"
         "\n"
-        "Respond with NOTHING but a single JSON object on one line, no prose, "
-        "no markdown fences:\n"
-        '  {"triggered": true|false, "reason": "<≤120 chars of what you saw>"}'
+        "When triggered=true, ALSO populate `bbox` with the bounding box of the "
+        "single region most responsible for the trigger:\n"
+        "  - Coordinates are integers in 0..1000, normalized to the frame "
+        "    (0,0 = top-left, 1000,1000 = bottom-right).\n"
+        "  - `camera` MUST equal the camera label printed next to the frame.\n"
+        "  - `label` is a 1-3 word description of what's in the box.\n"
+        "When triggered=false, omit `bbox` entirely.\n"
+        "\n"
+        "Respond with NOTHING but a single JSON object, no prose, no markdown fences:\n"
+        '  {"triggered": true|false, "reason": "<≤120 chars>", '
+        '"bbox": {"camera": "...", "y0": 0, "x0": 0, "y1": 0, "x1": 0, "label": "..."}}'
     )
 
 
@@ -412,6 +420,20 @@ def _extract_json_object(text: str) -> Optional[dict]:
         return None
 
 
+_BBOX_SCHEMA = types.Schema(
+    type=types.Type.OBJECT,
+    properties={
+        "camera": types.Schema(type=types.Type.STRING,
+                               description="Camera label of the frame the bbox belongs to."),
+        "y0":     types.Schema(type=types.Type.INTEGER, description="Top   (0..1000)."),
+        "x0":     types.Schema(type=types.Type.INTEGER, description="Left  (0..1000)."),
+        "y1":     types.Schema(type=types.Type.INTEGER, description="Bottom (0..1000)."),
+        "x1":     types.Schema(type=types.Type.INTEGER, description="Right (0..1000)."),
+        "label":  types.Schema(type=types.Type.STRING,  description="1-3 word description."),
+    },
+)
+
+
 _VERDICT_SCHEMA = types.Schema(
     type=types.Type.OBJECT,
     properties={
@@ -423,6 +445,7 @@ _VERDICT_SCHEMA = types.Schema(
             type=types.Type.STRING,
             description="One-sentence description of what was seen.",
         ),
+        "bbox": _BBOX_SCHEMA,
     },
     required=["triggered", "reason"],
 )
@@ -769,3 +792,117 @@ async def _safe_send(ws: WebSocket, payload: dict) -> None:
         await ws.send_text(json.dumps(payload))
     except Exception:
         pass
+
+
+# ============================================================
+# Test AI Model — free-form vision Q&A page
+#
+# Independent of the rules engine and the Playground WS: a one-shot REST
+# endpoint that accepts an image + prompt + provider/model and returns the
+# model's free-text reply. Used by the AI-Camera → Test AI Model page.
+# ============================================================
+
+@router.get("/test/models")
+async def test_list_models() -> dict[str, list[dict]]:
+    """Return vision-capable models grouped by provider for the Test page picker."""
+    out: dict[str, list[dict]] = {"gemini": [], "ollama": []}
+
+    # Gemini — list from the user's account, filter to non-Live generateContent.
+    if state.gemini_api_key:
+        try:
+            client = genai.Client(api_key=state.gemini_api_key)
+            async for m in await client.aio.models.list():
+                actions = list(getattr(m, "supported_actions", None) or [])
+                if "generateContent" not in actions:
+                    continue
+                name = (getattr(m, "name", "") or "").split("/")[-1]
+                if not name or "-live" in name:
+                    continue
+                out["gemini"].append({
+                    "name": name,
+                    "display_name": getattr(m, "display_name", None) or name,
+                })
+            # Newest-ish first by name.
+            out["gemini"].sort(key=lambda x: x["name"], reverse=True)
+        except Exception as e:
+            logger.warning("test/models gemini list failed: %s", e)
+
+    # Ollama — local installed models.
+    if ollama_client.is_configured():
+        try:
+            ms = await ollama_client.list_models()
+            out["ollama"] = [{"name": m["name"], "display_name": m["name"]} for m in ms]
+        except Exception as e:
+            logger.warning("test/models ollama list failed: %s", e)
+
+    return out
+
+
+@router.post("/test/ask")
+async def test_ask(
+    provider: str = Form(...),
+    model: str = Form(...),
+    prompt: str = Form(...),
+    image: UploadFile = File(...),
+) -> dict:
+    """Single-shot vision Q&A. Returns free text, *not* a JSON verdict."""
+    provider = (provider or "").strip().lower()
+    model = (model or "").strip()
+    prompt = (prompt or "").strip()
+    if provider not in ("gemini", "ollama"):
+        raise HTTPException(status_code=400, detail="provider must be 'gemini' or 'ollama'")
+    if not model:
+        raise HTTPException(status_code=400, detail="model is required")
+    if not prompt:
+        raise HTTPException(status_code=400, detail="prompt is required")
+
+    img_bytes = await image.read()
+    if not img_bytes:
+        raise HTTPException(status_code=400, detail="image upload is empty")
+    mime = image.content_type or "image/jpeg"
+
+    started = time.time()
+
+    if provider == "gemini":
+        if not state.gemini_api_key:
+            raise HTTPException(status_code=503, detail="Gemini API key not configured")
+        try:
+            client = genai.Client(api_key=state.gemini_api_key)
+            parts = [
+                types.Part(inline_data=types.Blob(data=img_bytes, mime_type=mime)),
+                types.Part(text=prompt),
+            ]
+            response = await client.aio.models.generate_content(
+                model=model,
+                contents=[types.Content(role="user", parts=parts)],
+            )
+            text = (response.text or "").strip()
+            return {
+                "ok": True,
+                "provider": "gemini",
+                "model": model,
+                "text": text,
+                "latency_ms": int((time.time() - started) * 1000),
+            }
+        except Exception as e:
+            logger.warning("test/ask gemini failed: %s", e)
+            return {
+                "ok": False,
+                "provider": "gemini",
+                "model": model,
+                "error": f"{type(e).__name__}: {e}",
+                "latency_ms": int((time.time() - started) * 1000),
+            }
+
+    # Ollama
+    if not ollama_client.is_configured():
+        raise HTTPException(status_code=503, detail="Ollama URL not configured")
+    res = await ollama_client.generate_text(model=model, prompt=prompt, images=[img_bytes])
+    return {
+        "ok": bool(res.get("ok")),
+        "provider": "ollama",
+        "model": model,
+        "text": res.get("text") or "",
+        "error": res.get("error"),
+        "latency_ms": int((time.time() - started) * 1000),
+    }

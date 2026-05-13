@@ -1095,6 +1095,67 @@ input:disabled, select:disabled, textarea:disabled {
 }
 
 /* =============================================================
+   Test AI Model page
+   ============================================================= */
+.tm-response {
+  background: var(--panel-2);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 12px 14px;
+  font-size: 14px;
+  line-height: 1.5;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+.tm-history-list {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+.tm-history-row {
+  display: grid;
+  grid-template-columns: 120px 1fr;
+  gap: 12px;
+  padding: 10px 12px;
+  background: var(--panel-2);
+  border: 1px solid var(--border);
+  border-left: 3px solid var(--border-2);
+  border-radius: 8px;
+}
+.tm-history-row.ok  { border-left-color: var(--ok); }
+.tm-history-row.err { border-left-color: var(--err); }
+.tm-history-thumb {
+  width: 120px;
+  height: 80px;
+  border-radius: 6px;
+  overflow: hidden;
+  background: #000;
+  border: 1px solid var(--border);
+  cursor: zoom-in;
+  transition: transform 0.1s ease, border-color 0.1s ease;
+}
+.tm-history-thumb:hover { transform: translateY(-1px); border-color: var(--accent); }
+.tm-history-thumb img { width: 100%; height: 100%; object-fit: cover; display: block; }
+.tm-history-body { min-width: 0; display: flex; flex-direction: column; gap: 6px; }
+.tm-history-meta { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.tm-history-prompt {
+  font-size: 13px;
+  color: var(--text);
+  line-height: 1.4;
+}
+.tm-history-response {
+  font-size: 13px;
+  color: var(--text-dim);
+  white-space: pre-wrap;
+  word-break: break-word;
+  line-height: 1.5;
+}
+@media (max-width: 700px) {
+  .tm-history-row { grid-template-columns: 1fr; }
+  .tm-history-thumb { width: 100%; height: 160px; }
+}
+
+/* =============================================================
    Alarm — full-page red strobe + banner with Silence button.
    Activated when an iteration_result lands with triggered=true.
    ============================================================= */
@@ -1468,6 +1529,52 @@ input:disabled, select:disabled, textarea:disabled {
   color: var(--accent-2);
 }
 .rule-countdown.paused .rule-cd-value { color: var(--text-dim); }
+
+.rule-sustained {
+  margin-top: 4px;
+  font-size: 11px;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 2px 8px;
+  border-radius: 999px;
+  background: var(--panel-3);
+  color: var(--text-dim);
+  border: 1px solid var(--border);
+}
+.rule-sustained[hidden] { display: none; }
+.rule-su-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--text-mute);
+  flex-shrink: 0;
+}
+.rule-su-label {
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  font-size: 10px;
+  font-weight: 600;
+}
+.rule-su-value { font-variant-numeric: tabular-nums; }
+.rule-sustained.candidate {
+  background: rgba(241, 196, 15, 0.14);
+  border-color: rgba(241, 196, 15, 0.4);
+  color: var(--warn);
+}
+.rule-sustained.candidate .rule-su-dot {
+  background: var(--warn);
+  animation: pulse 1.2s infinite ease-in-out;
+}
+.rule-sustained.sustained {
+  background: rgba(231, 76, 60, 0.18);
+  border-color: rgba(231, 76, 60, 0.4);
+  color: var(--err);
+}
+.rule-sustained.sustained .rule-su-dot {
+  background: var(--err);
+  box-shadow: 0 0 6px rgba(231, 76, 60, 0.6);
+}
 .rule-count { text-align: center; min-width: 64px; }
 .rule-count-num {
   font-size: 20px; font-weight: 700; color: var(--accent-2);
@@ -1536,6 +1643,227 @@ input:disabled, select:disabled, textarea:disabled {
   background: var(--surface);
   cursor: pointer;
 }
+
+/* Wrapper that lets us layer an SVG bounding-box overlay on a thumbnail. */
+.history-thumb-wrap {
+  position: relative;
+  display: inline-block;
+  line-height: 0;
+}
+.history-thumb-wrap .bbox-overlay {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  pointer-events: none;
+}
+.bbox-overlay rect {
+  fill: none;
+  stroke: #ff3b30;
+  stroke-width: 3;
+  vector-effect: non-scaling-stroke; /* keeps the stroke 3 CSS-px at any zoom */
+}
+/* Modal version: slightly bolder so it reads on a larger frame. */
+.live-frame.bbox-frame .bbox-overlay rect { stroke-width: 4; }
+.history-thumb-wrap.annotated::after {
+  content: "BOX";
+  position: absolute;
+  top: 3px;
+  left: 3px;
+  background: rgba(231, 76, 60, 0.95);
+  color: white;
+  padding: 1px 6px;
+  border-radius: 3px;
+  font-size: 9px;
+  font-weight: 700;
+  letter-spacing: 0.06em;
+  pointer-events: none;
+}
+
+/* Plain + annotated side by side */
+.thumb-pair {
+  display: inline-flex;
+  gap: 4px;
+  align-items: stretch;
+  padding: 2px;
+  border-radius: 6px;
+  background: rgba(231, 76, 60, 0.08);
+}
+
+/* Episode trigger row (sustained run with multiple iterations) */
+.history-entry.episode { border-left-width: 4px; }
+
+.ep-collapse {
+  margin-top: 8px;
+  border-top: 1px dashed var(--border);
+  padding-top: 6px;
+}
+.ep-collapse > summary {
+  list-style: none;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 4px;
+  border-radius: 6px;
+  font-size: 12px;
+  user-select: none;
+}
+.ep-collapse > summary::-webkit-details-marker { display: none; }
+.ep-collapse > summary::before {
+  content: "▶";
+  font-size: 9px;
+  color: var(--text-dim);
+  transition: transform 0.15s ease;
+  display: inline-block;
+}
+.ep-collapse[open] > summary::before { transform: rotate(90deg); }
+.ep-collapse > summary:hover { background: var(--panel-3); }
+.ep-count {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 24px;
+  height: 20px;
+  padding: 0 7px;
+  border-radius: 999px;
+  background: var(--err);
+  color: white;
+  font-weight: 700;
+  font-size: 11px;
+}
+.ep-count-lbl { color: var(--text); }
+.ep-toggle {
+  margin-left: auto;
+  color: var(--text-dim);
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+.ep-iter-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin-top: 6px;
+}
+.ep-iter {
+  background: var(--panel-2);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 6px 8px;
+}
+.ep-iter-meta {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 12px;
+  margin-bottom: 4px;
+}
+
+/* =============================================================
+   SIP Phone — Extension page
+   ============================================================= */
+.keypad {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 6px;
+  margin: 10px 0 14px;
+}
+.keypad-key {
+  background: var(--panel-2);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 14px 0;
+  font-size: 18px;
+  font-weight: 600;
+  color: var(--text);
+  cursor: pointer;
+  font-family: inherit;
+  transition: background 0.1s ease, transform 0.05s ease;
+}
+.keypad-key:hover { background: var(--panel-3); }
+.keypad-key:active { transform: scale(0.96); background: var(--accent-soft); color: var(--accent-2); }
+
+.call-panel {
+  margin-top: 14px;
+  padding: 14px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: var(--panel-2);
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+.call-peer-name { font-size: 18px; font-weight: 600; }
+.call-peer-meta { color: var(--text-dim); font-size: 12px; text-transform: capitalize; }
+.call-timer {
+  font-size: 28px;
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+  color: var(--accent-2);
+  text-align: center;
+}
+
+.btn.danger { background: var(--err); }
+.btn.danger:hover { filter: brightness(1.1); }
+.btn.secondary.active {
+  background: rgba(231, 76, 60, 0.18);
+  border-color: var(--err);
+  color: var(--err);
+}
+
+.sip-history-list { display: flex; flex-direction: column; gap: 6px; }
+.sip-history-row {
+  display: grid;
+  grid-template-columns: 24px 1fr;
+  gap: 10px;
+  align-items: center;
+  padding: 8px 10px;
+  background: var(--panel-2);
+  border: 1px solid var(--border);
+  border-left: 3px solid var(--border-2);
+  border-radius: 8px;
+}
+.sip-history-row.ok   { border-left-color: var(--ok); }
+.sip-history-row.warn { border-left-color: var(--warn); }
+.sip-history-row.err  { border-left-color: var(--err); }
+.sip-history-arrow { font-size: 20px; color: var(--text-dim); text-align: center; }
+.sip-history-peer { font-weight: 600; font-size: 14px; }
+.sip-history-meta { color: var(--text-dim); font-size: 12px; }
+
+/* Modal large frame — bbox sits over the contained image. We override the
+ * 16:9 aspect ratio + 100% sizing of .live-frame so the wrapper hugs the
+ * actual image's natural aspect; that way the absolutely-positioned SVG
+ * overlay covers exactly the image area (no letterboxed margins where the
+ * bbox would otherwise be wrongly drawn). */
+.live-frame.bbox-frame {
+  position: relative;
+  display: inline-block;
+  width: auto;
+  aspect-ratio: auto;
+  background: #000;
+  max-width: 100%;
+  margin: 0 auto;
+}
+.live-frame.bbox-frame img {
+  display: block;
+  width: auto;
+  height: auto;
+  max-width: 100%;
+  max-height: 70vh;
+  object-fit: initial;
+}
+.live-frame.bbox-frame .bbox-overlay {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  pointer-events: none;
+}
+/* Centre the bbox-frame block in the modal column. */
+.snap-modal { text-align: center; }
+.snap-modal > * { text-align: left; }
 
 /* Audio meter — shared between Frigate Home cards and the Rules audio row. */
 .audio-meter {

@@ -122,3 +122,51 @@ async def generate_verdict(
 
     text = (data.get("response") or "").strip()
     return {"text": text, "ok": True, "error": None}
+
+
+async def generate_text(
+    model: str,
+    prompt: str,
+    images: Optional[list[bytes]] = None,
+    system_instruction: Optional[str] = None,
+) -> dict:
+    """Free-form text generation — *not* constrained to JSON. Used by the
+    Test AI Model page for arbitrary Q&A about an uploaded image.
+
+    Returns the same shape as generate_verdict():
+      {"text": <response string>, "ok": bool, "error": str|None}
+    """
+    base = _base_url()
+    if not base:
+        return {"text": "", "ok": False, "error": "Ollama URL not configured"}
+
+    body: dict = {
+        "model": model,
+        "prompt": prompt,
+        "stream": False,
+        "options": {"temperature": 0.4},
+    }
+    if system_instruction:
+        body["system"] = system_instruction
+    if images:
+        body["images"] = [base64.b64encode(img).decode("ascii") for img in images]
+
+    try:
+        async with httpx.AsyncClient(timeout=_TIMEOUT) as client:
+            r = await client.post(f"{base}/api/generate", json=body)
+            r.raise_for_status()
+            data = r.json() or {}
+    except httpx.HTTPStatusError as e:
+        msg = f"HTTP {e.response.status_code}"
+        try:
+            err = e.response.json().get("error")
+            if err:
+                msg = f"{msg}: {err}"
+        except Exception:
+            pass
+        return {"text": "", "ok": False, "error": msg}
+    except Exception as e:
+        return {"text": "", "ok": False, "error": f"{type(e).__name__}: {e}"}
+
+    text = (data.get("response") or "").strip()
+    return {"text": text, "ok": True, "error": None}
