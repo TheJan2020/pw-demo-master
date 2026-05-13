@@ -1,23 +1,24 @@
 """
 MQTT service — singleton that connects to the user's MQTT broker and
-subscribes to Frigate topics. Maintains an in-memory motion/state cache
+subscribes to Frigate topics. Maintains an in-memory motion/audio cache
 and broadcasts updates to subscribers (WebSocket clients).
 
-Frigate's standard topic layout (under `<prefix>/`, default `frigate/`):
-  - frigate/<camera>/motion       payload: ON|OFF
-  - frigate/<camera>/audio        payload: ON|OFF
-  - frigate/<camera>/<label>      payload: ON|OFF (per-label detection)
-  - frigate/events                payload: JSON  {type:new|update|end, before, after}
+Frigate topic layout (under `<prefix>/`, default `frigate/`):
+  - frigate/<camera>/motion              payload: ON|OFF
+  - frigate/<camera>/<label>             payload: ON|OFF (per-label detection)
+  - frigate/<camera>/audio/<metric>      payload: float (dBFS, rms, snr) OR ON|OFF (per-label audio)
+  - frigate/events                       payload: JSON
 
-We subscribe to <prefix>/+/motion and <prefix>/events. Motion is the
-authoritative flag; the events stream provides object labels for each
-active detection so the UI can display "MOTION · person, car".
+Subscribed topics: <prefix>/+/motion, <prefix>/+/audio/+, <prefix>/events.
+Object labels come from the events stream so the UI can display
+"MOTION · person, car"; audio levels (dBFS) drive the per-camera meter.
 """
 from __future__ import annotations
 
 import asyncio
 import json
 import logging
+import math
 from typing import Any, Optional, Set
 
 import aiomqtt
@@ -26,11 +27,24 @@ from ..core.state import state
 
 logger = logging.getLogger("mqtt")
 
+# Audio "metric" topics under <prefix>/<cam>/audio/* that carry numeric levels
+# rather than per-label ON/OFF state.
+_AUDIO_METRICS = {"dBFS", "rms", "snr"}
+
+
+def _default_cam_state() -> dict[str, Any]:
+    return {
+        "motion": False,
+        "objects": set(),
+        "audio_dbfs": None,        # latest dBFS reading (None until first message)
+        "audio_labels": set(),     # active per-label audio detections (speech, dog_bark, …)
+    }
+
 
 class MqttService:
     def __init__(self) -> None:
         self._task: Optional[asyncio.Task] = None
-        # camera -> {motion: bool, objects: set[str], updated_at: float}
+        # camera -> dict (see _default_cam_state)
         self._motion_state: dict[str, dict[str, Any]] = {}
         # asyncio.Queue's, each receives JSON-friendly dicts
         self._subscribers: Set[asyncio.Queue] = set()
@@ -55,13 +69,16 @@ class MqttService:
         self.connected = False
 
     def snapshot(self) -> dict[str, dict]:
-        """Current motion/state per camera (JSON-friendly)."""
+        """Current motion/audio state per camera (JSON-friendly)."""
+        return {cam: self._serialize(s) for cam, s in self._motion_state.items()}
+
+    @staticmethod
+    def _serialize(s: dict[str, Any]) -> dict:
         return {
-            cam: {
-                "motion": s["motion"],
-                "objects": sorted(list(s["objects"])),
-            }
-            for cam, s in self._motion_state.items()
+            "motion": bool(s.get("motion")),
+            "objects": sorted(list(s.get("objects") or [])),
+            "audio_dbfs": s.get("audio_dbfs"),
+            "audio_labels": sorted(list(s.get("audio_labels") or [])),
         }
 
     def any_motion(self, cameras: list[str]) -> bool:
@@ -110,6 +127,7 @@ class MqttService:
                     logger.info("MQTT connected to %s:%s (prefix=%s)", host, port, prefix)
 
                     await client.subscribe(f"{prefix}/+/motion")
+                    await client.subscribe(f"{prefix}/+/audio/+")
                     await client.subscribe(f"{prefix}/events")
 
                     async for msg in client.messages:
@@ -144,11 +162,41 @@ class MqttService:
             camera = parts[1]
             value = payload.decode("utf-8", "replace").strip().upper()
             motion = (value == "ON")
-            current = self._motion_state.setdefault(camera, {"motion": False, "objects": set()})
+            current = self._motion_state.setdefault(camera, _default_cam_state())
             current["motion"] = motion
             if not motion:
                 # When motion ends, clear any lingering object labels.
                 current["objects"].clear()
+            self._broadcast_camera(camera)
+            return
+
+        # <prefix>/<camera>/audio/<metric_or_label>
+        #   metric in {dBFS, rms, snr} → float level
+        #   anything else (e.g. "speech", "dog_bark") → ON/OFF detection
+        if len(parts) == 4 and parts[2] == "audio":
+            camera = parts[1]
+            metric = parts[3]
+            payload_str = payload.decode("utf-8", "replace").strip()
+            current = self._motion_state.setdefault(camera, _default_cam_state())
+            if metric in _AUDIO_METRICS:
+                try:
+                    val = float(payload_str)
+                except ValueError:
+                    return
+                if metric == "dBFS":
+                    current["audio_dbfs"] = val
+                elif metric == "rms" and current.get("audio_dbfs") is None:
+                    # Fallback: convert int16 RMS to approximate dBFS so cameras
+                    # that don't publish dBFS still drive the meter.
+                    current["audio_dbfs"] = (
+                        20.0 * math.log10(val / 32768.0) if val > 0 else -100.0
+                    )
+                # snr is informational; we don't render it.
+            else:
+                if payload_str.upper() == "ON":
+                    current["audio_labels"].add(metric)
+                else:
+                    current["audio_labels"].discard(metric)
             self._broadcast_camera(camera)
             return
 
@@ -164,7 +212,7 @@ class MqttService:
             label = after.get("label")
             if not camera or not label:
                 return
-            current = self._motion_state.setdefault(camera, {"motion": False, "objects": set()})
+            current = self._motion_state.setdefault(camera, _default_cam_state())
             if etype == "end":
                 current["objects"].discard(label)
             else:  # new / update
@@ -176,12 +224,11 @@ class MqttService:
             return
 
     def _broadcast_camera(self, camera: str) -> None:
-        s = self._motion_state.get(camera) or {"motion": False, "objects": set()}
+        s = self._motion_state.get(camera) or _default_cam_state()
         payload = {
             "type": "motion",
             "camera": camera,
-            "motion": bool(s.get("motion")),
-            "objects": sorted(list(s.get("objects", set()))),
+            **self._serialize(s),
         }
         for q in list(self._subscribers):
             try:

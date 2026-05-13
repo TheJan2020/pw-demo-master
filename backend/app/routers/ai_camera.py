@@ -39,6 +39,7 @@ from google.genai import types
 
 from ..core.state import state
 from ..services.mqtt import mqtt_service
+from ..services import ollama as ollama_client
 
 logger = logging.getLogger("ai_camera")
 router = APIRouter()
@@ -427,10 +428,71 @@ _VERDICT_SCHEMA = types.Schema(
 )
 
 
+def _parse_model_selector(selector: str) -> tuple[str, str]:
+    """Same shape as the rules engine: `<provider>:<model>`. Empty → Gemini auto."""
+    s = (selector or "").strip()
+    if not s:
+        return "gemini", ""
+    if ":" not in s:
+        return "gemini", s
+    provider, _, model = s.partition(":")
+    provider = provider.strip().lower()
+    model = model.strip()
+    if provider not in ("gemini", "ollama"):
+        return "gemini", model
+    return provider, model
+
+
+async def _call_gemini_verdict(
+    client: genai.Client, model: str, rule: str, snapshots: dict[str, bytes],
+) -> dict:
+    parts: list[types.Part] = []
+    for cam, img in snapshots.items():
+        parts.append(types.Part(inline_data=types.Blob(data=img, mime_type="image/jpeg")))
+        parts.append(types.Part(text=f"(frame above is from camera: {cam})"))
+    parts.append(types.Part(text="Apply the rule and reply now with the JSON verdict."))
+    gen_config = types.GenerateContentConfig(
+        system_instruction=_build_system_instruction(rule),
+        response_mime_type="application/json",
+        response_schema=_VERDICT_SCHEMA,
+        temperature=0.1,
+    )
+    try:
+        response = await client.aio.models.generate_content(
+            model=model,
+            contents=[types.Content(role="user", parts=parts)],
+            config=gen_config,
+        )
+    except Exception as e:
+        logger.warning("gemini generate_content failed in playground: %s", e)
+        return {"text": "", "ok": False, "error": f"{type(e).__name__}: {e}"}
+    return {"text": (response.text or "").strip(), "ok": True, "error": None}
+
+
+async def _call_ollama_verdict(
+    model: str, rule: str, snapshots: dict[str, bytes],
+) -> dict:
+    # Ollama doesn't take interleaved image/text parts the way Gemini does —
+    # we list the cameras in a single user prompt that references the images
+    # in the order they're sent.
+    cam_list = ", ".join(snapshots.keys())
+    user_prompt = (
+        f"Frames provided in order: {cam_list}.\n"
+        "Apply the rule and reply now with the JSON verdict."
+    )
+    return await ollama_client.generate_verdict(
+        model=model,
+        system_instruction=_build_system_instruction(rule),
+        user_prompt=user_prompt,
+        images=list(snapshots.values()),
+    )
+
+
 async def _run_iteration(
     websocket: WebSocket,
     client: genai.Client,
-    model: str,
+    gemini_default_model: str,
+    model_selector: str,
     rule: str,
     iter_id: int,
     cameras: list[str],
@@ -462,41 +524,30 @@ async def _run_iteration(
         "snapshots": {c: base64.b64encode(b).decode("ascii") for c, b in snapshots.items()},
     })
 
-    # Build the contents: each image followed by the camera label, then a text
-    # prompt asking for the verdict. The system_instruction (set on the client
-    # config) pins the rule and the response format.
-    parts: list[types.Part] = []
-    for cam, img in snapshots.items():
-        parts.append(types.Part(inline_data=types.Blob(data=img, mime_type="image/jpeg")))
-        parts.append(types.Part(text=f"(frame above is from camera: {cam})"))
-    parts.append(types.Part(text="Apply the rule and reply now with the JSON verdict."))
+    provider, model_id = _parse_model_selector(model_selector)
+    if provider == "ollama":
+        result = await _call_ollama_verdict(model_id, rule, snapshots)
+        used_model = model_id
+    else:
+        used_model = model_id or gemini_default_model
+        result = await _call_gemini_verdict(client, used_model, rule, snapshots)
+        provider = "gemini"
 
-    gen_config = types.GenerateContentConfig(
-        system_instruction=_build_system_instruction(rule),
-        response_mime_type="application/json",
-        response_schema=_VERDICT_SCHEMA,
-        temperature=0.1,
-    )
-
-    try:
-        response = await client.aio.models.generate_content(
-            model=model,
-            contents=[types.Content(role="user", parts=parts)],
-            config=gen_config,
-        )
-    except Exception as e:
-        logger.exception("generate_content failed")
+    if not result.get("ok"):
+        err = result.get("error") or "unknown error"
         return {
             "iteration_id": iter_id,
             "trigger_reason": reason,
             "started_at": started_at,
             "finished_at": time.time(),
-            "response_text": f"error: {type(e).__name__}: {e}",
-            "parsed": {"error": True, "message": str(e)},
+            "response_text": f"error: {err}",
+            "parsed": {"error": True, "message": err},
             "triggered": False,
+            "provider": provider,
+            "model": used_model,
         }
 
-    text_buf = (response.text or "").strip()
+    text_buf = (result.get("text") or "").strip()
     parsed = _extract_json_object(text_buf) or {}
     triggered = bool(parsed.get("triggered")) if isinstance(parsed, dict) else False
 
@@ -508,6 +559,8 @@ async def _run_iteration(
         "response_text": text_buf,
         "parsed": parsed,
         "triggered": triggered,
+        "provider": provider,
+        "model": used_model,
     }
 
 
@@ -544,7 +597,7 @@ async def playground_ws(websocket: WebSocket) -> None:
     scan: dict = first.get("scan") or {"mode": "periodic", "period_s": 30}
     action: Optional[dict] = first.get("action") or None
     cooldown_s: float = float(first.get("cooldown_s") or 0)
-    override_model: str = (first.get("model") or "").strip()
+    model_selector: str = (first.get("model") or "").strip()
 
     if not cameras:
         await _safe_send(websocket, {"type": "error", "message": "Pick at least one camera."})
@@ -555,17 +608,36 @@ async def playground_ws(websocket: WebSocket) -> None:
         await websocket.close()
         return
 
+    provider, requested_model = _parse_model_selector(model_selector)
+    if provider == "ollama" and not ollama_client.is_configured():
+        await _safe_send(websocket, {
+            "type": "error",
+            "message": "Ollama URL not configured. Set it in Settings → Ollama.",
+        })
+        await websocket.close()
+        return
+
     # Dedicated client for this playground session — separate from any other
     # session in the app. Cleaned up when the WS closes.
     client = genai.Client(api_key=state.gemini_api_key)
 
-    # Resolve a vision-capable model that this account actually has access to.
-    if override_model:
-        model, candidates = override_model, [override_model]
+    # Resolve the Gemini default once per session — used both as the fallback
+    # for `gemini:` (with no specific model) and to label the ready message.
+    gemini_default = ""
+    try:
+        gemini_default, candidates = await _resolve_vision_model(client)
+    except Exception:
+        candidates = []
+
+    if provider == "ollama":
+        display = f"Ollama · {requested_model}"
+        ready_payload = {"type": "ready", "model": display, "provider": "ollama"}
     else:
-        model, candidates = await _resolve_vision_model(client)
-    logger.info("ai-camera playground using model %s (tried: %s)", model, candidates)
-    await _safe_send(websocket, {"type": "ready", "model": model, "candidates_tried": candidates})
+        chosen = requested_model or gemini_default
+        display = f"Gemini · {chosen}" if chosen else "Gemini"
+        ready_payload = {"type": "ready", "model": display, "provider": "gemini", "candidates_tried": candidates}
+    logger.info("ai-camera playground using %s", display)
+    await _safe_send(websocket, ready_payload)
 
     stop_evt = asyncio.Event()
     ctx = _RunContext(scan, cameras)
@@ -622,7 +694,10 @@ async def playground_ws(websocket: WebSocket) -> None:
 
                 iter_id += 1
                 try:
-                    result = await _run_iteration(websocket, client, model, rule, iter_id, cameras, reason)
+                    result = await _run_iteration(
+                        websocket, client, gemini_default, model_selector,
+                        rule, iter_id, cameras, reason,
+                    )
                 except Exception as e:
                     logger.exception("iteration error")
                     await _safe_send(websocket, {

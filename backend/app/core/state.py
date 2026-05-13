@@ -4,7 +4,7 @@ from __future__ import annotations
 import json
 import threading
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 
 _STATE_PATH = Path(__file__).resolve().parents[3] / "data" / "state.json"
 _lock = threading.Lock()
@@ -26,6 +26,12 @@ class State:
         self.mqtt_username: Optional[str] = None
         self.mqtt_password: Optional[str] = None
         self.mqtt_topic_prefix: str = "frigate"
+        # Ollama (local) — optional alternative vision provider for rules.
+        self.ollama_url: Optional[str] = None
+        # Persistent AI-Camera rules — see services/ai_camera_engine for the
+        # runtime engine that consumes these. Each entry is a plain dict; the
+        # rules router owns the schema, this layer only round-trips the list.
+        self.ai_camera_rules: list[dict[str, Any]] = []
         self._load()
 
     def _load(self) -> None:
@@ -43,6 +49,10 @@ class State:
             self.mqtt_username = data.get("mqtt_username") or None
             self.mqtt_password = data.get("mqtt_password") or None
             self.mqtt_topic_prefix = data.get("mqtt_topic_prefix") or "frigate"
+            self.ollama_url = data.get("ollama_url") or None
+            rules = data.get("ai_camera_rules")
+            if isinstance(rules, list):
+                self.ai_camera_rules = [r for r in rules if isinstance(r, dict)]
         except Exception:
             pass
 
@@ -62,6 +72,8 @@ class State:
                         "mqtt_username": self.mqtt_username,
                         "mqtt_password": self.mqtt_password,
                         "mqtt_topic_prefix": self.mqtt_topic_prefix,
+                        "ollama_url": self.ollama_url,
+                        "ai_camera_rules": self.ai_camera_rules,
                     },
                     indent=2,
                 )

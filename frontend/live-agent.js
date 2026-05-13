@@ -49,6 +49,10 @@ const LIVE = {
   cameraTimer: null,
   cameraName: null,
 
+  // True once a mic stream has been acquired this session. Stays false when
+  // the machine has no input device — session continues in text-only mode.
+  hasMic: false,
+
   log: null,
 };
 
@@ -79,6 +83,32 @@ function logLine(kind, text) {
   line.className = `log-line${kind ? ' ' + kind : ''}`;
   line.textContent = `[${new Date().toLocaleTimeString()}] ${text}`;
   LIVE.log.prepend(line);
+}
+
+// Streamed channels (agent/user transcripts) arrive as many small chunks
+// per turn. To avoid one log row per chunk, we keep a single "open" line
+// per stream id and append text into it until the turn closes.
+//
+// Call appendStream('agent_text', kind, prefix, chunk) to append; call
+// closeStreams() on turn_complete / interrupted to start fresh next turn.
+const STREAM_LINES = {};
+function appendStream(id, kind, prefix, chunk) {
+  if (!LIVE.log || !chunk) return;
+  let entry = STREAM_LINES[id];
+  if (!entry) {
+    const el = document.createElement('div');
+    el.className = `log-line${kind ? ' ' + kind : ''}`;
+    const ts = new Date().toLocaleTimeString();
+    el.textContent = `[${ts}] ${prefix}${chunk}`;
+    LIVE.log.prepend(el);
+    STREAM_LINES[id] = { el, text: chunk, ts, prefix };
+  } else {
+    entry.text += chunk;
+    entry.el.textContent = `[${entry.ts}] ${entry.prefix}${entry.text}`;
+  }
+}
+function closeStreams() {
+  for (const k of Object.keys(STREAM_LINES)) delete STREAM_LINES[k];
 }
 
 function setLiveStatus(state, text) {
@@ -442,25 +472,30 @@ function handleServerMessage(msg) {
     }
     case 'turn_complete':
       // No more audio incoming for this turn — schedule the echo gate to lift
-      // once the queued audio has finished playing.
+      // once the queued audio has finished playing, and close any streamed
+      // transcript lines so the next turn starts on a fresh row.
+      closeStreams();
       scheduleEchoEnd();
       break;
     case 'text':
-      logLine('agent', `agent: ${msg.text}`);
+      appendStream('text', 'agent', 'agent: ', msg.text);
       break;
     case 'user_text':
-      logLine('you', `(heard) ${msg.text}`);
+      appendStream('user_text', 'you', '(heard) ', msg.text);
       break;
     case 'agent_text':
-      logLine('agent', `(spoken) ${msg.text}`);
+      appendStream('agent_text', 'agent', '(spoken) ', msg.text);
       break;
     case 'tool_call':
+      // Tool activity is a hard turn boundary in our log.
+      closeStreams();
       logLine('tool', `→ ${msg.name}(${JSON.stringify(msg.args)})`);
       break;
     case 'tool_result':
       logLine('tool', `← ${msg.name}: ${JSON.stringify(msg.result).slice(0, 400)}`);
       break;
     case 'interrupted':
+      closeStreams();
       flushPlayback();
       scheduleEchoEnd();
       break;
@@ -515,16 +550,34 @@ async function startSession({ camera, log, wakeWord, stopWord, onlyAreas }) {
     // Push initial agent-side config to the backend so the filter applies
     // to the very first tool call.
     sendConfig({ only_areas: LIVE.onlyAreas });
-    await startMeter();
-    const ok = startSTT();
+
+    // Mic + STT are optional: if no input device is present (or the user
+    // denies permission), keep the session alive and let the text input
+    // drive the conversation instead.
+    let sttOk = false;
+    try {
+      await startMeter();
+      LIVE.hasMic = true;
+      sttOk = startSTT();
+    } catch (e) {
+      LIVE.hasMic = false;
+      logLine('err', `No microphone (${e.message || e.name || 'unavailable'}) — continuing in text-only mode.`);
+    }
+
     if (camera) startCameraStreaming(camera);
 
-    // Reflect mute state in the UI now that buttons exist.
+    // Without a mic, mute/wake-word logic doesn't apply — force-mute so any
+    // stray STT plumbing stays inert, and reflect that in the UI.
+    if (!LIVE.hasMic) LIVE.sttMuted = true;
     setMuted(LIVE.sttMuted);
 
-    if (ok) {
+    if (sttOk) {
       const prefix = LIVE.wakeWord ? `Say "${LIVE.wakeWord}" to start, "${LIVE.stopWord || '(no stop word)'}" to mute. ` : 'Listening — speak naturally. ';
       logLine('ok', `Session started. ${prefix}`);
+    } else if (LIVE.hasMic) {
+      logLine('ok', `Session started. Type below to chat (browser STT unavailable).`);
+    } else {
+      logLine('ok', `Session started · text-only. Type below and press Enter to chat.`);
     }
   } catch (e) {
     logLine('err', `start failed: ${e.message}`);
@@ -543,8 +596,10 @@ function stopSession() {
 
 function cleanup() {
   LIVE.active = false;
+  LIVE.hasMic = false;
   if (LIVE.echoEndTimer) { clearTimeout(LIVE.echoEndTimer); LIVE.echoEndTimer = null; }
   LIVE.echoing = false;
+  closeStreams();
   stopSTT();
   stopMeter();
   stopCameraStreaming();
@@ -581,4 +636,5 @@ window.LiveAgentSession = {
   isActive:    () => LIVE.active,
   isMuted:     () => LIVE.sttMuted,
   isOnlyAreas: () => LIVE.onlyAreas,
+  hasMic:      () => LIVE.hasMic,
 };

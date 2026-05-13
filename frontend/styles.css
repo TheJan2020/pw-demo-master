@@ -1283,3 +1283,354 @@ input:disabled, select:disabled, textarea:disabled {
   .sidebar.open { transform: translateX(0); box-shadow: var(--shadow); }
   .sidebar.collapsed { width: 248px; } /* on mobile, just hide via transform */
 }
+
+/* =============================================================
+   AI-Camera · Rules — list rows, history, editor modal
+   ============================================================= */
+.rule-row {
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  margin-bottom: 10px;
+  overflow: hidden;
+  transition: background-color 0.15s, border-color 0.15s, opacity 0.15s;
+}
+.rule-row.on {
+  background: var(--surface-2);
+  border-color: rgba(80, 200, 140, 0.35);
+  box-shadow: inset 4px 0 0 0 rgba(80, 200, 140, 0.6);
+}
+.rule-row.off {
+  background: repeating-linear-gradient(
+    -45deg,
+    var(--surface) 0 10px,
+    rgba(255, 255, 255, 0.02) 10px 20px
+  );
+  border-style: dashed;
+  opacity: 0.85;
+  filter: grayscale(0.4);
+  box-shadow: inset 4px 0 0 0 rgba(120, 120, 120, 0.4);
+}
+.rule-row.off .rule-name { color: var(--text-dim); }
+.rule-row-head {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 10px 14px;
+}
+.rule-info { flex: 1; min-width: 0; }
+.rule-name { font-weight: 600; font-size: 14px; }
+.rule-sub { display: flex; gap: 6px; flex-wrap: wrap; margin-top: 4px; }
+
+/* Power button — replaces the enable checkbox. */
+.rule-power {
+  display: inline-flex; align-items: center; gap: 6px;
+  padding: 6px 12px;
+  border-radius: 999px;
+  font-size: 11px; font-weight: 700; letter-spacing: 0.06em;
+  border: 1px solid var(--border);
+  background: var(--surface);
+  color: var(--text-dim);
+  cursor: pointer;
+  transition: background-color 0.15s, border-color 0.15s, color 0.15s, box-shadow 0.15s;
+  min-width: 78px; justify-content: center;
+}
+.rule-power[aria-pressed="true"] {
+  background: rgba(80, 200, 140, 0.16);
+  border-color: rgba(80, 200, 140, 0.6);
+  color: var(--ok);
+  box-shadow: 0 0 8px 0 rgba(80, 200, 140, 0.35);
+}
+.rule-power[aria-pressed="false"]:hover { color: var(--text); border-color: var(--text-dim); }
+.rule-power-icon { font-size: 14px; line-height: 1; }
+.rule-power:disabled { opacity: 0.6; cursor: wait; }
+
+/* Stats column — two stacked counters. */
+.rule-stats {
+  display: flex; gap: 14px; align-items: center; flex-shrink: 0;
+}
+
+/* Chevron expand button — sits at the far right end of the row. */
+.rule-expand {
+  margin-left: 8px;
+  width: 42px; height: 42px;
+  display: inline-flex; align-items: center; justify-content: center;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 50%;
+  color: var(--text-dim);
+  cursor: pointer;
+  flex-shrink: 0;
+  transition: color 0.18s, border-color 0.18s, background-color 0.18s, transform 0.18s, box-shadow 0.18s;
+}
+.rule-expand:hover {
+  color: var(--accent-2);
+  border-color: var(--accent-2);
+  background: rgba(80, 160, 255, 0.08);
+  box-shadow: 0 0 0 4px rgba(80, 160, 255, 0.10);
+}
+.rule-expand:active { transform: scale(0.94); }
+.rule-expand[aria-expanded="true"] {
+  color: var(--accent-2);
+  border-color: var(--accent-2);
+  background: rgba(80, 160, 255, 0.14);
+}
+.rule-expand-arrow {
+  display: block;
+  transition: transform 0.22s cubic-bezier(0.4, 0, 0.2, 1);
+}
+.rule-expand[aria-expanded="true"] .rule-expand-arrow { transform: rotate(90deg); }
+
+/* Snapshot modal — bigger image and full iteration metadata. */
+.snap-modal { display: flex; flex-direction: column; gap: 12px; }
+.snap-modal .live-frame { max-height: 60vh; }
+.snap-modal .live-frame img {
+  max-height: 60vh;
+  width: 100%;
+  object-fit: contain;
+  background: #000;
+  border-radius: 6px;
+}
+.snap-modal-others { display: flex; flex-direction: column; gap: 6px; }
+.snap-modal-others .history-thumb { width: 96px; height: 64px; }
+.snap-modal-meta {
+  display: grid;
+  grid-template-columns: max-content 1fr;
+  gap: 6px 14px;
+  margin: 0;
+  font-size: 13px;
+}
+.snap-modal-meta dt {
+  color: var(--text-dim);
+  text-transform: uppercase;
+  font-size: 11px;
+  letter-spacing: 0.05em;
+  align-self: start;
+  padding-top: 2px;
+}
+.snap-modal-meta dd { margin: 0; color: var(--text); word-break: break-word; }
+.snap-modal-raw {
+  margin: 0;
+  padding: 8px 10px;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  font-size: 11px;
+  max-height: 160px;
+  overflow: auto;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+.rule-badge {
+  font-size: 11px;
+  padding: 2px 8px;
+  border-radius: 999px;
+  background: var(--surface);
+  color: var(--text-dim);
+  border: 1px solid var(--border);
+}
+.rule-badge.red {
+  background: rgba(220, 53, 69, 0.12);
+  color: var(--err);
+  border-color: rgba(220, 53, 69, 0.35);
+}
+.rule-badge.muted { opacity: 0.7; }
+
+/* Camera-name badge: blinks when Frigate reports motion on the camera and
+   the rule is enabled with a motion-reactive scan mode. */
+.rule-badge.rule-cam.blinking {
+  animation: rule-cam-blink 1s infinite;
+  background: rgba(220, 53, 69, 0.18);
+  color: var(--err);
+  border-color: rgba(220, 53, 69, 0.55);
+}
+@keyframes rule-cam-blink {
+  0%, 100% { opacity: 1; box-shadow: 0 0 0 0 rgba(220, 53, 69, 0); }
+  50%      { opacity: 0.55; box-shadow: 0 0 6px 1px rgba(220, 53, 69, 0.5); }
+}
+
+.rule-countdown {
+  margin-top: 6px;
+  font-size: 11px;
+  color: var(--text-dim);
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+.rule-countdown[hidden] { display: none; }
+.rule-cd-label {
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  font-size: 10px;
+}
+.rule-cd-value {
+  font-variant-numeric: tabular-nums;
+  font-weight: 600;
+  color: var(--accent-2);
+}
+.rule-countdown.paused .rule-cd-value { color: var(--text-dim); }
+.rule-count { text-align: center; min-width: 64px; }
+.rule-count-num {
+  font-size: 20px; font-weight: 700; color: var(--accent-2);
+  font-variant-numeric: tabular-nums;
+}
+.rule-count-num.rule-count-trig { color: var(--err); }
+.rule-count-num.pulse { animation: rule-count-pulse 0.4s ease-out; }
+.rule-count-lbl { font-size: 10px; text-transform: uppercase; color: var(--text-dim); letter-spacing: 0.05em; }
+@keyframes rule-count-pulse {
+  0%   { transform: scale(1);   }
+  40%  { transform: scale(1.18); }
+  100% { transform: scale(1);   }
+}
+.rule-actions { display: flex; gap: 6px; flex-shrink: 0; }
+.btn.danger { color: var(--err); border-color: rgba(220, 53, 69, 0.35); }
+.btn.danger:hover { background: rgba(220, 53, 69, 0.08); }
+
+.rule-row-detail {
+  padding: 12px 14px 14px;
+  border-top: 1px dashed var(--border);
+  background: var(--surface);
+}
+.rule-history-tabs {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-bottom: 10px;
+}
+.rule-history-tabs .tab {
+  font-size: 12px;
+  padding: 5px 10px;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--text-dim);
+  border: 1px solid var(--border);
+  cursor: pointer;
+}
+.rule-history-tabs .tab.active {
+  background: var(--surface-2);
+  color: var(--text);
+  border-color: var(--accent-2);
+}
+
+.history-list { display: flex; flex-direction: column; gap: 8px; }
+.history-entry {
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 8px 10px;
+  background: var(--surface-2);
+}
+.history-entry.triggered { border-left: 3px solid var(--err); }
+.history-entry.not-triggered { border-left: 3px solid var(--border); }
+.history-meta {
+  display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
+  font-size: 12px;
+}
+.history-reason { font-size: 13px; margin-top: 4px; color: var(--text); }
+.history-thumbs {
+  display: flex; gap: 6px; margin-top: 8px; flex-wrap: wrap;
+}
+.history-thumb {
+  width: 120px; height: 80px;
+  object-fit: cover;
+  border-radius: 4px;
+  border: 1px solid var(--border);
+  background: var(--surface);
+  cursor: pointer;
+}
+
+/* Audio meter — shared between Frigate Home cards and the Rules audio row. */
+.audio-meter {
+  position: relative;
+  width: 100%;
+  height: 14px;
+  border-radius: 7px;
+  background: rgba(255, 255, 255, 0.04);
+  border: 1px solid var(--border);
+  overflow: hidden;
+}
+.audio-meter-bar {
+  position: absolute;
+  inset: 0 auto 0 0;
+  width: 0%;
+  background: linear-gradient(90deg, #2eb872 0%, #2eb872 55%, #e6c020 55%, #e6c020 80%, #dc3545 80%, #dc3545 100%);
+  background-size: 180% 100%;
+  background-position: left center;
+  transition: width 0.15s linear;
+}
+.audio-meter-val {
+  position: absolute;
+  right: 6px; top: 0; bottom: 0;
+  display: flex; align-items: center;
+  font-size: 9px;
+  font-variant-numeric: tabular-nums;
+  color: var(--text);
+  text-shadow: 0 0 4px rgba(0, 0, 0, 0.6);
+  pointer-events: none;
+  white-space: nowrap;
+}
+.audio-meter.warm .audio-meter-bar { filter: brightness(1.05); }
+.audio-meter.hot  .audio-meter-bar { filter: brightness(1.15) saturate(1.2); }
+
+/* Frigate Home — live motion / object badges + audio meter on each card. */
+.cam-badges {
+  position: absolute;
+  top: 8px; left: 8px;
+  display: flex; gap: 4px; flex-wrap: wrap;
+  pointer-events: none;
+  z-index: 2;
+}
+.cam-badge {
+  font-size: 10px;
+  font-weight: 700;
+  padding: 3px 7px;
+  border-radius: 999px;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+  background: rgba(0, 0, 0, 0.65);
+  color: #fff;
+  backdrop-filter: blur(2px);
+  border: 1px solid rgba(255, 255, 255, 0.15);
+}
+.cam-badge.motion {
+  background: rgba(220, 53, 69, 0.85);
+  border-color: rgba(255, 255, 255, 0.2);
+  animation: cam-motion-pulse 1.2s ease-in-out infinite;
+}
+.cam-badge.objects {
+  background: rgba(80, 160, 255, 0.85);
+  border-color: rgba(255, 255, 255, 0.2);
+}
+@keyframes cam-motion-pulse {
+  0%, 100% { box-shadow: 0 0 0 0 rgba(220, 53, 69, 0); }
+  50%      { box-shadow: 0 0 8px 2px rgba(220, 53, 69, 0.6); }
+}
+
+/* Rules — per-camera audio meter row inside each rule div. */
+.rule-audio-row {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+  gap: 8px;
+  padding: 8px 14px 12px;
+  border-top: 1px dashed var(--border);
+  background: rgba(0, 0, 0, 0.08);
+}
+.rule-row.off .rule-audio-row { opacity: 0.55; }
+.rule-audio-cell {
+  display: flex; flex-direction: column; gap: 4px;
+}
+.rule-audio-cam {
+  font-size: 11px;
+  color: var(--text-dim);
+  letter-spacing: 0.04em;
+}
+
+/* Rule editor modal */
+.rule-editor .row-2 {
+  display: grid; grid-template-columns: 1fr 1fr; gap: 10px;
+}
+.rule-flags {
+  display: flex; flex-direction: column; gap: 6px;
+  margin-top: 12px; padding: 10px; border-radius: 6px;
+  background: var(--surface);
+  border: 1px solid var(--border);
+}
+

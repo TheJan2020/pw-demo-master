@@ -110,6 +110,17 @@ const Mqtt = {
   getHealth: ()       => Api.getJSON('/api/mqtt/health'),
 };
 
+const Ollama = {
+  getConfig: () => Api.getJSON('/api/ai-camera/ollama/config'),
+  setConfig: (url) => Api.postJSON('/api/ai-camera/ollama/config', { url }),
+  getHealth: () => Api.getJSON('/api/ai-camera/ollama/health'),
+  listModels: () => Api.getJSON('/api/ai-camera/ollama/models'),
+};
+
+const AiCameraRules = {
+  listModels: () => Api.getJSON('/api/ai-camera/models'),
+};
+
 // =============================================================
 // Header health indicators
 // =============================================================
@@ -192,8 +203,11 @@ function navigate() {
     document.querySelector('.nav-group[data-group="frigate"]')?.classList.add('open');
   }
 
-  // Leaving Frigate Home? Stop background refresh.
-  if (route !== 'frigate/home') stopThumbsRefresh();
+  // Leaving Frigate Home? Stop background refresh + motion WS.
+  if (route !== 'frigate/home') {
+    stopThumbsRefresh();
+    try { closeFrigateHomeMotionWs(); } catch {}
+  }
 
   // Leaving the Live Agent page? Drop the session.
   if (route !== 'smart-home/live-agent' && window.LiveAgentSession) {
@@ -211,6 +225,11 @@ function navigate() {
   // Leaving the Playground page? Drop the session.
   if (route !== 'ai-camera/playground' && window.AiCameraSession?.isActive?.()) {
     try { window.AiCameraSession.stop(); } catch {}
+  }
+
+  // Leaving the Rules page? Close its motion WS + unwire the event listener.
+  if (route !== 'ai-camera/rules') {
+    try { tearDownRulesPage(); } catch {}
   }
 
   document.getElementById('page-title').textContent = entry.title;
@@ -315,6 +334,21 @@ function renderSettings(root) {
     </div>
 
     <div class="card">
+      <h2>Ollama (local vision)</h2>
+      <p class="hint">Optional. Point at a local Ollama daemon (e.g. <code>http://localhost:11434</code>) to run AI-Camera Rules against vision models on your own GPU — moondream, llava, llama3.2-vision, etc. Each rule picks its own model.</p>
+      <label class="field">
+        <span class="lbl">Ollama base URL</span>
+        <input id="ollama-url" type="url" placeholder="http://localhost:11434" />
+      </label>
+      <div class="btn-row">
+        <button class="btn" id="btn-ollama-save">Save &amp; test</button>
+        <button class="btn secondary" id="btn-ollama-clear">Clear</button>
+      </div>
+      <div class="feedback" id="ollama-feedback"></div>
+      <div id="ollama-models" class="hint" style="margin-top:8px"></div>
+    </div>
+
+    <div class="card">
       <h2>Gemini Live Agent</h2>
       <p class="hint">Paste your Google AI Studio API key. Used to drive the Smart Home → Live Agent page (audio in/out, vision, Home Assistant tool calls).</p>
       <label class="field">
@@ -338,7 +372,68 @@ function renderSettings(root) {
   initFrigateSettings();
   initHASettings();
   initMqttSettings();
+  initOllamaSettings();
   initGeminiSettings();
+}
+
+function initOllamaSettings() {
+  const urlEl = document.getElementById('ollama-url');
+  const feedback = document.getElementById('ollama-feedback');
+  const modelsEl = document.getElementById('ollama-models');
+
+  const renderHealthAndModels = async (cfgHealth) => {
+    if (!cfgHealth) {
+      try { cfgHealth = await Ollama.getHealth(); } catch { cfgHealth = { status: 'err', message: 'unreachable' }; }
+    }
+    if (cfgHealth.status === 'ok') {
+      const ver = cfgHealth.version ? ` (v${cfgHealth.version})` : '';
+      showFeedback(feedback, 'ok', `Connected${ver}.`);
+      try {
+        const { models } = await Ollama.listModels();
+        if (!models.length) {
+          modelsEl.textContent = 'No models installed. Pull one first (e.g. `ollama pull moondream`).';
+        } else {
+          modelsEl.innerHTML = `Installed models: ${models.map((m) => `<code>${escapeHtml(m.name)}</code>`).join(', ')}`;
+        }
+      } catch (e) {
+        modelsEl.textContent = `Couldn't list models: ${e.message}`;
+      }
+    } else {
+      modelsEl.textContent = '';
+      showFeedback(feedback, 'err', cfgHealth.message || 'Unreachable.');
+    }
+  };
+
+  Ollama.getConfig().then((c) => {
+    if (c.url) {
+      urlEl.value = c.url;
+      renderHealthAndModels();
+    }
+  }).catch(() => {});
+
+  document.getElementById('btn-ollama-save').addEventListener('click', async () => {
+    const raw = urlEl.value.trim();
+    showFeedback(feedback, 'ok', 'Saving…');
+    modelsEl.textContent = '';
+    try {
+      const out = await Ollama.setConfig(raw);
+      if (out.url) urlEl.value = out.url;
+      await renderHealthAndModels(out.health);
+    } catch (e) {
+      showFeedback(feedback, 'err', `Failed: ${e.message}`);
+    }
+  });
+
+  document.getElementById('btn-ollama-clear').addEventListener('click', async () => {
+    try {
+      await Ollama.setConfig('');
+      urlEl.value = '';
+      modelsEl.textContent = '';
+      showFeedback(feedback, 'ok', 'Cleared.');
+    } catch (e) {
+      showFeedback(feedback, 'err', `Failed: ${e.message}`);
+    }
+  });
 }
 
 function initMqttSettings() {
@@ -593,10 +688,18 @@ async function renderFrigateHome(root) {
                 <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polygon points="5 3 19 12 5 21 5 3"/></svg>
                 View live
               </div>
+              <div class="cam-badges" data-cam="${escapeHtml(cam.name)}">
+                <span class="cam-badge motion" hidden>MOTION</span>
+                <span class="cam-badge objects" hidden></span>
+              </div>
             </div>
             <div class="camera-body">
               <div class="camera-name">${escapeHtml(cam.name)}</div>
               <div class="camera-meta">${cam.enabled ? 'Enabled' : 'Disabled'}</div>
+              <div class="audio-meter" data-cam="${escapeHtml(cam.name)}" title="Audio level (dBFS)">
+                <div class="audio-meter-bar"></div>
+                <span class="audio-meter-val">—</span>
+              </div>
             </div>
           </div>
         `).join('')}
@@ -616,9 +719,102 @@ async function renderFrigateHome(root) {
 
     refreshThumbs(); // immediate set
     startThumbsRefresh();
+    ensureFrigateHomeMotionWs();
   } catch (e) {
     container.innerHTML = `<p class="hint" style="color:var(--err)">Failed to load cameras: ${escapeHtml(e.message)}</p>`;
   }
+}
+
+// -------------------------------------------------------------
+// Frigate Home — motion / objects / audio per camera card
+// -------------------------------------------------------------
+const FRIGATE_HOME = {
+  motion: {},          // cam -> { motion, objects, audio_dbfs, audio_labels }
+  ws: null,
+  reconnect: null,
+};
+
+function ensureFrigateHomeMotionWs() {
+  if (FRIGATE_HOME.ws && FRIGATE_HOME.ws.readyState <= WebSocket.OPEN) return;
+  const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+  let ws;
+  try { ws = new WebSocket(`${proto}//${location.host}/api/frigate/motion/ws`); }
+  catch { scheduleFrigateHomeReconnect(); return; }
+  FRIGATE_HOME.ws = ws;
+  ws.onmessage = (ev) => {
+    let msg;
+    try { msg = JSON.parse(ev.data); } catch { return; }
+    if (msg.type === 'snapshot') {
+      FRIGATE_HOME.motion = msg.cameras || {};
+      Object.keys(FRIGATE_HOME.motion).forEach(updateCameraCardBadges);
+    } else if (msg.type === 'motion') {
+      FRIGATE_HOME.motion[msg.camera] = {
+        motion: !!msg.motion,
+        objects: msg.objects || [],
+        audio_dbfs: msg.audio_dbfs ?? null,
+        audio_labels: msg.audio_labels || [],
+      };
+      updateCameraCardBadges(msg.camera);
+    }
+  };
+  ws.onclose = () => { FRIGATE_HOME.ws = null; scheduleFrigateHomeReconnect(); };
+  ws.onerror = () => { try { ws.close(); } catch {} };
+}
+
+function scheduleFrigateHomeReconnect() {
+  // Only reconnect if Frigate Home is still mounted.
+  if (!document.querySelector('.camera-grid')) return;
+  clearTimeout(FRIGATE_HOME.reconnect);
+  FRIGATE_HOME.reconnect = setTimeout(ensureFrigateHomeMotionWs, 3000);
+}
+
+function closeFrigateHomeMotionWs() {
+  clearTimeout(FRIGATE_HOME.reconnect);
+  FRIGATE_HOME.reconnect = null;
+  if (FRIGATE_HOME.ws) { try { FRIGATE_HOME.ws.close(); } catch {} FRIGATE_HOME.ws = null; }
+  FRIGATE_HOME.motion = {};
+}
+
+function updateCameraCardBadges(camera) {
+  const info = FRIGATE_HOME.motion[camera] || { motion: false, objects: [], audio_dbfs: null, audio_labels: [] };
+  const badges = document.querySelector(`.cam-badges[data-cam="${CSS.escape(camera)}"]`);
+  if (badges) {
+    const motionEl = badges.querySelector('.cam-badge.motion');
+    if (motionEl) motionEl.hidden = !info.motion;
+    const objectsEl = badges.querySelector('.cam-badge.objects');
+    if (objectsEl) {
+      const labels = info.objects || [];
+      if (labels.length) {
+        objectsEl.textContent = labels.join(', ').toUpperCase();
+        objectsEl.hidden = false;
+      } else {
+        objectsEl.hidden = true;
+      }
+    }
+  }
+  const meter = document.querySelector(`.audio-meter[data-cam="${CSS.escape(camera)}"]`);
+  if (meter) applyAudioMeter(meter, info);
+}
+
+function applyAudioMeter(meter, info) {
+  const bar = meter.querySelector('.audio-meter-bar');
+  const val = meter.querySelector('.audio-meter-val');
+  const dbfs = info.audio_dbfs;
+  if (dbfs == null || !Number.isFinite(dbfs)) {
+    if (bar) bar.style.width = '0%';
+    if (val) val.textContent = info.audio_labels?.length ? info.audio_labels.join(', ') : '—';
+    meter.classList.remove('hot', 'warm');
+    return;
+  }
+  // -60 dBFS → 0%, 0 dBFS → 100%
+  const pct = Math.max(0, Math.min(100, ((dbfs + 60) / 60) * 100));
+  if (bar) bar.style.width = pct.toFixed(0) + '%';
+  if (val) {
+    const labels = info.audio_labels?.length ? ` · ${info.audio_labels.join(', ')}` : '';
+    val.textContent = `${dbfs.toFixed(0)} dBFS${labels}`;
+  }
+  meter.classList.toggle('hot', pct >= 80);
+  meter.classList.toggle('warm', pct >= 55 && pct < 80);
 }
 
 function refreshThumbs() {
@@ -1612,7 +1808,8 @@ async function renderLiveAgent(root) {
         onlyAreas: document.getElementById('only-areas-toggle').checked,
       });
       stopBtn.disabled = false;
-      muteBtn.disabled = false;
+      // Mute only makes sense when a mic is actually attached to the session.
+      muteBtn.disabled = !window.LiveAgentSession.hasMic();
       if (camSel.value) startPreview();
     } catch (e) {
       startBtn.disabled = false;
@@ -2057,17 +2254,831 @@ function renderAiCameraMain(root) {
   `;
 }
 
-function renderAiCameraRules(root) {
+// -------------------------------------------------------------
+// AI-Camera · Rules — persistent rules + history + alarm broadcast
+// -------------------------------------------------------------
+const RULES_STATE = {
+  rules: [],
+  expanded: new Set(),          // rule IDs currently showing their history panel
+  pagination: {},               // rule_id -> { triggers: {offset,total,items}, iterations: {...} }
+  cameras: [],
+  haEntities: [],
+  evtListener: null,
+  // Motion (push-based from Frigate via MQTT bridge) — blinks camera badges
+  // for rules whose scan mode reacts to motion.
+  motion: {},                   // camera -> { motion: bool, objects: [...] }
+  motionWs: null,
+  motionReconnect: null,
+  // Server-pushed countdown snapshots, keyed by rule_id. Only periodic /
+  // periodic_motion rules populate this; other modes leave it untouched.
+  countdowns: {},               // rule_id -> { remaining_s, total_s, paused, waiting_for_motion }
+};
+
+async function renderAiCameraRules(root) {
+  // Same preflight as Playground — Rules need Frigate + Gemini.
+  let frigateCfg, liveCfg;
+  try {
+    [frigateCfg, liveCfg] = await Promise.all([Frigate.getConfig(), LiveAgent.getConfig()]);
+  } catch (e) {
+    root.innerHTML = `<div class="empty-state"><h3>Backend error</h3><p>${escapeHtml(e.message)}</p></div>`;
+    return;
+  }
+  if (!frigateCfg.url || !liveCfg.api_key_set) {
+    root.innerHTML = `
+      <div class="page-header"><h1>AI-Camera · Rules</h1></div>
+      <div class="empty-state">
+        <h3>Configure prerequisites</h3>
+        <p>This page needs <strong>Frigate</strong> and a <strong>Gemini API key</strong>. Configure them in <a href="#/settings">Settings</a>.</p>
+      </div>`;
+    return;
+  }
+
   root.innerHTML = `
     <div class="page-header">
       <h1>AI-Camera · Rules</h1>
-      <p>Saved rules and their schedules.</p>
+      <p>Saved rules run continuously on the backend. Each rule analyses its cameras on the schedule you set; triggers are always stored, and you can optionally store every iteration too. Tick "Fire alarm" to flash a system-wide alarm banner with siren whenever the rule trips.</p>
     </div>
-    <div class="empty-state">
-      <h3>Rules · coming soon</h3>
-      <p>For now, build and test rules in <a href="#/ai-camera/playground">Playground</a>.</p>
+    <div class="card" style="margin:0">
+      <div class="events-meta">
+        <h2 style="margin:0">Rules</h2>
+        <button class="btn" id="rules-new">+ New rule</button>
+      </div>
+      <div id="rules-list"><p class="hint">Loading…</p></div>
     </div>
   `;
+
+  const [camsR, entsR] = await Promise.allSettled([Frigate.getCameras(), HA.getEntities()]);
+  RULES_STATE.cameras = camsR.status === 'fulfilled' ? camsR.value : [];
+  RULES_STATE.haEntities = entsR.status === 'fulfilled' ? entsR.value : [];
+  await loadRules();
+  renderRulesList();
+
+  document.getElementById('rules-new').addEventListener('click', () => openRuleEditor(null));
+
+  if (RULES_STATE.evtListener) window.removeEventListener('ai-camera-event', RULES_STATE.evtListener);
+  RULES_STATE.evtListener = (e) => handleRulesEvent(e.detail);
+  window.addEventListener('ai-camera-event', RULES_STATE.evtListener);
+
+  document.getElementById('rules-list').addEventListener('click', onRulesListClick);
+  ensureRulesMotionWs();
+}
+
+function tearDownRulesPage() {
+  if (RULES_STATE.evtListener) {
+    window.removeEventListener('ai-camera-event', RULES_STATE.evtListener);
+    RULES_STATE.evtListener = null;
+  }
+  closeRulesMotionWs();
+}
+
+async function loadRules() {
+  try {
+    const r = await fetch('/api/ai-camera/rules');
+    if (!r.ok) throw new Error(`http ${r.status}`);
+    const data = await r.json();
+    RULES_STATE.rules = data.rules || [];
+  } catch (e) {
+    RULES_STATE.rules = [];
+  }
+}
+
+function renderRulesList() {
+  const wrap = document.getElementById('rules-list');
+  if (!wrap) return;
+  if (RULES_STATE.rules.length === 0) {
+    wrap.innerHTML = `<p class="hint">No rules yet. Click <strong>+ New rule</strong> to create one.</p>`;
+    return;
+  }
+  wrap.innerHTML = RULES_STATE.rules.map(renderRuleRow).join('');
+  wrap.querySelectorAll('[data-rule-action]').forEach((b) => b.addEventListener('click', onRuleAction));
+  wrap.querySelectorAll('.rule-power[data-toggle-id]').forEach((btn) => btn.addEventListener('click', onTogglePower));
+  // Re-mount detail panels for any rules that were expanded across re-renders.
+  RULES_STATE.expanded.forEach((id) => {
+    const rule = RULES_STATE.rules.find((r) => r.id === id);
+    if (rule) renderHistoryFromCache(rule);
+  });
+  // Re-apply motion blink + last known countdown values for every row, since
+  // the wholesale innerHTML replace just wiped them.
+  refreshRulesMotion();
+  refreshRulesAudioMeters();
+  refreshRulesCountdowns();
+}
+
+function refreshRulesMotion() {
+  document.querySelectorAll('.rule-row').forEach((row) => {
+    const ruleId = row.dataset.ruleId;
+    const mode = row.dataset.scanMode;
+    const rule = RULES_STATE.rules.find((r) => r.id === ruleId);
+    if (!rule) return;
+    const motionMode = mode === 'motion' || mode === 'periodic_motion';
+    row.querySelectorAll('.rule-cam').forEach((el) => {
+      const cam = el.dataset.cam;
+      const isMotion = !!(RULES_STATE.motion[cam] && RULES_STATE.motion[cam].motion);
+      const blink = rule.enabled && motionMode && isMotion;
+      el.classList.toggle('blinking', blink);
+    });
+  });
+}
+
+function refreshRulesCountdowns() {
+  for (const [ruleId, cd] of Object.entries(RULES_STATE.countdowns)) {
+    applyCountdownToDom(ruleId, cd);
+  }
+}
+
+function applyCountdownToDom(ruleId, cd) {
+  const el = document.getElementById(`rule-cd-${ruleId}`);
+  if (!el || el.hidden) return;
+  const valueEl = el.querySelector('.rule-cd-value');
+  if (!valueEl) return;
+  if (cd.waiting_for_motion) {
+    valueEl.textContent = 'waiting for motion';
+    el.classList.add('paused');
+  } else if (cd.paused) {
+    valueEl.textContent = `${cd.remaining_s}s · paused (no motion)`;
+    el.classList.add('paused');
+  } else {
+    valueEl.textContent = `${cd.remaining_s}s`;
+    el.classList.remove('paused');
+  }
+}
+
+// -------------------------------------------------------------
+// Motion WS — push-based motion state for blinking camera badges
+// -------------------------------------------------------------
+function ensureRulesMotionWs() {
+  if (RULES_STATE.motionWs && RULES_STATE.motionWs.readyState <= WebSocket.OPEN) return;
+  const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+  let ws;
+  try { ws = new WebSocket(`${proto}//${location.host}/api/frigate/motion/ws`); }
+  catch { scheduleRulesMotionReconnect(); return; }
+  RULES_STATE.motionWs = ws;
+  ws.onmessage = (ev) => {
+    let msg;
+    try { msg = JSON.parse(ev.data); } catch { return; }
+    if (msg.type === 'snapshot') {
+      RULES_STATE.motion = msg.cameras || {};
+    } else if (msg.type === 'motion') {
+      RULES_STATE.motion[msg.camera] = {
+        motion: !!msg.motion,
+        objects: msg.objects || [],
+        audio_dbfs: msg.audio_dbfs ?? null,
+        audio_labels: msg.audio_labels || [],
+      };
+    } else {
+      return;
+    }
+    refreshRulesMotion();
+    refreshRulesAudioMeters();
+  };
+  ws.onclose = () => { RULES_STATE.motionWs = null; scheduleRulesMotionReconnect(); };
+  ws.onerror = () => { try { ws.close(); } catch {} };
+}
+
+function scheduleRulesMotionReconnect() {
+  if (!document.getElementById('rules-list')) return;  // page left
+  clearTimeout(RULES_STATE.motionReconnect);
+  RULES_STATE.motionReconnect = setTimeout(ensureRulesMotionWs, 3000);
+}
+
+function closeRulesMotionWs() {
+  clearTimeout(RULES_STATE.motionReconnect);
+  RULES_STATE.motionReconnect = null;
+  if (RULES_STATE.motionWs) {
+    try { RULES_STATE.motionWs.close(); } catch {}
+    RULES_STATE.motionWs = null;
+  }
+  RULES_STATE.motion = {};
+  RULES_STATE.countdowns = {};
+}
+
+function renderRuleRow(rule) {
+  const isExpanded = RULES_STATE.expanded.has(rule.id);
+  const cams = rule.cameras || [];
+  const mode = (rule.scan && rule.scan.mode) || 'periodic';
+  const camBadges = cams.length
+    ? cams.map((c) => `<span class="rule-badge rule-cam" data-cam="${escapeHtml(c)}" data-rule-id="${escapeHtml(rule.id)}">${escapeHtml(c)}</span>`).join('')
+    : `<span class="rule-badge muted">no cameras</span>`;
+  const showCountdown = rule.enabled && (mode === 'periodic' || mode === 'periodic_motion');
+  const enabled = !!rule.enabled;
+  return `
+    <div class="rule-row ${enabled ? 'on' : 'off'}" data-rule-id="${escapeHtml(rule.id)}" data-scan-mode="${escapeHtml(mode)}">
+      <div class="rule-row-head">
+        <button class="rule-power" data-toggle-id="${escapeHtml(rule.id)}" aria-pressed="${enabled}" title="${enabled ? 'Turn rule off' : 'Turn rule on'}">
+          <span class="rule-power-icon">⏻</span>
+          <span class="rule-power-label">${enabled ? 'ON' : 'OFF'}</span>
+        </button>
+        <div class="rule-info">
+          <div class="rule-name">${escapeHtml(rule.name || rule.id)}</div>
+          <div class="rule-sub">
+            ${camBadges}
+            <span class="rule-badge">${escapeHtml(scanSummary(rule.scan))}</span>
+            <span class="rule-badge muted" title="Vision model">${escapeHtml(modelSummary(rule.model))}</span>
+            ${rule.fire_alarm ? '<span class="rule-badge red">🚨 alarm</span>' : ''}
+            ${rule.store_iterations ? '<span class="rule-badge muted">store iterations</span>' : ''}
+          </div>
+          <div class="rule-countdown" id="rule-cd-${escapeHtml(rule.id)}" ${showCountdown ? '' : 'hidden'}>
+            <span class="rule-cd-label">Next scan</span>
+            <span class="rule-cd-value">—</span>
+          </div>
+        </div>
+        <div class="rule-stats">
+          <div class="rule-count" title="Total triggers since rule was created">
+            <div class="rule-count-num rule-count-trig" data-rule-id="${escapeHtml(rule.id)}">${rule.trigger_count || 0}</div>
+            <div class="rule-count-lbl">total triggered</div>
+          </div>
+          <div class="rule-count" title="Total iterations since rule was created">
+            <div class="rule-count-num rule-count-iter" data-rule-id="${escapeHtml(rule.id)}">${rule.iteration_count || 0}</div>
+            <div class="rule-count-lbl">total iterations</div>
+          </div>
+        </div>
+        <div class="rule-actions">
+          <button class="btn secondary" data-rule-action="edit" data-rule-id="${escapeHtml(rule.id)}">Edit</button>
+          <button class="btn secondary danger" data-rule-action="delete" data-rule-id="${escapeHtml(rule.id)}">Delete</button>
+        </div>
+        <button class="rule-expand" data-rule-action="expand" data-rule-id="${escapeHtml(rule.id)}"
+                aria-expanded="${isExpanded}" aria-label="${isExpanded ? 'Hide details' : 'Show details'}"
+                title="${isExpanded ? 'Hide details' : 'Show details'}">
+          <svg class="rule-expand-arrow" viewBox="0 0 16 16" width="16" height="16" aria-hidden="true">
+            <polyline points="5,4 11,8 5,12" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" />
+          </svg>
+        </button>
+      </div>
+      ${cams.length ? `
+        <div class="rule-audio-row" data-rule-id="${escapeHtml(rule.id)}">
+          ${cams.map((c) => `
+            <div class="rule-audio-cell">
+              <span class="rule-audio-cam">${escapeHtml(c)}</span>
+              <div class="audio-meter" data-cam-row="${escapeHtml(c)}" data-rule-id="${escapeHtml(rule.id)}" title="Audio level (dBFS)">
+                <div class="audio-meter-bar"></div>
+                <span class="audio-meter-val">—</span>
+              </div>
+            </div>
+          `).join('')}
+        </div>
+      ` : ''}
+      ${isExpanded ? `<div class="rule-row-detail" id="rule-detail-${escapeHtml(rule.id)}"><p class="hint">Loading history…</p></div>` : ''}
+    </div>
+  `;
+}
+
+function refreshRulesAudioMeters() {
+  document.querySelectorAll('.rule-audio-row .audio-meter[data-cam-row]').forEach((meter) => {
+    const cam = meter.dataset.camRow;
+    const info = RULES_STATE.motion[cam] || { audio_dbfs: null, audio_labels: [] };
+    applyAudioMeter(meter, info);
+  });
+}
+
+function modelSummary(selector) {
+  const s = (selector || '').trim();
+  if (!s) return 'Gemini · auto';
+  if (s.startsWith('ollama:')) return `Ollama · ${s.slice('ollama:'.length)}`;
+  if (s.startsWith('gemini:')) {
+    const m = s.slice('gemini:'.length);
+    return m ? `Gemini · ${m}` : 'Gemini · auto';
+  }
+  return s;
+}
+
+function scanSummary(scan) {
+  if (!scan) return 'no scan';
+  const m = scan.mode || 'periodic';
+  if (m === 'periodic') return `every ${scan.period_s || 60}s`;
+  if (m === 'periodic_motion') return `motion + every ${scan.period_s || 60}s`;
+  if (m === 'motion') return 'on motion';
+  if (m === 'entity_state') return `on ${scan.entity_id || '?'} = ${scan.target_state || '?'}`;
+  return m;
+}
+
+function onRuleAction(e) {
+  const btn = e.currentTarget;
+  const id = btn.dataset.ruleId;
+  const action = btn.dataset.ruleAction;
+  const rule = RULES_STATE.rules.find((r) => r.id === id);
+  if (!rule) return;
+  if (action === 'expand') toggleExpanded(rule);
+  else if (action === 'edit') openRuleEditor(rule);
+  else if (action === 'delete') confirmDeleteRule(rule);
+  else if (action === 'clear-history') clearHistory(rule);
+}
+
+async function toggleExpanded(rule) {
+  if (RULES_STATE.expanded.has(rule.id)) {
+    RULES_STATE.expanded.delete(rule.id);
+    renderRulesList();
+    return;
+  }
+  RULES_STATE.expanded.add(rule.id);
+  RULES_STATE.pagination[rule.id] = {
+    triggers: { offset: 0, total: 0, items: [] },
+    iterations: { offset: 0, total: 0, items: [] },
+    tab: 'triggers',
+  };
+  renderRulesList();
+  await mountHistoryShell(rule);
+  await loadHistoryPage(rule, 'triggers');
+}
+
+async function mountHistoryShell(rule) {
+  const detail = document.getElementById(`rule-detail-${rule.id}`);
+  if (!detail) return;
+  detail.innerHTML = `
+    <div class="rule-history-tabs">
+      <button class="tab active" data-tab="triggers" data-rule-action="tab" data-rule-id="${escapeHtml(rule.id)}">Triggers</button>
+      ${rule.store_iterations ? `<button class="tab" data-tab="iterations" data-rule-action="tab" data-rule-id="${escapeHtml(rule.id)}">All iterations</button>` : ''}
+      <span style="flex:1"></span>
+      <button class="btn secondary" data-rule-action="clear-history" data-rule-id="${escapeHtml(rule.id)}">Clear history</button>
+    </div>
+    <div id="rule-history-${escapeHtml(rule.id)}"><p class="hint">Loading…</p></div>
+  `;
+  detail.querySelectorAll('[data-rule-action="tab"]').forEach((b) => b.addEventListener('click', onHistoryTab));
+  detail.querySelector('[data-rule-action="clear-history"]').addEventListener('click', () => clearHistory(rule));
+}
+
+function renderHistoryFromCache(rule) {
+  // Used after a re-render: rebuild the detail panel from cached pagination.
+  mountHistoryShell(rule).then(() => {
+    const pag = RULES_STATE.pagination[rule.id];
+    if (!pag) return;
+    const tab = pag.tab || 'triggers';
+    const detail = document.getElementById(`rule-detail-${rule.id}`);
+    detail?.querySelectorAll('[data-tab]').forEach((b) => b.classList.toggle('active', b.dataset.tab === tab));
+    if ((pag[tab].items || []).length === 0) {
+      loadHistoryPage(rule, tab);
+    } else {
+      renderHistory(rule, tab);
+    }
+  });
+}
+
+async function onHistoryTab(e) {
+  const btn = e.currentTarget;
+  const id = btn.dataset.ruleId;
+  const tab = btn.dataset.tab;
+  const rule = RULES_STATE.rules.find((r) => r.id === id);
+  if (!rule) return;
+  const detail = document.getElementById(`rule-detail-${id}`);
+  detail.querySelectorAll('[data-tab]').forEach((b) => b.classList.toggle('active', b === btn));
+  RULES_STATE.pagination[rule.id].tab = tab;
+  RULES_STATE.pagination[rule.id][tab] = { offset: 0, total: 0, items: [] };
+  await loadHistoryPage(rule, tab);
+}
+
+async function loadHistoryPage(rule, kind) {
+  const wrap = document.getElementById(`rule-history-${rule.id}`);
+  if (!wrap) return;
+  const pag = RULES_STATE.pagination[rule.id][kind];
+  try {
+    const r = await fetch(`/api/ai-camera/rules/${encodeURIComponent(rule.id)}/${kind}?offset=${pag.offset}&limit=20`);
+    if (!r.ok) throw new Error(`http ${r.status}`);
+    const data = await r.json();
+    pag.total = data.total;
+    pag.items.push(...(data.items || []));
+    pag.offset = pag.items.length;
+    renderHistory(rule, kind);
+  } catch (e) {
+    wrap.innerHTML = `<p class="hint" style="color:var(--err)">Failed to load ${kind}: ${escapeHtml(e.message)}</p>`;
+  }
+}
+
+function renderHistory(rule, kind) {
+  const wrap = document.getElementById(`rule-history-${rule.id}`);
+  if (!wrap) return;
+  const pag = RULES_STATE.pagination[rule.id][kind];
+  if (!pag.items.length) {
+    wrap.innerHTML = `<p class="hint">No ${kind} yet.</p>`;
+    return;
+  }
+  const rows = pag.items.map((it) => historyEntryHtml(rule, it)).join('');
+  const remaining = Math.max(0, pag.total - pag.items.length);
+  const more = remaining > 0
+    ? `<button class="btn secondary" id="history-more-${rule.id}-${kind}">Load 20 more (${remaining} remaining)</button>`
+    : `<p class="hint" style="text-align:center">All ${pag.total} entries loaded.</p>`;
+  wrap.innerHTML = `<div class="history-list">${rows}</div><div style="margin-top:10px;text-align:center">${more}</div>`;
+  const btn = document.getElementById(`history-more-${rule.id}-${kind}`);
+  if (btn) btn.addEventListener('click', () => loadHistoryPage(rule, kind));
+}
+
+function historyEntryHtml(rule, it) {
+  const ts = it.ts ? new Date(it.ts * 1000).toLocaleString() : '';
+  const cams = it.snap_cams && it.snap_cams.length ? it.snap_cams : (it.cameras || []);
+  const reason = it.verdict_reason || (it.parsed && it.parsed.reason) || '';
+  const triggered = !!it.triggered;
+  const cls = triggered ? 'triggered' : 'not-triggered';
+  const thumbs = cams.map((c) => `
+    <img class="history-thumb" loading="lazy"
+         data-rule-id="${escapeHtml(rule.id)}"
+         data-iter-id="${it.iteration_id}"
+         data-camera="${escapeHtml(c)}"
+         src="/api/ai-camera/rules/${encodeURIComponent(rule.id)}/snap/${it.iteration_id}/${encodeURIComponent(c)}"
+         alt="${escapeHtml(c)}"
+         title="Click to enlarge"
+         onerror="this.replaceWith(Object.assign(document.createElement('div'),{textContent:'No snapshot',className:'preview-fallback'}))" />
+  `).join('');
+  return `
+    <div class="history-entry ${cls}">
+      <div class="history-meta">
+        <strong>#${it.iteration_id}</strong>
+        <span class="rule-badge ${triggered ? 'red' : 'muted'}">${triggered ? 'TRIGGERED' : 'no match'}</span>
+        <span class="hint">${escapeHtml(it.trigger_reason || '')}</span>
+        <span class="hint" style="margin-left:auto">${ts}</span>
+      </div>
+      ${reason ? `<div class="history-reason">${escapeHtml(reason)}</div>` : ''}
+      ${thumbs ? `<div class="history-thumbs">${thumbs}</div>` : ''}
+    </div>
+  `;
+}
+
+function findIterationInCache(ruleId, iterId) {
+  const pag = RULES_STATE.pagination[ruleId];
+  if (!pag) return null;
+  for (const kind of ['triggers', 'iterations']) {
+    const bucket = pag[kind];
+    if (!bucket || !bucket.items) continue;
+    const found = bucket.items.find((x) => Number(x.iteration_id) === Number(iterId));
+    if (found) return found;
+  }
+  return null;
+}
+
+function openRuleSnapshotModal(ruleId, iterId, camera) {
+  const rule = RULES_STATE.rules.find((r) => r.id === ruleId);
+  const it = findIterationInCache(ruleId, iterId);
+  if (!rule || !it) return;
+  const ts = it.ts ? new Date(it.ts * 1000).toLocaleString() : '';
+  const triggered = !!it.triggered;
+  const reason = it.verdict_reason || (it.parsed && it.parsed.reason) || '(no reason returned)';
+  const responseText = (it.response_text || '').trim();
+  const triggerSrc = it.trigger_reason || '';
+  const otherCams = (it.snap_cams && it.snap_cams.length ? it.snap_cams : (it.cameras || []))
+    .filter((c) => c !== camera);
+  const otherThumbs = otherCams.map((c) => `
+    <img class="history-thumb" loading="lazy"
+         data-rule-id="${escapeHtml(ruleId)}"
+         data-iter-id="${it.iteration_id}"
+         data-camera="${escapeHtml(c)}"
+         src="/api/ai-camera/rules/${encodeURIComponent(ruleId)}/snap/${it.iteration_id}/${encodeURIComponent(c)}"
+         alt="${escapeHtml(c)}"
+         title="Switch view" />
+  `).join('');
+  const bodyHtml = `
+    <div class="snap-modal">
+      <div class="live-frame">
+        <img src="/api/ai-camera/rules/${encodeURIComponent(ruleId)}/snap/${it.iteration_id}/${encodeURIComponent(camera)}"
+             alt="${escapeHtml(camera)}" />
+      </div>
+      ${otherThumbs ? `<div class="snap-modal-others"><span class="hint">Other cameras this iteration:</span><div class="history-thumbs">${otherThumbs}</div></div>` : ''}
+      <dl class="snap-modal-meta">
+        <dt>When</dt><dd>${escapeHtml(ts)}</dd>
+        <dt>Rule</dt><dd>${escapeHtml(rule.name || rule.id)}</dd>
+        <dt>Camera</dt><dd>${escapeHtml(camera)}</dd>
+        <dt>Verdict</dt><dd>
+          <span class="rule-badge ${triggered ? 'red' : 'muted'}">${triggered ? 'TRIGGERED' : 'no match'}</span>
+        </dd>
+        <dt>AI reason</dt><dd>${escapeHtml(reason)}</dd>
+        <dt>Scheduled by</dt><dd>${escapeHtml(triggerSrc)}</dd>
+        ${it.provider || it.model ? `<dt>Model</dt><dd>${escapeHtml(it.provider || '')}${it.provider && it.model ? ' · ' : ''}${escapeHtml(it.model || '')}</dd>` : ''}
+        ${responseText ? `<dt>Raw response</dt><dd><pre class="snap-modal-raw">${escapeHtml(responseText)}</pre></dd>` : ''}
+      </dl>
+    </div>
+  `;
+  showModal({
+    title: `Iteration #${it.iteration_id}`,
+    sub: `${rule.name || rule.id} · ${camera}`,
+    bodyHtml,
+  });
+  // Allow swapping to a sibling camera within the open modal.
+  document.querySelectorAll('.snap-modal-others .history-thumb').forEach((img) => {
+    img.addEventListener('click', () => openRuleSnapshotModal(ruleId, iterId, img.dataset.camera));
+  });
+}
+
+function onRulesListClick(e) {
+  const thumb = e.target.closest('.history-thumb');
+  if (!thumb) return;
+  const ruleId = thumb.dataset.ruleId;
+  const iterId = thumb.dataset.iterId;
+  const camera = thumb.dataset.camera;
+  if (!ruleId || !iterId || !camera) return;
+  openRuleSnapshotModal(ruleId, iterId, camera);
+}
+
+async function clearHistory(rule) {
+  if (!confirm(`Clear all triggers and iterations for "${rule.name || rule.id}"?`)) return;
+  try {
+    const r = await fetch(`/api/ai-camera/rules/${encodeURIComponent(rule.id)}/history`, { method: 'DELETE' });
+    if (!r.ok) throw new Error(`http ${r.status}`);
+    await loadRules();
+    const wasExpanded = RULES_STATE.expanded.has(rule.id);
+    renderRulesList();
+    if (wasExpanded) {
+      const fresh = RULES_STATE.rules.find((x) => x.id === rule.id);
+      RULES_STATE.pagination[rule.id] = {
+        triggers: { offset: 0, total: 0, items: [] },
+        iterations: { offset: 0, total: 0, items: [] },
+        tab: 'triggers',
+      };
+      await mountHistoryShell(fresh);
+      await loadHistoryPage(fresh, 'triggers');
+    }
+  } catch (e) {
+    alert(`Clear failed: ${e.message}`);
+  }
+}
+
+async function onTogglePower(e) {
+  const btn = e.currentTarget;
+  const id = btn.dataset.toggleId;
+  const wasPressed = btn.getAttribute('aria-pressed') === 'true';
+  const enabled = !wasPressed;
+  btn.disabled = true;
+  try {
+    const r = await fetch(`/api/ai-camera/rules/${encodeURIComponent(id)}`, {
+      method: 'PATCH', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ enabled }),
+    });
+    if (!r.ok) throw new Error(`http ${r.status}`);
+    await loadRules();
+    renderRulesList();
+  } catch (err) {
+    alert(`Toggle failed: ${err.message}`);
+    btn.disabled = false;
+  }
+}
+
+async function confirmDeleteRule(rule) {
+  if (!confirm(`Delete rule "${rule.name || rule.id}" and all its history?`)) return;
+  try {
+    const r = await fetch(`/api/ai-camera/rules/${encodeURIComponent(rule.id)}`, { method: 'DELETE' });
+    if (!r.ok) throw new Error(`http ${r.status}`);
+    RULES_STATE.expanded.delete(rule.id);
+    delete RULES_STATE.pagination[rule.id];
+    await loadRules();
+    renderRulesList();
+  } catch (err) {
+    alert(`Delete failed: ${err.message}`);
+  }
+}
+
+function handleRulesEvent(msg) {
+  if (!msg) return;
+  if (!document.getElementById('rules-list')) return;  // not mounted
+  if (msg.type === 'countdown') {
+    RULES_STATE.countdowns[msg.rule_id] = {
+      remaining_s: msg.remaining_s,
+      total_s: msg.total_s,
+      paused: !!msg.paused,
+      waiting_for_motion: !!msg.waiting_for_motion,
+    };
+    applyCountdownToDom(msg.rule_id, RULES_STATE.countdowns[msg.rule_id]);
+    return;
+  }
+  if (msg.type === 'trigger') {
+    const rule = RULES_STATE.rules.find((r) => r.id === msg.rule_id);
+    if (rule) {
+      rule.trigger_count = (rule.trigger_count || 0) + 1;
+      bumpCountInDom('rule-count-trig', msg.rule_id, rule.trigger_count);
+      if (RULES_STATE.expanded.has(rule.id)) {
+        RULES_STATE.pagination[rule.id].triggers = { offset: 0, total: 0, items: [] };
+        loadHistoryPage(rule, 'triggers');
+      }
+    }
+  } else if (msg.type === 'iteration') {
+    const rule = RULES_STATE.rules.find((r) => r.id === msg.rule_id);
+    if (rule) {
+      // Prefer the server-pushed count (authoritative) when present.
+      rule.iteration_count = msg.iteration_count != null
+        ? msg.iteration_count
+        : (rule.iteration_count || 0) + 1;
+      bumpCountInDom('rule-count-iter', msg.rule_id, rule.iteration_count);
+      const pag = RULES_STATE.pagination[msg.rule_id];
+      if (RULES_STATE.expanded.has(msg.rule_id) && rule.store_iterations && pag && pag.tab === 'iterations') {
+        pag.iterations = { offset: 0, total: 0, items: [] };
+        loadHistoryPage(rule, 'iterations');
+      }
+    }
+  } else if (msg.type === 'rule_deleted' || msg.type === 'rule_updated') {
+    loadRules().then(renderRulesList);
+  }
+}
+
+function bumpCountInDom(cls, ruleId, value) {
+  const el = document.querySelector(`.${cls}[data-rule-id="${CSS.escape(ruleId)}"]`);
+  if (!el) return;
+  el.textContent = value;
+  el.classList.remove('pulse');
+  void el.offsetWidth;  // restart the CSS animation
+  el.classList.add('pulse');
+}
+
+// -------------------------------------------------------------
+// Rule editor (shared modal — create + edit)
+// -------------------------------------------------------------
+function openRuleEditor(existing) {
+  const seed = existing || {
+    name: '', enabled: true, cameras: [], rule: '',
+    scan: { mode: 'periodic_motion', period_s: 60 },
+    action: null, cooldown_s: 60, fire_alarm: false, store_iterations: false,
+    model: '',
+  };
+  const cams = RULES_STATE.cameras;
+  const ents = RULES_STATE.haEntities;
+  const camsHtml = cams.length
+    ? cams.map((c) => `
+      <label class="checkbox-row">
+        <input type="checkbox" name="re-cam" value="${escapeHtml(c.name)}" ${(seed.cameras || []).includes(c.name) ? 'checked' : ''} />
+        <span>${escapeHtml(c.name)}</span>
+      </label>`).join('')
+    : `<p class="hint">No Frigate cameras available.</p>`;
+  const action = seed.action || {};
+  const sd = action.service_data ? JSON.stringify(action.service_data) : '';
+  const scan = seed.scan || { mode: 'periodic', period_s: 60 };
+
+  const body = `
+    <div class="rule-editor">
+      <label class="field"><span class="lbl">Name</span>
+        <input id="re-name" type="text" value="${escapeHtml(seed.name || '')}" placeholder="e.g. Person without hi-vis" />
+      </label>
+      <label class="field"><span class="lbl">Cameras</span>
+        <div class="checkbox-list" id="re-cams">${camsHtml}</div>
+      </label>
+      <label class="field"><span class="lbl">Rule / trigger</span>
+        <textarea id="re-rule" rows="3" placeholder="e.g. Trigger if a person is on site not wearing a hi-vis vest.">${escapeHtml(seed.rule || '')}</textarea>
+      </label>
+      <label class="field"><span class="lbl">Vision model</span>
+        <select id="re-model"><option value="${escapeHtml(seed.model || '')}">Loading…</option></select>
+        <span class="hint" style="margin-top:6px;display:block">Gemini runs in the cloud; Ollama runs locally on your GPU. Configure Ollama in <a href="#/settings">Settings</a> to see local models here.</span>
+      </label>
+      <label class="field"><span class="lbl">Scan pattern</span>
+        <select id="re-scan-mode">
+          <option value="periodic"${scan.mode === 'periodic' ? ' selected' : ''}>Periodic</option>
+          <option value="motion"${scan.mode === 'motion' ? ' selected' : ''}>On motion (Frigate)</option>
+          <option value="periodic_motion"${scan.mode === 'periodic_motion' ? ' selected' : ''}>Periodic + motion</option>
+          <option value="entity_state"${scan.mode === 'entity_state' ? ' selected' : ''}>On HA entity state</option>
+        </select>
+      </label>
+      <div id="re-scan-extra"></div>
+      <details class="wake-words">
+        <summary>Action when triggered (optional)</summary>
+        <label class="field"><span class="lbl">Target entity</span>
+          <input id="re-action-entity" type="text" value="${escapeHtml(action.entity_id || '')}" placeholder="light.alarm, switch.siren, …" list="re-entities-dl" />
+          <datalist id="re-entities-dl">${ents.map((e) => `<option value="${escapeHtml(e.entity_id)}">${escapeHtml(e.friendly_name)}</option>`).join('')}</datalist>
+        </label>
+        <div class="row-2">
+          <label class="field" style="margin:0"><span class="lbl">Service</span>
+            <input id="re-action-service" type="text" value="${escapeHtml(action.service || 'turn_on')}" placeholder="turn_on" />
+          </label>
+          <label class="field" style="margin:0"><span class="lbl">Cooldown (s)</span>
+            <input id="re-cooldown" type="number" min="0" value="${seed.cooldown_s ?? 60}" />
+          </label>
+        </div>
+        <label class="field"><span class="lbl">Service data (JSON, optional)</span>
+          <textarea id="re-action-data" rows="2" placeholder='{"brightness_pct": 100}'>${escapeHtml(sd)}</textarea>
+        </label>
+      </details>
+      <div class="rule-flags">
+        <label class="checkbox-row">
+          <input id="re-fire-alarm" type="checkbox" ${seed.fire_alarm ? 'checked' : ''} />
+          <span><strong>Fire system-wide alarm</strong> on trigger (red banner + siren, dismissible)</span>
+        </label>
+        <label class="checkbox-row">
+          <input id="re-store-iter" type="checkbox" ${seed.store_iterations ? 'checked' : ''} />
+          <span>Store every iteration (not just triggers). Triggers are always stored.</span>
+        </label>
+        <label class="checkbox-row">
+          <input id="re-enabled" type="checkbox" ${seed.enabled ? 'checked' : ''} />
+          <span>Enabled — start scanning immediately</span>
+        </label>
+      </div>
+      <div id="re-error" class="hint" style="color:var(--err);min-height:1.2em"></div>
+      <div class="btn-row" style="margin-top:10px">
+        <button class="btn" id="re-save">${existing ? 'Save changes' : 'Create rule'}</button>
+        <button class="btn secondary" id="re-cancel">Cancel</button>
+      </div>
+    </div>
+  `;
+  showModal({
+    title: existing ? 'Edit rule' : 'New rule',
+    sub: existing ? existing.id : '',
+    bodyHtml: body,
+  });
+  renderRuleEditorScanExtra(scan);
+  document.getElementById('re-scan-mode').addEventListener('change', (e) => {
+    renderRuleEditorScanExtra({ mode: e.target.value, period_s: getEditorPeriod() || 60 });
+  });
+  document.getElementById('re-save').addEventListener('click', () => saveRuleFromEditor(existing));
+  document.getElementById('re-cancel').addEventListener('click', closeModal);
+  // Populate the model dropdown (async, best-effort).
+  AiCameraRules.listModels().then(({ options }) => {
+    const sel = document.getElementById('re-model');
+    if (!sel) return;
+    const current = seed.model || '';
+    const knownIds = new Set(options.map((o) => o.id));
+    sel.innerHTML = options.map((o) => `
+      <option value="${escapeHtml(o.id)}" ${o.id === current ? 'selected' : ''}>${escapeHtml(o.label)}</option>
+    `).join('');
+    // If the rule was saved with a model that isn't currently available
+    // (e.g. user removed Ollama, or pulled a different tag), keep it as
+    // a disabled option so the user sees what's saved.
+    if (current && !knownIds.has(current)) {
+      const opt = document.createElement('option');
+      opt.value = current;
+      opt.textContent = `${current} (unavailable)`;
+      opt.selected = true;
+      sel.appendChild(opt);
+    }
+  }).catch(() => { /* leave the loading option */ });
+}
+
+function getEditorPeriod() {
+  const el = document.getElementById('re-period');
+  return el ? parseInt(el.value, 10) : null;
+}
+
+function renderRuleEditorScanExtra(scan) {
+  const wrap = document.getElementById('re-scan-extra');
+  if (!wrap) return;
+  const mode = scan.mode || 'periodic';
+  if (mode === 'periodic' || mode === 'periodic_motion') {
+    wrap.innerHTML = `
+      <label class="field"><span class="lbl">Scan period (1–300 seconds)</span>
+        <input id="re-period" type="number" min="1" max="300" value="${scan.period_s || 60}" />
+        <span class="hint">1s for critical alerts (eats Gemini quota fast); 60–300s for normal monitoring.</span>
+      </label>`;
+  } else if (mode === 'entity_state') {
+    wrap.innerHTML = `
+      <div class="row-2">
+        <label class="field" style="margin:0"><span class="lbl">HA entity</span>
+          <input id="re-ent-id" type="text" value="${escapeHtml(scan.entity_id || '')}" list="re-entities-dl" placeholder="binary_sensor.door" />
+        </label>
+        <label class="field" style="margin:0"><span class="lbl">Target state</span>
+          <input id="re-target-state" type="text" value="${escapeHtml(scan.target_state || 'on')}" placeholder="on" />
+        </label>
+      </div>`;
+  } else {
+    wrap.innerHTML = '';
+  }
+}
+
+async function saveRuleFromEditor(existing) {
+  const errEl = document.getElementById('re-error');
+  errEl.textContent = '';
+  const name = document.getElementById('re-name').value.trim();
+  const ruleText = document.getElementById('re-rule').value.trim();
+  const cameras = [...document.querySelectorAll('input[name="re-cam"]:checked')].map((c) => c.value);
+  const mode = document.getElementById('re-scan-mode').value;
+  const scan = { mode };
+  if (mode === 'periodic' || mode === 'periodic_motion') {
+    const v = parseInt(document.getElementById('re-period').value, 10);
+    scan.period_s = Math.max(1, Math.min(300, isNaN(v) ? 60 : v));
+  } else if (mode === 'entity_state') {
+    scan.entity_id = document.getElementById('re-ent-id').value.trim();
+    scan.target_state = document.getElementById('re-target-state').value.trim();
+  }
+  const entity_id = document.getElementById('re-action-entity').value.trim();
+  let action = null;
+  if (entity_id) {
+    const service = document.getElementById('re-action-service').value.trim() || 'turn_on';
+    const domain = entity_id.split('.')[0] || 'homeassistant';
+    let service_data = null;
+    const sdText = document.getElementById('re-action-data').value.trim();
+    if (sdText) {
+      try { service_data = JSON.parse(sdText); }
+      catch (e) { errEl.textContent = `Service data JSON: ${e.message}`; return; }
+    }
+    action = { domain, service, entity_id, service_data };
+  }
+  const cooldown_s = parseInt(document.getElementById('re-cooldown').value, 10) || 0;
+  const fire_alarm = document.getElementById('re-fire-alarm').checked;
+  const store_iterations = document.getElementById('re-store-iter').checked;
+  const enabled = document.getElementById('re-enabled').checked;
+
+  if (!name) { errEl.textContent = 'Name is required.'; return; }
+  if (!ruleText) { errEl.textContent = 'Rule text is required.'; return; }
+  if (cameras.length === 0) { errEl.textContent = 'Pick at least one camera.'; return; }
+  if (mode === 'entity_state' && (!scan.entity_id || !scan.target_state)) {
+    errEl.textContent = 'Entity-state scan needs an entity and a target state.'; return;
+  }
+
+  const model = (document.getElementById('re-model')?.value || '').trim();
+  const payload = { name, rule: ruleText, cameras, scan, action, cooldown_s, fire_alarm, store_iterations, enabled, model };
+  try {
+    const url = existing && existing.id
+      ? `/api/ai-camera/rules/${encodeURIComponent(existing.id)}`
+      : '/api/ai-camera/rules';
+    const method = existing && existing.id ? 'PATCH' : 'POST';
+    const r = await fetch(url, { method, headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) });
+    if (!r.ok) {
+      const txt = await r.text().catch(() => '');
+      throw new Error(`http ${r.status}: ${txt.slice(0, 200)}`);
+    }
+    closeModal();
+    await loadRules();
+    renderRulesList();
+  } catch (e) {
+    errEl.textContent = `Save failed: ${e.message}`;
+  }
 }
 
 // -------------------------------------------------------------
@@ -2088,11 +3099,6 @@ const AI_PG = {
   motionState: {},           // {camera: {motion: bool, objects: [..]}}
   motionReconnect: null,
 
-  // Alarm (red strobe + tone, fires on a triggered result)
-  alarmActive: false,
-  alarmCtx: null,
-  alarmOsc: null,
-  alarmTimer: null,
 };
 
 async function renderAiCameraPlayground(root) {
@@ -2141,6 +3147,12 @@ async function renderAiCameraPlayground(root) {
         <label class="field">
           <span class="lbl">Rule / trigger</span>
           <textarea id="pg-rule" rows="3" placeholder="e.g. Trigger if you see a person on site not wearing a hi-vis vest."></textarea>
+        </label>
+
+        <label class="field">
+          <span class="lbl">Vision model</span>
+          <select id="pg-model"><option value="">Loading…</option></select>
+          <span class="hint" style="margin-top:6px;display:block">Gemini runs in the cloud; Ollama runs locally on your GPU. Configure Ollama in <a href="#/settings">Settings</a> to see local models here.</span>
         </label>
 
         <label class="field">
@@ -2262,6 +3274,15 @@ async function renderAiCameraPlayground(root) {
     if (dl) dl.innerHTML = ents.map((e) => `<option value="${escapeHtml(e.entity_id)}">${escapeHtml(e.friendly_name)}</option>`).join('');
     refreshScanExtra();
   }).catch(() => {});
+
+  // Populate the model dropdown (best-effort — the page still works on Gemini default if this fails).
+  AiCameraRules.listModels().then(({ options }) => {
+    const sel = document.getElementById('pg-model');
+    if (!sel || !options) return;
+    sel.innerHTML = options.map((o) => `
+      <option value="${escapeHtml(o.id)}">${escapeHtml(o.label)}</option>
+    `).join('');
+  }).catch(() => { /* leave the loading option */ });
 
   document.getElementById('pg-scan-mode').addEventListener('change', refreshScanExtra);
   refreshScanExtra();
@@ -2479,7 +3500,8 @@ function collectPlaygroundConfig() {
     action = { domain, service, entity_id: entity, service_data: serviceData };
   }
   const cooldown_s = parseInt(document.getElementById('pg-action-cooldown').value, 10) || 0;
-  return { cameras, rule, scan, action, cooldown_s };
+  const model = (document.getElementById('pg-model')?.value || '').trim();
+  return { cameras, rule, scan, action, cooldown_s, model };
 }
 
 async function startPlayground() {
@@ -2667,54 +3689,61 @@ function refreshResultsUI() {
 }
 
 // -------------------------------------------------------------
-// Alarm — red strobe + looping two-tone siren until user silences it.
-// The AudioContext is created inside the user-gesture handler for
-// "Start Session" (see primeAlarmAudio) so the browser allows the audio
-// to start later when an iteration triggers the rule.
+// Alarm — shell-level. Red strobe + looping two-tone siren until silenced.
+// Primed on the first user gesture (anywhere) so the siren can play when
+// a rule fires later without a per-page user click. Triggered both by the
+// Playground (locally) and by the shell's events WS (any saved rule).
 // -------------------------------------------------------------
+const Alarm = {
+  ctx: null,
+  osc: null,
+  timer: null,
+  active: false,
+  ws: null,
+  reconnectTimer: null,
+};
+
 function primeAlarmAudio() {
-  if (AI_PG.alarmCtx) return;
+  if (Alarm.ctx) return;
   try {
-    AI_PG.alarmCtx = new (window.AudioContext || window.webkitAudioContext)();
+    Alarm.ctx = new (window.AudioContext || window.webkitAudioContext)();
   } catch { /* AudioContext not supported — alarm will be silent */ }
 }
 
 function startAlarmAudio() {
-  const ctx = AI_PG.alarmCtx;
-  if (!ctx || AI_PG.alarmTimer) return;
+  const ctx = Alarm.ctx;
+  if (!ctx || Alarm.timer) return;
   if (ctx.state === 'suspended') {
     try { ctx.resume(); } catch {}
   }
   const osc = ctx.createOscillator();
   osc.type = 'square';
   const gain = ctx.createGain();
-  gain.gain.value = 0.08;  // moderate volume; user can lower system volume
+  gain.gain.value = 0.08;
   osc.connect(gain);
   gain.connect(ctx.destination);
   osc.start();
-  AI_PG.alarmOsc = osc;
+  Alarm.osc = osc;
   let high = true;
   const tick = () => {
-    if (!AI_PG.alarmOsc) return;
-    AI_PG.alarmOsc.frequency.setValueAtTime(high ? 1100 : 800, ctx.currentTime);
+    if (!Alarm.osc) return;
+    Alarm.osc.frequency.setValueAtTime(high ? 1100 : 800, ctx.currentTime);
     high = !high;
   };
   tick();
-  AI_PG.alarmTimer = setInterval(tick, 500);
+  Alarm.timer = setInterval(tick, 500);
 }
 
 function stopAlarmAudio() {
-  if (AI_PG.alarmTimer) clearInterval(AI_PG.alarmTimer);
-  AI_PG.alarmTimer = null;
-  if (AI_PG.alarmOsc) {
-    try { AI_PG.alarmOsc.stop(); } catch {}
-    AI_PG.alarmOsc = null;
+  if (Alarm.timer) clearInterval(Alarm.timer);
+  Alarm.timer = null;
+  if (Alarm.osc) {
+    try { Alarm.osc.stop(); } catch {}
+    Alarm.osc = null;
   }
-  // Keep AI_PG.alarmCtx alive for the next alarm.
 }
 
 function fireAlarm(detail) {
-  // Update banner text every time so the user sees the latest match.
   const message = detail || 'Rule triggered';
   let banner = document.getElementById('alarm-banner');
   if (!banner) {
@@ -2735,7 +3764,7 @@ function fireAlarm(detail) {
     `;
     document.body.appendChild(banner);
     document.getElementById('alarm-silence-btn').addEventListener('click', silenceAlarm);
-    AI_PG.alarmActive = true;
+    Alarm.active = true;
     startAlarmAudio();
   }
   const detailEl = document.getElementById('alarm-banner-detail');
@@ -2743,10 +3772,47 @@ function fireAlarm(detail) {
 }
 
 function silenceAlarm() {
-  AI_PG.alarmActive = false;
+  Alarm.active = false;
   document.getElementById('alarm-strobe')?.remove();
   document.getElementById('alarm-banner')?.remove();
   stopAlarmAudio();
+}
+
+function initAlarm() {
+  const onFirstGesture = () => {
+    primeAlarmAudio();
+    document.removeEventListener('pointerdown', onFirstGesture);
+    document.removeEventListener('keydown', onFirstGesture);
+  };
+  document.addEventListener('pointerdown', onFirstGesture, { once: true });
+  document.addEventListener('keydown', onFirstGesture, { once: true });
+  connectRulesEventWs();
+}
+
+function connectRulesEventWs() {
+  if (Alarm.ws && Alarm.ws.readyState !== WebSocket.CLOSED) return;
+  const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+  const url = `${proto}//${location.host}/api/ai-camera/events/ws`;
+  let ws;
+  try { ws = new WebSocket(url); } catch { scheduleReconnect(); return; }
+  Alarm.ws = ws;
+  ws.onmessage = (e) => {
+    let msg;
+    try { msg = JSON.parse(e.data); } catch { return; }
+    if (msg.type === 'trigger' && msg.fire_alarm) {
+      const detail = `${msg.rule_name || 'Rule'} — ${msg.verdict_reason || msg.trigger_reason || ''}`;
+      fireAlarm(detail);
+    }
+    // Anything mounted on the Rules page listens here to refresh its data.
+    window.dispatchEvent(new CustomEvent('ai-camera-event', { detail: msg }));
+  };
+  ws.onclose = () => { Alarm.ws = null; scheduleReconnect(); };
+  ws.onerror = () => { try { ws.close(); } catch {} };
+}
+
+function scheduleReconnect() {
+  clearTimeout(Alarm.reconnectTimer);
+  Alarm.reconnectTimer = setTimeout(connectRulesEventWs, 3000);
 }
 
 function renderIterationCard(it, opts = {}) {
@@ -2924,6 +3990,7 @@ window.addEventListener('DOMContentLoaded', () => {
   applySidebarState();
   initNav();
   initModal();
+  initAlarm();
   if (!location.hash) location.hash = '#/home';
   navigate();
   refreshHealth();
