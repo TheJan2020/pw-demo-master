@@ -178,8 +178,8 @@
   </div>
 
   <!-- JsSIP — browser-side SIP client used by the SIP Phone → Extension page.
-       Pinned to a specific minor so a CDN side-effect can't break the demo. -->
-  <script src="https://cdn.jsdelivr.net/npm/jssip@3.10.1/dist/jssip.min.js"></script>
+       Bundled locally so the demo works offline / behind corporate proxies. -->
+  <script src="/jssip.min.js"></script>
   <script src="/sip-phone.js"></script>
   <script src="/live-agent.js"></script>
   <script src="/app.js"></script>

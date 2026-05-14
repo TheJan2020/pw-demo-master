@@ -205,7 +205,8 @@
     try {
       const session = PHONE.ua.call(uri, {
         mediaConstraints: { audio: true, video: false },
-        pcConfig: { iceServers: [{ urls: 'stun:stun.l.google.com:19302' }] },
+        // See `answer()` for why STUN is intentionally empty.
+        pcConfig: { iceServers: [] },
       });
       PHONE.activeSession = session;
       // wireSessionEvents is called from 'newRTCSession' fired by the UA.
@@ -220,7 +221,12 @@
     try {
       PHONE.incomingSession.answer({
         mediaConstraints: { audio: true, video: false },
-        pcConfig: { iceServers: [{ urls: 'stun:stun.l.google.com:19302' }] },
+        // No STUN servers — both ends are expected to be on the same LAN (or
+        // reachable via Tailscale host candidates). With STUN here, Chrome
+        // waits 30+ s for stun.l.google.com to time out from networks where
+        // it's blocked, ICE goes failed → connecting → connected, and SRTP
+        // ends up with mismatched key material from the two handshakes.
+        pcConfig: { iceServers: [] },
       });
       PHONE.activeSession = PHONE.incomingSession;
       PHONE.incomingSession = null;
