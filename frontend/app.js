@@ -114,6 +114,19 @@ const Sip = {
   getConfig: ()       => Api.getJSON('/api/sip/config'),
   setConfig: (patch)  => Api.postJSON('/api/sip/config', patch),
   getHealth: ()       => Api.getJSON('/api/sip/health'),
+  getCredentials: ()  => Api.getJSON('/api/sip/credentials'),
+  // PBX (host) — single source of truth used by the Live Assistant and by
+  // the Extension page to derive a default WebSocket URL.
+  getPbx:   ()        => Api.getJSON('/api/sip/pbx'),
+  setPbx:   (patch)   => Api.postJSON('/api/sip/pbx', patch),
+  checkPbx: (host)    => Api.postJSON('/api/sip/pbx/check', { host }),
+};
+
+const SipLiveAgent = {
+  getConfig: ()      => Api.getJSON('/api/sip-live-agent/config'),
+  setConfig: (patch) => Api.postJSON('/api/sip-live-agent/config', patch),
+  getHealth: ()      => Api.getJSON('/api/sip-live-agent/health'),
+  getStatus: ()      => Api.getJSON('/api/sip-live-agent/status'),
 };
 
 const Ollama = {
@@ -204,7 +217,8 @@ const routes = {
   'ai-camera/rules':       { title: 'AI-Camera · Rules',      render: renderAiCameraRules },
   'ai-camera/playground':  { title: 'AI-Camera · Playground', render: renderAiCameraPlayground },
   'ai-camera/test-model':  { title: 'AI-Camera · Test AI Model', render: renderAiCameraTestModel },
-  'sip/extension':         { title: 'SIP Phone · Extension',     render: renderSipExtension },
+  'sip/extension':         { title: 'SIP Phone · Extension',       render: renderSipExtension },
+  'sip/live-assistant':    { title: 'SIP Phone · Live Assistant',  render: renderSipLiveAssistant },
 };
 
 function currentRoute() {
@@ -253,6 +267,10 @@ function navigate() {
   // Leaving the SIP Extension page? Tear down the softphone.
   if (route !== 'sip/extension' && window.SipPhone) {
     try { window.SipPhone.stopPhone(); } catch {}
+  }
+  // Leaving the Live Assistant page? Close its WebSocket.
+  if (route !== 'sip/live-assistant' && typeof closeSlaWs === 'function') {
+    try { closeSlaWs(); } catch {}
   }
 
   // Leaving the Rules page? Close its motion WS + unwire the event listener.
@@ -397,37 +415,19 @@ function renderSettings(root) {
     </div>
 
     <div class="card">
-      <h2>SIP softphone</h2>
-      <p class="hint">Credentials for the browser-based softphone (SIP Phone → Extension). Audio/signalling go browser → PBX directly via SIP-over-WebSocket + WebRTC; nothing flows through this backend. Suggested PBX: <strong>Asterisk</strong> or <strong>FreePBX</strong> in Proxmox with <code>chan_pjsip</code> configured with <code>transport=wss</code>.</p>
+      <h2>PBX</h2>
+      <p class="hint">Address of your FreePBX / Asterisk server. The same host is used to derive a default SIP-WebSocket URL on the <a href="#/sip/extension">Extension page</a> and to verify connectivity for the <a href="#/sip/live-assistant">Live Assistant</a>. Per-extension registration lives on the Extension page itself.</p>
       <label class="field">
-        <span class="lbl">WebSocket URL</span>
-        <input id="sip-ws-url" type="text" placeholder="wss://pbx.example.com:8089/ws" />
-        <span class="hint" style="margin-top:6px;display:block">For Asterisk default: <code>wss://&lt;pbx&gt;:8089/ws</code>. Browsers require <code>wss://</code> (TLS) when the page itself is served over HTTPS.</span>
-      </label>
-      <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px">
-        <label class="field">
-          <span class="lbl">Extension</span>
-          <input id="sip-extension" type="text" placeholder="1001" autocomplete="off" />
-        </label>
-        <label class="field">
-          <span class="lbl">SIP realm (optional)</span>
-          <input id="sip-realm" type="text" placeholder="defaults to the WS host" />
-        </label>
-      </div>
-      <label class="field">
-        <span class="lbl">Password</span>
-        <input id="sip-password" type="password" autocomplete="off" />
-        <span class="hint" style="margin-top:6px;display:block">Leave blank to keep the saved password.</span>
-      </label>
-      <label class="field">
-        <span class="lbl">Display name (optional)</span>
-        <input id="sip-display-name" type="text" placeholder="Reception phone" />
+        <span class="lbl">PBX host / IP</span>
+        <input id="pbx-host" type="text" placeholder="192.168.100.45 or pbx.example.com" />
+        <span class="hint" style="margin-top:6px;display:block">Just the hostname or IP — no scheme, no port. We probe SIP-WS on <code>:8089</code> and AMI on <code>:5038</code> below.</span>
       </label>
       <div class="btn-row">
-        <button class="btn" id="btn-sip-save">Save</button>
-        <button class="btn secondary" id="btn-sip-clear">Clear</button>
+        <button class="btn" id="btn-pbx-save">Save</button>
+        <button class="btn secondary" id="btn-pbx-check">Check requirements</button>
       </div>
-      <div class="feedback" id="sip-feedback"></div>
+      <div class="feedback" id="pbx-feedback"></div>
+      <div id="pbx-check-results" class="pbx-check-list" hidden></div>
     </div>
   `;
 
@@ -436,55 +436,52 @@ function renderSettings(root) {
   initMqttSettings();
   initOllamaSettings();
   initGeminiSettings();
-  initSipSettings();
+  initPbxSettings();
 }
 
-function initSipSettings() {
-  const wsEl    = document.getElementById('sip-ws-url');
-  const extEl   = document.getElementById('sip-extension');
-  const realmEl = document.getElementById('sip-realm');
-  const passEl  = document.getElementById('sip-password');
-  const dnEl    = document.getElementById('sip-display-name');
-  const fb      = document.getElementById('sip-feedback');
+function initPbxSettings() {
+  const hostEl = document.getElementById('pbx-host');
+  const fb     = document.getElementById('pbx-feedback');
+  const out    = document.getElementById('pbx-check-results');
 
-  Sip.getConfig().then((c) => {
-    if (c.ws_url)       wsEl.value    = c.ws_url;
-    if (c.extension)    extEl.value   = c.extension;
-    if (c.realm)        realmEl.value = c.realm;
-    if (c.display_name) dnEl.value    = c.display_name;
-    if (c.password_set) passEl.placeholder = '••••••• (saved — leave blank to keep)';
+  Sip.getPbx().then((p) => {
+    if (p.host) hostEl.value = p.host;
   }).catch(() => {});
 
-  document.getElementById('btn-sip-save').addEventListener('click', async () => {
-    const patch = {
-      ws_url:       wsEl.value.trim(),
-      extension:    extEl.value.trim(),
-      realm:        realmEl.value.trim(),
-      display_name: dnEl.value.trim(),
-    };
-    if (passEl.value) patch.password = passEl.value;
-    if (!patch.ws_url || !patch.extension) {
-      showFeedback(fb, 'err', 'WebSocket URL and Extension are required.');
-      return;
-    }
+  document.getElementById('btn-pbx-save').addEventListener('click', async () => {
+    const host = hostEl.value.trim();
     try {
-      const saved = await Sip.setConfig(patch);
-      passEl.value = '';
-      if (saved.password_set) passEl.placeholder = '••••••• (saved — leave blank to keep)';
-      showFeedback(fb, 'ok', 'Saved. The Extension page will use this on next register.');
+      await Sip.setPbx({ host });
+      showFeedback(fb, 'ok', host ? `Saved · ${host}` : 'Cleared.');
     } catch (e) {
       showFeedback(fb, 'err', `Failed: ${e.message}`);
     }
   });
 
-  document.getElementById('btn-sip-clear').addEventListener('click', async () => {
+  document.getElementById('btn-pbx-check').addEventListener('click', async () => {
+    const host = hostEl.value.trim();
+    if (!host) { showFeedback(fb, 'err', 'Enter a PBX host first.'); return; }
+    showFeedback(fb, 'ok', `Probing ${host}…`);
+    out.hidden = true;
+    out.innerHTML = '';
     try {
-      await Sip.setConfig({ ws_url: '', extension: '', realm: '', display_name: '', password: '' });
-      wsEl.value = ''; extEl.value = ''; realmEl.value = ''; passEl.value = ''; dnEl.value = '';
-      passEl.placeholder = '';
-      showFeedback(fb, 'ok', 'Cleared.');
+      const r = await Sip.checkPbx(host);
+      const overall = r.ok ? 'ok' : 'err';
+      showFeedback(fb, overall, r.ok
+        ? 'All required checks passed.'
+        : 'One or more checks failed — see below.');
+      out.hidden = false;
+      out.innerHTML = (r.checks || []).map((c) => `
+        <div class="pbx-check ${c.ok ? 'ok' : (c.optional ? 'warn' : 'err')}">
+          <span class="pbx-check-icon">${c.ok ? '✓' : (c.optional ? '–' : '✗')}</span>
+          <div class="pbx-check-body">
+            <div class="pbx-check-name">${escapeHtml(c.name)}${c.optional ? ' <span class="hint">(optional)</span>' : ''}</div>
+            <div class="pbx-check-msg">${escapeHtml(c.message || '')}</div>
+          </div>
+        </div>
+      `).join('');
     } catch (e) {
-      showFeedback(fb, 'err', `Failed: ${e.message}`);
+      showFeedback(fb, 'err', `Check failed: ${e.message}`);
     }
   });
 }
@@ -4448,44 +4445,57 @@ function openTestHistoryModal(entry) {
 // SIP Phone — Extension page
 // =============================================================
 async function renderSipExtension(root) {
-  let cfg;
-  try { cfg = await Sip.getConfig(); }
-  catch (e) {
+  let cfg, pbx;
+  try {
+    [cfg, pbx] = await Promise.all([Sip.getConfig(), Sip.getPbx()]);
+  } catch (e) {
     root.innerHTML = `<div class="empty-state"><h3>Backend error</h3><p>${escapeHtml(e.message)}</p></div>`;
     return;
   }
 
-  if (!cfg.ws_url || !cfg.extension || !cfg.password_set) {
-    root.innerHTML = `
-      <div class="page-header">
-        <h1>SIP Phone · Extension</h1>
-      </div>
-      <div class="empty-state">
-        <h3>Configure SIP first</h3>
-        <p>Add your PBX <strong>WebSocket URL</strong>, <strong>Extension</strong>, and <strong>Password</strong> in <a href="#/settings">Settings → SIP softphone</a>.</p>
-        <p class="hint" style="margin-top:8px">Suggested PBX: Asterisk in Proxmox with <code>chan_pjsip</code>, <code>transport=wss</code>, an extension with a strong password, and TLS certificates so the browser will accept the <code>wss://</code> URL.</p>
-      </div>
-    `;
-    return;
-  }
-
-  // Fetch the password by issuing an "echo" POST that doesn't change anything
-  // — the GET intentionally hides the password, but the softphone needs it.
-  // We instead require the user to type it in Settings, then the same POST
-  // they made already persisted it; we read it back through a tiny dedicated
-  // endpoint. Cleanest fix: re-fetch via a private endpoint. For now, ask the
-  // user to re-enter the password if they cleared it — but normally we have
-  // it cached server-side and will get it via /api/sip/config when we add a
-  // secret-leak endpoint. To keep this self-contained, we read the password
-  // out of the form state at session-start time by making a second POST that
-  // returns it inside `password_set` only. Simpler approach: pass the
-  // password back from the backend just for the SIP page. Add a dedicated
-  // endpoint later if you want it more secure than that.
+  const headerSub = cfg.extension
+    ? `Extension <strong>${escapeHtml(cfg.extension)}</strong>${cfg.ws_url ? ` · <code>${escapeHtml(cfg.ws_url)}</code>` : ''}`
+    : (pbx.host ? `PBX: <code>${escapeHtml(pbx.host)}</code> · no extension configured yet`
+                : 'Set the PBX host in <a href="#/settings">Settings</a>, then configure your extension below.');
 
   root.innerHTML = `
     <div class="page-header">
       <h1>SIP Phone · Extension</h1>
-      <p>Extension <strong>${escapeHtml(cfg.extension)}</strong> · <code>${escapeHtml(cfg.ws_url)}</code></p>
+      <p>${headerSub}</p>
+    </div>
+
+    <div class="card" style="margin-bottom:14px">
+      <h2>Registration</h2>
+      <p class="hint">Credentials for the browser softphone. The WebSocket URL defaults to <code>${escapeHtml(pbx.default_ws_url || 'wss://<pbx-host>:8089/ws')}</code> derived from the PBX host in Settings — override it here if your PBX exposes WSS on a different path.</p>
+
+      <label class="field">
+        <span class="lbl">WebSocket URL</span>
+        <input id="reg-ws-url" type="text" placeholder="${escapeHtml(pbx.default_ws_url || 'wss://pbx.example.com:8089/ws')}" />
+      </label>
+      <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px">
+        <label class="field">
+          <span class="lbl">Extension</span>
+          <input id="reg-ext" type="text" placeholder="1001" autocomplete="off" />
+        </label>
+        <label class="field">
+          <span class="lbl">SIP realm (optional)</span>
+          <input id="reg-realm" type="text" placeholder="${escapeHtml(pbx.host || 'defaults to the WS host')}" />
+        </label>
+      </div>
+      <label class="field">
+        <span class="lbl">Password</span>
+        <input id="reg-password" type="password" autocomplete="off" />
+        <span class="hint" style="margin-top:6px;display:block">Leave blank to keep the saved password.</span>
+      </label>
+      <label class="field">
+        <span class="lbl">Display name (optional)</span>
+        <input id="reg-display" type="text" placeholder="Reception phone" />
+      </label>
+      <div class="btn-row">
+        <button class="btn" id="btn-reg-save">Save &amp; register</button>
+        <button class="btn secondary" id="btn-reg-clear">Clear</button>
+      </div>
+      <div class="feedback" id="reg-feedback"></div>
     </div>
 
     <div class="split">
@@ -4496,7 +4506,7 @@ async function renderSipExtension(root) {
         <div class="status-pill" id="phone-status" style="margin-bottom:12px">
           <span class="status-dot" id="phone-status-dot"></span>
           <span class="status-label">State:</span>
-          <span class="status-text" id="phone-status-text">starting…</span>
+          <span class="status-text" id="phone-status-text">${cfg.extension && cfg.password_set ? 'starting…' : 'Configure registration above to start.'}</span>
         </div>
 
         <div class="btn-row" style="margin-bottom:10px">
@@ -4671,11 +4681,67 @@ async function renderSipExtension(root) {
     refreshUI();
   });
 
+  // ----- Wire the new Registration card -----
+  const wsEl    = document.getElementById('reg-ws-url');
+  const extEl   = document.getElementById('reg-ext');
+  const realmEl = document.getElementById('reg-realm');
+  const passEl  = document.getElementById('reg-password');
+  const dnEl    = document.getElementById('reg-display');
+  const regFb   = document.getElementById('reg-feedback');
+
+  if (cfg.ws_url)       wsEl.value    = cfg.ws_url;
+  if (cfg.extension)    extEl.value   = cfg.extension;
+  if (cfg.realm)        realmEl.value = cfg.realm;
+  if (cfg.display_name) dnEl.value    = cfg.display_name;
+  if (cfg.password_set) passEl.placeholder = '••••••• (saved — leave blank to keep)';
+
+  document.getElementById('btn-reg-save').addEventListener('click', async () => {
+    const wsValue = wsEl.value.trim() || pbx.default_ws_url || '';
+    const patch = {
+      ws_url:       wsValue,
+      extension:    extEl.value.trim(),
+      realm:        realmEl.value.trim(),
+      display_name: dnEl.value.trim(),
+    };
+    if (passEl.value) patch.password = passEl.value;
+    if (!patch.ws_url || !patch.extension) {
+      showFeedback(regFb, 'err', 'WebSocket URL and Extension are required.');
+      return;
+    }
+    showFeedback(regFb, 'ok', 'Saving…');
+    try {
+      const saved = await Sip.setConfig(patch);
+      passEl.value = '';
+      if (saved.password_set) passEl.placeholder = '••••••• (saved — leave blank to keep)';
+      if (saved.ws_url) wsEl.value = saved.ws_url;
+      showFeedback(regFb, 'ok', 'Saved · registering with the PBX…');
+      // Re-fetch refreshed config + credentials and (re)start the phone.
+      try { window.SipPhone.stopPhone(); } catch {}
+      await startSipSession(saved);
+    } catch (e) {
+      showFeedback(regFb, 'err', `Save failed: ${e.message}`);
+    }
+  });
+
+  document.getElementById('btn-reg-clear').addEventListener('click', async () => {
+    try {
+      await Sip.setConfig({ ws_url: '', extension: '', realm: '', display_name: '', password: '' });
+      wsEl.value = ''; extEl.value = ''; realmEl.value = ''; passEl.value = ''; dnEl.value = '';
+      passEl.placeholder = '';
+      try { window.SipPhone.stopPhone(); } catch {}
+      showFeedback(regFb, 'ok', 'Cleared.');
+    } catch (e) {
+      showFeedback(regFb, 'err', `Clear failed: ${e.message}`);
+    }
+  });
+
   renderSipHistory();
   refreshUI();
 
-  // Auto-start: the phone tries to register as soon as the page mounts.
-  await startSipSession(cfg);
+  // Auto-start the phone only when we already have a full set of credentials.
+  if (cfg.ws_url && cfg.extension && cfg.password_set) {
+    await startSipSession(cfg);
+  }
 }
 
 async function startSipSession(cfgFromGet) {
@@ -4733,6 +4799,317 @@ function renderSipHistory() {
       }).join('')}
     </div>
   `;
+}
+
+// =============================================================
+// SIP Phone — Live Assistant management page
+// =============================================================
+const SLA_STATE = {
+  ws: null,
+  reconnectTimer: null,
+  status: null,
+  calls: [],
+  history: [],
+  transcripts: new Map(),   // call_id -> {heard, spoken}
+};
+
+async function renderSipLiveAssistant(root) {
+  let cfg;
+  try { cfg = await SipLiveAgent.getConfig(); }
+  catch (e) {
+    root.innerHTML = `<div class="empty-state"><h3>Backend error</h3><p>${escapeHtml(e.message)}</p></div>`;
+    return;
+  }
+
+  let geminiCfg = { api_key_set: false };
+  try { geminiCfg = await LiveAgent.getConfig(); } catch {}
+
+  root.innerHTML = `
+    <div class="page-header">
+      <h1>SIP Phone · Live Assistant</h1>
+      <p>Gemini Live answers calls routed to it from your FreePBX/Asterisk PBX via the AudioSocket protocol. See <a href="docs/LiveAssistantSIP.md">LiveAssistantSIP.md</a> for the full setup.</p>
+    </div>
+
+    ${!geminiCfg.api_key_set ? `
+      <div class="card" style="border-left:3px solid var(--err)">
+        <h2>Gemini API key not set</h2>
+        <p>The Live Assistant uses the same Gemini account as the Smart Home Live Agent. Add your key in <a href="#/settings">Settings → Gemini Live Agent</a> first.</p>
+      </div>` : ''}
+
+    <div class="split">
+      <!-- LEFT: settings -->
+      <div class="card" style="margin:0">
+        <h2>Settings</h2>
+
+        <label class="checkbox-row" style="margin-bottom:12px">
+          <input type="checkbox" id="sla-enabled" ${cfg.enabled ? 'checked' : ''} />
+          <span><strong>Enable service</strong> — start the AudioSocket listener so the PBX can route calls here.</span>
+        </label>
+
+        <div style="display:grid;grid-template-columns:1fr 140px;gap:10px">
+          <label class="field" style="margin:0">
+            <span class="lbl">Bind host</span>
+            <input id="sla-host" type="text" value="${escapeHtml(cfg.bind_host)}" placeholder="0.0.0.0" />
+          </label>
+          <label class="field" style="margin:0">
+            <span class="lbl">Port</span>
+            <input id="sla-port" type="number" min="1" max="65535" value="${cfg.bind_port}" />
+          </label>
+        </div>
+
+        <label class="field">
+          <span class="lbl">System prompt</span>
+          <textarea id="sla-prompt" rows="6">${escapeHtml(cfg.system_prompt)}</textarea>
+          <span class="hint" style="margin-top:6px;display:block">Drives the agent's persona and what it's allowed to do. Home Assistant capabilities are appended automatically when "Enable HA tools" is on.</span>
+        </label>
+
+        <label class="field">
+          <span class="lbl">Greeting (optional)</span>
+          <input id="sla-greeting" type="text" value="${escapeHtml(cfg.greeting)}" placeholder="Hello, you've reached the demo. How can I help?" />
+          <span class="hint" style="margin-top:6px;display:block">Spoken by the agent the moment a call connects. Leave blank to let the agent improvise.</span>
+        </label>
+
+        <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px">
+          <label class="field" style="margin:0">
+            <span class="lbl">Voice</span>
+            <select id="sla-voice">
+              ${['Aoede','Puck','Charon','Kore','Fenrir'].map((v) =>
+                `<option value="${v}" ${cfg.voice === v ? 'selected' : ''}>${v}</option>`).join('')}
+            </select>
+          </label>
+          <label class="field" style="margin:0">
+            <span class="lbl">Max call duration (seconds)</span>
+            <input id="sla-max" type="number" min="0" value="${cfg.max_call_s}" />
+          </label>
+        </div>
+
+        <label class="checkbox-row">
+          <input type="checkbox" id="sla-tools" ${cfg.enable_ha_tools ? 'checked' : ''} />
+          <span>Enable Home Assistant tools (agent can list entities and call services)</span>
+        </label>
+        <label class="checkbox-row">
+          <input type="checkbox" id="sla-only-areas" ${cfg.only_areas ? 'checked' : ''} />
+          <span>Restrict to entities assigned to an HA Area</span>
+        </label>
+
+        <div class="btn-row" style="margin-top:14px">
+          <button class="btn" id="sla-save">Save &amp; apply</button>
+        </div>
+        <div class="feedback" id="sla-feedback"></div>
+
+        <div class="status-pill" style="margin-top:12px">
+          <span class="status-dot" id="sla-dot"></span>
+          <span class="status-label">Service:</span>
+          <span class="status-text" id="sla-status-text">checking…</span>
+        </div>
+      </div>
+
+      <!-- RIGHT: live calls + history -->
+      <div style="display:flex;flex-direction:column;gap:14px">
+        <div class="card" style="margin:0">
+          <div class="events-meta">
+            <h2 style="margin:0">Active calls</h2>
+            <span class="count" id="sla-active-count">0</span>
+          </div>
+          <div id="sla-active-list"><p class="hint">No active calls.</p></div>
+        </div>
+
+        <div class="card" style="margin:0">
+          <div class="events-meta">
+            <h2 style="margin:0">Recent calls</h2>
+            <span class="count" id="sla-history-count">0</span>
+          </div>
+          <div id="sla-history-list"><p class="hint">No call history.</p></div>
+        </div>
+      </div>
+    </div>
+  `;
+
+  // Wire save
+  document.getElementById('sla-save').addEventListener('click', async () => {
+    const fb = document.getElementById('sla-feedback');
+    const patch = {
+      enabled:         document.getElementById('sla-enabled').checked,
+      bind_host:       document.getElementById('sla-host').value.trim() || '0.0.0.0',
+      bind_port:       parseInt(document.getElementById('sla-port').value, 10) || 8090,
+      system_prompt:   document.getElementById('sla-prompt').value,
+      greeting:        document.getElementById('sla-greeting').value,
+      voice:           document.getElementById('sla-voice').value,
+      max_call_s:      parseInt(document.getElementById('sla-max').value, 10) || 0,
+      enable_ha_tools: document.getElementById('sla-tools').checked,
+      only_areas:      document.getElementById('sla-only-areas').checked,
+    };
+    showFeedback(fb, 'ok', 'Saving…');
+    try {
+      await SipLiveAgent.setConfig(patch);
+      showFeedback(fb, 'ok', 'Saved. Service will (re)bind shortly.');
+    } catch (e) {
+      showFeedback(fb, 'err', `Failed: ${e.message}`);
+    }
+  });
+
+  // Subscribe to live status / call events.
+  openSlaWs();
+}
+
+function openSlaWs() {
+  closeSlaWs();
+  const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+  const ws = new WebSocket(`${proto}//${location.host}/api/sip-live-agent/ws`);
+  SLA_STATE.ws = ws;
+  ws.onmessage = (ev) => {
+    let m;
+    try { m = JSON.parse(ev.data); } catch { return; }
+    handleSlaMessage(m);
+  };
+  ws.onclose = () => {
+    SLA_STATE.ws = null;
+    if (document.getElementById('sla-status-text')) {
+      clearTimeout(SLA_STATE.reconnectTimer);
+      SLA_STATE.reconnectTimer = setTimeout(openSlaWs, 3000);
+    }
+  };
+}
+
+function closeSlaWs() {
+  clearTimeout(SLA_STATE.reconnectTimer);
+  SLA_STATE.reconnectTimer = null;
+  if (SLA_STATE.ws) {
+    try { SLA_STATE.ws.close(); } catch {}
+    SLA_STATE.ws = null;
+  }
+}
+
+function handleSlaMessage(m) {
+  switch (m.type) {
+    case 'snapshot':
+      SLA_STATE.status = m.status;
+      SLA_STATE.calls = m.calls || [];
+      SLA_STATE.history = m.history || [];
+      renderSlaStatus();
+      renderSlaCalls();
+      renderSlaHistory();
+      break;
+    case 'status':
+      SLA_STATE.status = m;
+      renderSlaStatus();
+      break;
+    case 'call_started':
+      SLA_STATE.calls.unshift({ call_id: m.call_id, peer: m.peer, started_at: m.started_at, duration_s: 0, heard: '', spoken: '', turns: [] });
+      SLA_STATE.transcripts.set(m.call_id, { heard: '', spoken: '', turns: [] });
+      renderSlaCalls();
+      break;
+    case 'call_transcript': {
+      const t = SLA_STATE.transcripts.get(m.call_id) || { heard: '', spoken: '', turns: [] };
+      if (m.kind === 'heard')  t.heard  = (t.heard  + m.text).slice(-600);
+      if (m.kind === 'spoken') t.spoken = (t.spoken + m.text).slice(-600);
+      if (Array.isArray(m.turns)) t.turns = m.turns;
+      SLA_STATE.transcripts.set(m.call_id, t);
+      const call = SLA_STATE.calls.find((c) => c.call_id === m.call_id);
+      if (call) {
+        call.heard  = t.heard;
+        call.spoken = t.spoken;
+        call.turns  = t.turns;
+        renderSlaCalls();
+      }
+      break;
+    }
+    case 'call_tool':
+      // log inline; no per-tool persistence yet
+      console.log('SLA tool call', m);
+      break;
+    case 'call_ended':
+      SLA_STATE.calls = SLA_STATE.calls.filter((c) => c.call_id !== m.call_id);
+      SLA_STATE.transcripts.delete(m.call_id);
+      renderSlaCalls();
+      // Server pushed status afterwards which will refresh history.
+      SipLiveAgent.getStatus().then((s) => {
+        SLA_STATE.history = s.history || [];
+        renderSlaHistory();
+      }).catch(() => {});
+      break;
+  }
+}
+
+function renderSlaStatus() {
+  const dot = document.getElementById('sla-dot');
+  const txt = document.getElementById('sla-status-text');
+  if (!dot || !txt || !SLA_STATE.status) return;
+  dot.classList.remove('ok', 'err', 'warn', 'checking');
+  const s = SLA_STATE.status;
+  if (!s.enabled) {
+    dot.classList.add('idle' === '' ? 'warn' : 'warn');
+    txt.textContent = 'Disabled';
+  } else if (!s.running) {
+    dot.classList.add('err');
+    txt.textContent = s.last_error || 'Not running';
+  } else {
+    dot.classList.add('ok');
+    txt.textContent = `Listening on ${s.host}:${s.port} · ${s.active} active`;
+  }
+}
+
+function renderSlaCalls() {
+  const wrap = document.getElementById('sla-active-list');
+  const cnt = document.getElementById('sla-active-count');
+  if (!wrap || !cnt) return;
+  cnt.textContent = SLA_STATE.calls.length;
+  if (SLA_STATE.calls.length === 0) {
+    wrap.innerHTML = `<p class="hint">No active calls.</p>`;
+    return;
+  }
+  wrap.innerHTML = SLA_STATE.calls.map((c) => {
+    const startedAt = c.started_at ? new Date(c.started_at * 1000).toLocaleTimeString() : '';
+    return `
+      <div class="iter-card pending">
+        <div class="iter-head">
+          <span class="iter-state-pill on">LIVE</span>
+          <span class="iter-meta">${escapeHtml(c.peer)} · started ${escapeHtml(startedAt)}</span>
+        </div>
+        ${renderSlaTurns(c)}
+      </div>
+    `;
+  }).join('');
+}
+
+function renderSlaTurns(c) {
+  const turns = Array.isArray(c.turns) ? c.turns : [];
+  if (turns.length === 0) {
+    return [
+      c.heard  ? `<div class="iter-reason"><strong>Heard:</strong> ${escapeHtml(c.heard)}</div>`  : '',
+      c.spoken ? `<div class="iter-reason"><strong>Said:</strong> ${escapeHtml(c.spoken)}</div>` : '',
+    ].join('');
+  }
+  return `<div class="sla-turns">` + turns.map((t) => {
+    const label = t.role === 'user' ? 'Caller' : 'Agent';
+    const cls   = t.role === 'user' ? 'user' : 'agent';
+    return `<div class="sla-turn ${cls}"><span class="sla-turn-role">${label}:</span> ${escapeHtml(t.text)}</div>`;
+  }).join('') + `</div>`;
+}
+
+function renderSlaHistory() {
+  const wrap = document.getElementById('sla-history-list');
+  const cnt = document.getElementById('sla-history-count');
+  if (!wrap || !cnt) return;
+  const hist = SLA_STATE.history || [];
+  cnt.textContent = hist.length;
+  if (hist.length === 0) {
+    wrap.innerHTML = `<p class="hint">No call history.</p>`;
+    return;
+  }
+  wrap.innerHTML = hist.map((h) => {
+    const ts = h.started_at ? new Date(h.started_at * 1000).toLocaleString() : '';
+    const dur = `${String(Math.floor(h.duration_s / 60)).padStart(2,'0')}:${String(h.duration_s % 60).padStart(2,'0')}`;
+    return `
+      <div class="iter-card not-triggered">
+        <div class="iter-head">
+          <span class="iter-state-pill">ended · ${escapeHtml(dur)}</span>
+          <span class="iter-meta">${escapeHtml(h.peer)} · ${escapeHtml(ts)}</span>
+        </div>
+        ${renderSlaTurns(h)}
+      </div>
+    `;
+  }).join('');
 }
 
 function renderNotFound(root) {

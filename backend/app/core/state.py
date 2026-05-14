@@ -32,6 +32,11 @@ class State:
         # runtime engine that consumes these. Each entry is a plain dict; the
         # rules router owns the schema, this layer only round-trips the list.
         self.ai_camera_rules: list[dict[str, Any]] = []
+        # PBX — single source of truth for "where is the SIP server". The
+        # Live Assistant uses this for connectivity checks; the softphone
+        # derives a default ws_url from it (wss://<host>:8089/ws) unless the
+        # user has overridden ws_url on the Extension page.
+        self.pbx_host: Optional[str] = None
         # SIP softphone — settings the browser-side JsSIP client uses to
         # register with the PBX. ws_url is the WebSocket endpoint (ws:// or
         # wss://). realm is the SIP domain part of the AOR; falls back to the
@@ -41,6 +46,23 @@ class State:
         self.sip_password: Optional[str] = None
         self.sip_realm: Optional[str] = None
         self.sip_display_name: Optional[str] = None
+        # SIP Live Assistant — backend AudioSocket service that answers
+        # FreePBX-routed calls with a Gemini Live session. See
+        # docs/LiveAssistantSIP.md for the full architecture.
+        self.sla_enabled: bool = False
+        self.sla_bind_host: str = "0.0.0.0"
+        self.sla_bind_port: int = 8090
+        self.sla_system_prompt: str = (
+            "You are a friendly phone receptionist for a smart-home demo. "
+            "Greet the caller, identify who is calling, and route the call. "
+            "If the caller asks you to control devices, use the Home Assistant "
+            "tools you have access to. Keep replies conversational and short."
+        )
+        self.sla_voice: str = "Aoede"
+        self.sla_greeting: str = "Hello, you've reached the Primewave demo. How can I help?"
+        self.sla_enable_ha_tools: bool = True
+        self.sla_only_areas: bool = False
+        self.sla_max_call_s: int = 600
         self._load()
 
     def _load(self) -> None:
@@ -62,11 +84,21 @@ class State:
             rules = data.get("ai_camera_rules")
             if isinstance(rules, list):
                 self.ai_camera_rules = [r for r in rules if isinstance(r, dict)]
+            self.pbx_host         = data.get("pbx_host") or None
             self.sip_ws_url       = data.get("sip_ws_url") or None
             self.sip_extension    = data.get("sip_extension") or None
             self.sip_password     = data.get("sip_password") or None
             self.sip_realm        = data.get("sip_realm") or None
             self.sip_display_name = data.get("sip_display_name") or None
+            self.sla_enabled        = bool(data.get("sla_enabled"))
+            self.sla_bind_host      = data.get("sla_bind_host") or "0.0.0.0"
+            self.sla_bind_port      = int(data.get("sla_bind_port") or 8090)
+            self.sla_system_prompt  = data.get("sla_system_prompt") or self.sla_system_prompt
+            self.sla_voice          = data.get("sla_voice") or "Aoede"
+            self.sla_greeting       = data.get("sla_greeting") or ""
+            self.sla_enable_ha_tools = bool(data.get("sla_enable_ha_tools", True))
+            self.sla_only_areas     = bool(data.get("sla_only_areas"))
+            self.sla_max_call_s     = int(data.get("sla_max_call_s") or 600)
         except Exception:
             pass
 
@@ -88,11 +120,21 @@ class State:
                         "mqtt_topic_prefix": self.mqtt_topic_prefix,
                         "ollama_url": self.ollama_url,
                         "ai_camera_rules": self.ai_camera_rules,
+                        "pbx_host":         self.pbx_host,
                         "sip_ws_url":       self.sip_ws_url,
                         "sip_extension":    self.sip_extension,
                         "sip_password":     self.sip_password,
                         "sip_realm":        self.sip_realm,
                         "sip_display_name": self.sip_display_name,
+                        "sla_enabled":          self.sla_enabled,
+                        "sla_bind_host":        self.sla_bind_host,
+                        "sla_bind_port":        self.sla_bind_port,
+                        "sla_system_prompt":    self.sla_system_prompt,
+                        "sla_voice":            self.sla_voice,
+                        "sla_greeting":         self.sla_greeting,
+                        "sla_enable_ha_tools":  self.sla_enable_ha_tools,
+                        "sla_only_areas":       self.sla_only_areas,
+                        "sla_max_call_s":       self.sla_max_call_s,
                     },
                     indent=2,
                 )

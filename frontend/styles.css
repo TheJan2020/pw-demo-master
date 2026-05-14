@@ -1832,6 +1832,57 @@ input:disabled, select:disabled, textarea:disabled {
 .sip-history-peer { font-weight: 600; font-size: 14px; }
 .sip-history-meta { color: var(--text-dim); font-size: 12px; }
 
+/* PBX requirements check (Settings → PBX card) */
+.pbx-check-list {
+  margin-top: 10px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.pbx-check {
+  display: grid;
+  grid-template-columns: 24px 1fr;
+  gap: 10px;
+  align-items: start;
+  padding: 8px 10px;
+  border-radius: 8px;
+  border: 1px solid var(--border);
+  background: var(--panel-2);
+}
+.pbx-check.ok   { border-left: 3px solid var(--ok); }
+.pbx-check.err  { border-left: 3px solid var(--err); }
+.pbx-check.warn { border-left: 3px solid var(--warn); }
+.pbx-check-icon {
+  font-weight: 700;
+  text-align: center;
+  font-size: 16px;
+}
+.pbx-check.ok   .pbx-check-icon { color: var(--ok); }
+.pbx-check.err  .pbx-check-icon { color: var(--err); }
+.pbx-check.warn .pbx-check-icon { color: var(--warn); }
+.pbx-check-name { font-size: 13px; font-weight: 500; }
+.pbx-check-msg  { font-size: 12px; color: var(--text-dim); margin-top: 2px; word-break: break-word; }
+
+/* SIP Live Assistant — interleaved per-turn transcript inside each call card. */
+.sla-turns {
+  margin-top: 8px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.sla-turn {
+  font-size: 13px;
+  line-height: 1.45;
+  padding: 6px 10px;
+  border-radius: 8px;
+  border: 1px solid var(--border);
+  background: var(--panel-2);
+  word-break: break-word;
+}
+.sla-turn.user  { border-left: 3px solid var(--accent, #4a9eff); }
+.sla-turn.agent { border-left: 3px solid var(--ok); }
+.sla-turn-role  { font-weight: 600; color: var(--text-dim); margin-right: 4px; }
+
 /* Modal large frame — bbox sits over the contained image. We override the
  * 16:9 aspect ratio + 100% sizing of .live-frame so the wrapper hugs the
  * actual image's natural aspect; that way the absolutely-positioned SVG
