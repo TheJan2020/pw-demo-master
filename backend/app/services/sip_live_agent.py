@@ -51,6 +51,7 @@ from google.genai import types
 
 from ..core.state import state
 from ..knowledge import homeassistant as ha_knowledge
+from ..routers.ai_camera import _fetch_frigate_snapshot
 
 logger = logging.getLogger("sip_live_agent")
 
@@ -133,6 +134,17 @@ def _ha_tool_declarations() -> list[types.FunctionDeclaration]:
 
 def _build_system_instruction() -> str:
     base = (state.sla_system_prompt or "").strip()
+    cams = list(state.sla_cameras or [])
+    if cams:
+        base = (
+            base + "\n\n"
+            "## Camera vision\n"
+            f"You also receive live video frames every ~1 s from these Frigate cameras: "
+            f"{', '.join(cams)}.\n"
+            "Frames arrive in round-robin order. When the caller asks what you see, "
+            "describe the most recent frame plainly and reference the camera by name. "
+            "If the caller asks about a specific camera not in the list above, say so."
+        )
     if not state.sla_enable_ha_tools:
         return base
     lines = [base, "", "## Home Assistant capability catalog"]
@@ -220,6 +232,19 @@ class CallSession:
         self.stop_evt = asyncio.Event()
         self._upstate = None    # audioop ratecv state for 8k→16k
         self._downstate = None  # audioop ratecv state for 24k→8k
+        # Leftover sub-frame bytes carried between _write_loop iterations so
+        # we never pad mid-stream — partial frames get glued onto the front
+        # of the next chunk instead of being zero-padded out (which causes
+        # audible "tong tong" clicks).
+        self._out_leftover: bytes = b""
+        # Monotonic "next frame should leave at" timestamp, kept across
+        # _send_audio calls so 20 ms pacing is precise rather than drifting.
+        self._next_send_at: Optional[float] = None
+        # Half-duplex echo gate: while wall-clock < echo_until, the caller's
+        # mic audio is NOT forwarded to Gemini. Prevents the agent's own
+        # voice (played through the caller's speaker, picked up by the mic)
+        # from triggering Gemini's VAD and self-interrupting.
+        self.echo_until: float = 0.0
         self.heard_text = ""
         self.spoken_text = ""
         # Interleaved per-turn transcript. Each entry: {role, text, ts}.
@@ -244,14 +269,38 @@ class CallSession:
             self.turns.append({"role": role, "text": text, "ts": time.time()})
 
     async def _send_audio(self, pcm8k: bytes) -> None:
-        # AudioSocket payloads can be >0xFFFF if you let them grow; cap at
-        # 20 ms (320 bytes) frames so we play nicely.
+        # pcm8k is guaranteed to be a multiple of 320 bytes — see _write_loop
+        # for the buffering that ensures this. Each 320-byte chunk is 20 ms
+        # of slin audio; we pace them out at exactly 20 ms intervals using a
+        # monotonic clock, otherwise drift accumulates and Asterisk's RTP
+        # output ends up with rhythmic click artifacts.
         FRAME = 320
+        n_frames = len(pcm8k) // FRAME
+        if n_frames == 0:
+            return
+        # Open the half-duplex echo gate: while we're playing this clip plus
+        # a 350 ms tail (room reverberation + phone AEC convergence), drop
+        # whatever the caller's mic sends so Gemini doesn't hear its own
+        # voice come back and VAD-interrupt itself.
+        self.echo_until = max(
+            self.echo_until, time.time() + n_frames * 0.020 + 0.35,
+        )
+        now = time.monotonic()
+        if self._next_send_at is None or self._next_send_at < now - 0.05:
+            # First frame ever, OR we fell behind by >50 ms — reset the
+            # cadence so we don't try to "catch up" by sending bursts.
+            self._next_send_at = now
         for i in range(0, len(pcm8k), FRAME):
             chunk = pcm8k[i:i + FRAME]
-            header = bytes([_AS_AUDIO]) + struct.pack(">H", len(chunk))
-            self.writer.write(header + chunk)
-        await self.writer.drain()
+            self.writer.write(bytes([_AS_AUDIO]) + struct.pack(">H", len(chunk)) + chunk)
+            await self.writer.drain()
+            self._next_send_at += 0.020
+            delay = self._next_send_at - time.monotonic()
+            if delay > 0:
+                await asyncio.sleep(delay)
+            else:
+                # Yield to the event loop even when on-time / behind.
+                await asyncio.sleep(0)
 
     async def _hangup(self) -> None:
         try:
@@ -281,6 +330,13 @@ class CallSession:
                     logger.warning("call %s: peer error: %r", self.call_id, payload)
                     continue
                 if msg_type == _AS_AUDIO and payload:
+                    # Half-duplex: while the agent is speaking (or just
+                    # finished), the caller's mic mostly contains the
+                    # agent's own voice fed back through the phone speaker.
+                    # Drop those frames so Gemini doesn't VAD-trigger on
+                    # them and interrupt itself.
+                    if time.time() < self.echo_until:
+                        continue
                     pcm16k, self._upstate = audioop.ratecv(
                         payload, _SAMPLE_WIDTH, 1, 8000, 16000, self._upstate,
                     )
@@ -298,7 +354,11 @@ class CallSession:
             self.stop_evt.set()
 
     async def _write_loop(self) -> None:
-        """us → Asterisk. Pulls Gemini's 24 kHz PCM, downsamples to 8 kHz, writes."""
+        """us → Asterisk. Pulls Gemini's 24 kHz PCM, downsamples to 8 kHz,
+        writes only complete 320-byte frames — leftover sub-frame bytes are
+        carried into the next iteration via self._out_leftover so we never
+        zero-pad mid-stream (which causes audible clicks at chunk seams)."""
+        FRAME = 320
         try:
             while not self.stop_evt.is_set():
                 try:
@@ -310,8 +370,13 @@ class CallSession:
                 pcm8k, self._downstate = audioop.ratecv(
                     pcm24k, _SAMPLE_WIDTH, 1, 24000, 8000, self._downstate,
                 )
-                if pcm8k:
-                    await self._send_audio(pcm8k)
+                if not pcm8k:
+                    continue
+                buf = self._out_leftover + pcm8k
+                n_complete = (len(buf) // FRAME) * FRAME
+                if n_complete:
+                    await self._send_audio(buf[:n_complete])
+                self._out_leftover = buf[n_complete:]
         except Exception as e:
             logger.warning("call %s: write loop ended: %s", self.call_id, e)
 
@@ -372,6 +437,27 @@ class CallSession:
                             audio=types.Blob(data=chunk, mime_type="audio/pcm;rate=16000"),
                         )
 
+                async def stream_cameras():
+                    """Round-robin selected cameras at ~1 frame/sec/each so
+                    Gemini gets fresh visual context throughout the call."""
+                    cams = list(state.sla_cameras or [])
+                    if not cams:
+                        return
+                    period = 1.0
+                    idx = 0
+                    while not self.stop_evt.is_set():
+                        cam = cams[idx % len(cams)]
+                        idx += 1
+                        try:
+                            jpg = await _fetch_frigate_snapshot(cam, height=480)
+                            if jpg:
+                                await session.send_realtime_input(
+                                    video=types.Blob(data=jpg, mime_type="image/jpeg"),
+                                )
+                        except Exception:
+                            logger.warning("call %s: camera %s frame failed", self.call_id, cam, exc_info=True)
+                        await asyncio.sleep(period)
+
                 async def receive():
                     while not self.stop_evt.is_set():
                         async for resp in session.receive():
@@ -387,6 +473,20 @@ class CallSession:
 
                             sc = getattr(resp, "server_content", None)
                             if sc:
+                                if getattr(sc, "interrupted", False):
+                                    # Caller talked over the agent — drop any
+                                    # buffered audio so we don't play stale
+                                    # response after they've interjected.
+                                    drained = 0
+                                    while not self.audio_out.empty():
+                                        try:
+                                            self.audio_out.get_nowait()
+                                            drained += 1
+                                        except Exception:
+                                            break
+                                    if drained:
+                                        logger.info("call %s: interrupted — flushed %d queued frames",
+                                                    self.call_id, drained)
                                 it = getattr(sc, "input_transcription", None)
                                 if it and getattr(it, "text", None):
                                     self.heard_text += it.text
@@ -422,7 +522,7 @@ class CallSession:
                             if self.stop_evt.is_set():
                                 return
 
-                await asyncio.gather(feed(), receive())
+                await asyncio.gather(feed(), receive(), stream_cameras())
         except asyncio.CancelledError:
             raise
         except Exception as e:

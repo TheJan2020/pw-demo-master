@@ -8,10 +8,14 @@ from fastapi import FastAPI
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 
-from .routers import ai_camera, ai_camera_rules, frigate, homeassistant, live_agent, mqtt, sip, sip_live_agent
+from .routers import (
+    ai_camera, ai_camera_rules, frigate, homeassistant, live_agent, mqtt,
+    sip, sip_live_agent, sip_live_rep,
+)
 from .services import ai_camera_engine
 from .services.mqtt import mqtt_service
 from .services.sip_live_agent import sip_live_agent_service
+from .services.sip_live_rep import sip_live_rep_service
 
 FRONTEND_DIR = Path(__file__).resolve().parents[2] / "frontend"
 
@@ -25,9 +29,11 @@ async def lifespan(_app: FastAPI):
     mqtt_service.start()
     await ai_camera_engine.start_engine()
     sip_live_agent_service.apply_config()
+    sip_live_rep_service.apply_config()
     try:
         yield
     finally:
+        await sip_live_rep_service.stop()
         await sip_live_agent_service.stop()
         await ai_camera_engine.stop_engine()
         mqtt_service.stop()
@@ -44,6 +50,7 @@ app.include_router(ai_camera_rules.router, prefix="/api/ai-camera",     tags=["a
 app.include_router(mqtt.router,           prefix="/api/mqtt",           tags=["mqtt"])
 app.include_router(sip.router,            prefix="/api/sip",            tags=["sip"])
 app.include_router(sip_live_agent.router, prefix="/api/sip-live-agent", tags=["sip-live-agent"])
+app.include_router(sip_live_rep.router,   prefix="/api/sip-live-rep",   tags=["sip-live-rep"])
 
 
 @app.get("/api/health")

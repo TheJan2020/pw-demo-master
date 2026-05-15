@@ -26,6 +26,7 @@ class SlaConfigIn(BaseModel):
     enable_ha_tools:   Optional[bool] = None
     only_areas:        Optional[bool] = None
     max_call_s:        Optional[int] = None
+    cameras:           Optional[list[str]] = None
 
 
 class SlaConfigOut(BaseModel):
@@ -38,6 +39,7 @@ class SlaConfigOut(BaseModel):
     enable_ha_tools:   bool
     only_areas:        bool
     max_call_s:        int
+    cameras:           list[str]
 
 
 def _current() -> SlaConfigOut:
@@ -51,6 +53,7 @@ def _current() -> SlaConfigOut:
         enable_ha_tools=bool(state.sla_enable_ha_tools),
         only_areas=bool(state.sla_only_areas),
         max_call_s=int(state.sla_max_call_s or 0),
+        cameras=list(state.sla_cameras or []),
     )
 
 
@@ -70,6 +73,7 @@ async def set_config(payload: SlaConfigIn) -> SlaConfigOut:
     if payload.enable_ha_tools is not None: state.sla_enable_ha_tools = bool(payload.enable_ha_tools)
     if payload.only_areas      is not None: state.sla_only_areas      = bool(payload.only_areas)
     if payload.max_call_s      is not None: state.sla_max_call_s      = max(0, int(payload.max_call_s))
+    if payload.cameras         is not None: state.sla_cameras         = [c for c in payload.cameras if isinstance(c, str) and c.strip()]
     state.save()
     # React to the change (start/stop/rebind) once the event loop is free.
     svc.apply_config()

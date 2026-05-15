@@ -129,6 +129,15 @@ const SipLiveAgent = {
   getStatus: ()      => Api.getJSON('/api/sip-live-agent/status'),
 };
 
+const SipLiveRep = {
+  getConfig:    ()           => Api.getJSON('/api/sip-live-rep/config'),
+  setConfig:    (patch)      => Api.postJSON('/api/sip-live-rep/config', patch),
+  getHealth:    ()           => Api.getJSON('/api/sip-live-rep/health'),
+  getStatus:    ()           => Api.getJSON('/api/sip-live-rep/status'),
+  getHistory:   (offset, limit) => Api.getJSON(`/api/sip-live-rep/history?offset=${offset}&limit=${limit}`),
+  clearHistory: ()           => fetch('/api/sip-live-rep/history', { method: 'DELETE' }).then((r) => r.json()),
+};
+
 const Ollama = {
   getConfig: () => Api.getJSON('/api/ai-camera/ollama/config'),
   setConfig: (url) => Api.postJSON('/api/ai-camera/ollama/config', { url }),
@@ -219,6 +228,7 @@ const routes = {
   'ai-camera/test-model':  { title: 'AI-Camera · Test AI Model', render: renderAiCameraTestModel },
   'sip/extension':         { title: 'SIP Phone · Extension',       render: renderSipExtension },
   'sip/live-assistant':    { title: 'SIP Phone · Live Assistant',  render: renderSipLiveAssistant },
+  'sip/live-rep':          { title: 'SIP Phone · Live Representative', render: renderSipLiveRep },
 };
 
 function currentRoute() {
@@ -271,6 +281,10 @@ function navigate() {
   // Leaving the Live Assistant page? Close its WebSocket.
   if (route !== 'sip/live-assistant' && typeof closeSlaWs === 'function') {
     try { closeSlaWs(); } catch {}
+  }
+  // Leaving the Live Representative page? Same — release the WS + expand state.
+  if (route !== 'sip/live-rep' && typeof closeSlrWs === 'function') {
+    try { closeSlrWs(); } catch {}
   }
 
   // Leaving the Rules page? Close its motion WS + unwire the event listener.
@@ -4892,6 +4906,12 @@ async function renderSipLiveAssistant(root) {
           <span>Restrict to entities assigned to an HA Area</span>
         </label>
 
+        <label class="field">
+          <span class="lbl">Cameras the agent can see</span>
+          <div id="sla-cameras" class="checkbox-list"><p class="hint">Loading…</p></div>
+          <span class="hint" style="margin-top:6px;display:block">Frames stream at ~1 fps per camera in round-robin, so the agent can answer "what do you see on the front door camera?".</span>
+        </label>
+
         <div class="btn-row" style="margin-top:14px">
           <button class="btn" id="sla-save">Save &amp; apply</button>
         </div>
@@ -4925,9 +4945,30 @@ async function renderSipLiveAssistant(root) {
     </div>
   `;
 
+  // Populate the camera checkboxes from Frigate (best-effort).
+  const selected = new Set(cfg.cameras || []);
+  Frigate.getCameras().then((cams) => {
+    const wrap = document.getElementById('sla-cameras');
+    if (!wrap) return;
+    if (!cams || cams.length === 0) {
+      wrap.innerHTML = `<p class="hint">No Frigate cameras configured.</p>`;
+      return;
+    }
+    wrap.innerHTML = cams.map((c) => `
+      <label class="checkbox-row">
+        <input type="checkbox" name="sla-cam" value="${escapeHtml(c.name)}" ${selected.has(c.name) ? 'checked' : ''} />
+        <span>${escapeHtml(c.name)}</span>
+      </label>
+    `).join('');
+  }).catch(() => {
+    const wrap = document.getElementById('sla-cameras');
+    if (wrap) wrap.innerHTML = `<p class="hint" style="color:var(--err)">Could not fetch cameras from Frigate.</p>`;
+  });
+
   // Wire save
   document.getElementById('sla-save').addEventListener('click', async () => {
     const fb = document.getElementById('sla-feedback');
+    const cameras = [...document.querySelectorAll('#sla-cameras input[type="checkbox"]:checked')].map((c) => c.value);
     const patch = {
       enabled:         document.getElementById('sla-enabled').checked,
       bind_host:       document.getElementById('sla-host').value.trim() || '0.0.0.0',
@@ -4938,6 +4979,7 @@ async function renderSipLiveAssistant(root) {
       max_call_s:      parseInt(document.getElementById('sla-max').value, 10) || 0,
       enable_ha_tools: document.getElementById('sla-tools').checked,
       only_areas:      document.getElementById('sla-only-areas').checked,
+      cameras,
     };
     showFeedback(fb, 'ok', 'Saving…');
     try {
@@ -5227,6 +5269,495 @@ function initModal() {
   document.addEventListener('keydown', (e) => {
     if (e.key === 'Escape' && backdrop && !backdrop.hidden) closeModal();
   });
+}
+
+// =============================================================
+// SIP Phone · Live Representative — Primewave's customer-facing AI rep
+//   - One bigger system-prompt textarea (this is the persona we iterate on)
+//   - Persistent call history, one collapsible row per past call so the
+//     full transcript is one click away.
+// =============================================================
+const SLR_STATE = {
+  ws: null,
+  reconnectTimer: null,
+  status: null,
+  calls: [],        // active calls (transient)
+  history: [],      // persistent calls (newest first)
+  historyTotal: 0,
+  historyOffset: 0,
+  expanded: new Set(), // call_ids whose transcript is expanded
+};
+
+async function renderSipLiveRep(root) {
+  let cfg;
+  try { cfg = await SipLiveRep.getConfig(); }
+  catch (e) {
+    root.innerHTML = `<div class="empty-state"><h3>Backend error</h3><p>${escapeHtml(e.message)}</p></div>`;
+    return;
+  }
+  let geminiCfg = { api_key_set: false };
+  try { geminiCfg = await LiveAgent.getConfig(); } catch {}
+
+  root.innerHTML = `
+    <div class="page-header">
+      <h1>SIP Phone · Live Representative</h1>
+      <p>Primewave's customer-facing AI rep. Dial the feature code routed to <code>pwdemo-live-rep,s,1</code> (default <strong>8888</strong>) and Gemini Live answers as Lena. Every call's transcript is permanently saved below.</p>
+    </div>
+
+    ${!geminiCfg.api_key_set ? `
+      <div class="card" style="border-left:3px solid var(--err)">
+        <h2>Gemini API key not set</h2>
+        <p>Add your key in <a href="#/settings">Settings → Gemini Live Agent</a> first.</p>
+      </div>` : ''}
+
+    <div class="split">
+      <div class="card" style="margin:0">
+        <h2>Settings</h2>
+
+        <label class="checkbox-row" style="margin-bottom:12px">
+          <input type="checkbox" id="slr-enabled" ${cfg.enabled ? 'checked' : ''} />
+          <span><strong>Enable service</strong> — start the AudioSocket listener so FreePBX can route calls here.</span>
+        </label>
+
+        <div style="display:grid;grid-template-columns:1fr 140px;gap:10px">
+          <label class="field" style="margin:0">
+            <span class="lbl">Bind host</span>
+            <input id="slr-host" type="text" value="${escapeHtml(cfg.bind_host)}" placeholder="0.0.0.0" />
+          </label>
+          <label class="field" style="margin:0">
+            <span class="lbl">Port</span>
+            <input id="slr-port" type="number" min="1" max="65535" value="${cfg.bind_port}" />
+          </label>
+        </div>
+
+        <label class="field">
+          <span class="lbl">Persona / system prompt <span class="hint">— who Lena is and how she speaks (Lebanese dialect by default)</span></span>
+          <textarea id="slr-prompt" rows="8" dir="auto">${escapeHtml(cfg.system_prompt)}</textarea>
+        </label>
+
+        <label class="field">
+          <span class="lbl">Knowledge base <span class="hint">— what Lena knows about our company / products. The agent reads this as reference.</span></span>
+          <textarea id="slr-knowledge" rows="10" dir="auto">${escapeHtml(cfg.knowledge || '')}</textarea>
+        </label>
+
+        <label class="field">
+          <span class="lbl">Information to collect <span class="hint">— Lena will try to gather these during the call. Add/remove fields freely; they become live columns in the table below.</span></span>
+          <div id="slr-schema-editor" class="slr-schema-editor"></div>
+          <button class="btn secondary" id="slr-schema-add" style="margin-top:6px">+ Add field</button>
+        </label>
+
+        <label class="field">
+          <span class="lbl">Greeting</span>
+          <input id="slr-greeting" type="text" dir="auto" value="${escapeHtml(cfg.greeting)}" />
+          <span class="hint" style="margin-top:6px;display:block">Spoken the moment a call connects.</span>
+        </label>
+
+        <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px">
+          <label class="field" style="margin:0">
+            <span class="lbl">Voice</span>
+            <select id="slr-voice">
+              ${['Aoede','Puck','Charon','Kore','Fenrir'].map((v) =>
+                `<option value="${v}" ${cfg.voice === v ? 'selected' : ''}>${v}</option>`).join('')}
+            </select>
+          </label>
+          <label class="field" style="margin:0">
+            <span class="lbl">Max call duration (seconds)</span>
+            <input id="slr-max" type="number" min="0" value="${cfg.max_call_s}" />
+          </label>
+        </div>
+
+        <div class="btn-row" style="margin-top:14px">
+          <button class="btn" id="slr-save">Save &amp; apply</button>
+        </div>
+        <div class="feedback" id="slr-feedback"></div>
+
+        <div class="status-pill" style="margin-top:12px">
+          <span class="status-dot" id="slr-dot"></span>
+          <span class="status-label">Service:</span>
+          <span class="status-text" id="slr-status-text">checking…</span>
+        </div>
+      </div>
+
+      <div style="display:flex;flex-direction:column;gap:14px">
+        <div class="card" style="margin:0">
+          <div class="events-meta">
+            <h2 style="margin:0">Active calls</h2>
+            <span class="count" id="slr-active-count">0</span>
+          </div>
+          <div id="slr-active-list"><p class="hint">No active calls.</p></div>
+        </div>
+
+        <div class="card" style="margin:0">
+          <div class="events-meta">
+            <h2 style="margin:0">Collected information</h2>
+            <span class="count" id="slr-collected-count">0</span>
+          </div>
+          <div id="slr-collected-table"><p class="hint">No information collected yet.</p></div>
+          <p class="hint" style="margin-top:6px">Columns are generated live from the "Information to collect" schema on the left.</p>
+        </div>
+
+        <div class="card" style="margin:0">
+          <div class="events-meta">
+            <h2 style="margin:0">Call history (permanent)</h2>
+            <span class="count" id="slr-history-count">0</span>
+          </div>
+          <div id="slr-history-list"><p class="hint">No call history yet.</p></div>
+          <div class="btn-row" style="margin-top:10px;justify-content:space-between">
+            <button class="btn secondary" id="slr-history-more">Load 20 more</button>
+            <button class="btn secondary danger" id="slr-history-clear">Clear history</button>
+          </div>
+        </div>
+      </div>
+    </div>
+  `;
+
+  // Keep the loaded config's info_schema in a local variable so we can edit
+  // it without immediately saving — saved on "Save & apply" click.
+  SLR_STATE.schemaDraft = (cfg.info_schema || []).map((f) => ({ ...f }));
+  renderSlrSchemaEditor();
+
+  document.getElementById('slr-save').addEventListener('click', async () => {
+    const fb = document.getElementById('slr-feedback');
+    // Snapshot the live schema editor rows.
+    const info_schema = readSlrSchemaFromDom();
+    const patch = {
+      enabled:       document.getElementById('slr-enabled').checked,
+      bind_host:     document.getElementById('slr-host').value.trim() || '0.0.0.0',
+      bind_port:     parseInt(document.getElementById('slr-port').value, 10) || 8091,
+      system_prompt: document.getElementById('slr-prompt').value,
+      knowledge:     document.getElementById('slr-knowledge').value,
+      info_schema,
+      greeting:      document.getElementById('slr-greeting').value,
+      voice:         document.getElementById('slr-voice').value,
+      max_call_s:    parseInt(document.getElementById('slr-max').value, 10) || 0,
+    };
+    showFeedback(fb, 'ok', 'Saving…');
+    try {
+      const saved = await SipLiveRep.setConfig(patch);
+      // Refresh the cached schema so the table headers reflect what the
+      // backend actually accepted (after deduping / trimming).
+      SLR_STATE.schemaDraft = (saved.info_schema || []).map((f) => ({ ...f }));
+      renderSlrSchemaEditor();
+      renderSlrCollected();
+      showFeedback(fb, 'ok', 'Saved. Service will (re)bind shortly.');
+    } catch (e) {
+      showFeedback(fb, 'err', `Failed: ${e.message}`);
+    }
+  });
+
+  document.getElementById('slr-schema-add').addEventListener('click', () => {
+    SLR_STATE.schemaDraft.push({ name: '', label: '', description: '' });
+    renderSlrSchemaEditor();
+  });
+
+  document.getElementById('slr-history-more').addEventListener('click', loadMoreSlrHistory);
+  document.getElementById('slr-history-clear').addEventListener('click', clearSlrHistory);
+  document.getElementById('slr-history-list').addEventListener('click', onSlrHistoryClick);
+
+  // Reset paging state and fetch the first page.
+  SLR_STATE.history = [];
+  SLR_STATE.historyOffset = 0;
+  SLR_STATE.historyTotal = 0;
+  SLR_STATE.expanded.clear();
+
+  openSlrWs();
+}
+
+function openSlrWs() {
+  closeSlrWs();
+  const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+  const ws = new WebSocket(`${proto}//${location.host}/api/sip-live-rep/ws`);
+  SLR_STATE.ws = ws;
+  ws.onmessage = (ev) => {
+    let m;
+    try { m = JSON.parse(ev.data); } catch { return; }
+    handleSlrMessage(m);
+  };
+  ws.onclose = () => {
+    SLR_STATE.ws = null;
+    if (document.getElementById('slr-status-text')) {
+      clearTimeout(SLR_STATE.reconnectTimer);
+      SLR_STATE.reconnectTimer = setTimeout(openSlrWs, 3000);
+    }
+  };
+}
+
+function closeSlrWs() {
+  clearTimeout(SLR_STATE.reconnectTimer);
+  SLR_STATE.reconnectTimer = null;
+  if (SLR_STATE.ws) {
+    try { SLR_STATE.ws.close(); } catch {}
+    SLR_STATE.ws = null;
+  }
+}
+
+function handleSlrMessage(m) {
+  switch (m.type) {
+    case 'snapshot':
+      SLR_STATE.status = m.status;
+      SLR_STATE.calls = m.calls || [];
+      SLR_STATE.history = m.history || [];
+      SLR_STATE.historyTotal = m.history_total || SLR_STATE.history.length;
+      SLR_STATE.historyOffset = SLR_STATE.history.length;
+      renderSlrStatus();
+      renderSlrCalls();
+      renderSlrHistory();
+      renderSlrCollected();
+      break;
+    case 'status':
+      SLR_STATE.status = m;
+      renderSlrStatus();
+      break;
+    case 'call_started':
+      SLR_STATE.calls = SLR_STATE.calls.filter((c) => c.call_id !== m.call_id);
+      SLR_STATE.calls.unshift({ call_id: m.call_id, peer: m.peer, started_at: m.started_at, turns: [], duration_s: 0, collected: {} });
+      renderSlrCalls();
+      renderSlrCollected();
+      break;
+    case 'call_transcript': {
+      const c = SLR_STATE.calls.find((c) => c.call_id === m.call_id);
+      if (c) { c.turns = m.turns || c.turns; renderSlrCalls(); }
+      break;
+    }
+    case 'call_collected': {
+      const c = SLR_STATE.calls.find((c) => c.call_id === m.call_id);
+      if (c) { c.collected = m.fields || {}; renderSlrCalls(); renderSlrCollected(); }
+      break;
+    }
+    case 'call_ended':
+      SLR_STATE.calls = SLR_STATE.calls.filter((c) => c.call_id !== m.call_id);
+      SLR_STATE.history.unshift({
+        call_id:    m.call_id,
+        peer:       m.peer,
+        uuid:       m.uuid,
+        started_at: m.started_at,
+        ended_at:   m.ended_at,
+        duration_s: m.duration_s,
+        heard:      m.heard,
+        spoken:     m.spoken,
+        turns:      m.turns || [],
+        collected:  m.collected || {},
+      });
+      SLR_STATE.historyTotal += 1;
+      SLR_STATE.historyOffset += 1;
+      renderSlrCalls();
+      renderSlrHistory();
+      renderSlrCollected();
+      break;
+  }
+}
+
+function renderSlrStatus() {
+  const dot = document.getElementById('slr-dot');
+  const txt = document.getElementById('slr-status-text');
+  if (!dot || !txt) return;
+  dot.classList.remove('ok', 'err', 'warn', 'checking');
+  const s = SLR_STATE.status || {};
+  if (!s.enabled) {
+    dot.classList.add('idle'); txt.textContent = 'Disabled';
+  } else if (s.running) {
+    dot.classList.add('ok'); txt.textContent = `Listening on ${s.host}:${s.port}`;
+  } else {
+    dot.classList.add('err'); txt.textContent = s.last_error || 'Not running';
+  }
+}
+
+function renderSlrCalls() {
+  const wrap = document.getElementById('slr-active-list');
+  const cnt  = document.getElementById('slr-active-count');
+  if (!wrap || !cnt) return;
+  cnt.textContent = SLR_STATE.calls.length;
+  if (SLR_STATE.calls.length === 0) {
+    wrap.innerHTML = `<p class="hint">No active calls.</p>`;
+    return;
+  }
+  wrap.innerHTML = SLR_STATE.calls.map((c) => `
+    <div class="sla-active-call">
+      <div class="sla-call-head">
+        <strong>${escapeHtml(c.peer || c.call_id)}</strong>
+        <span class="hint">${new Date((c.started_at || 0) * 1000).toLocaleTimeString()}</span>
+      </div>
+      <div class="sla-transcript">${renderTurns(c.turns)}</div>
+    </div>
+  `).join('');
+}
+
+function renderSlrHistory() {
+  const wrap = document.getElementById('slr-history-list');
+  const cnt  = document.getElementById('slr-history-count');
+  const more = document.getElementById('slr-history-more');
+  if (!wrap || !cnt) return;
+  cnt.textContent = SLR_STATE.historyTotal;
+  if (SLR_STATE.history.length === 0) {
+    wrap.innerHTML = `<p class="hint">No call history yet.</p>`;
+    if (more) more.hidden = true;
+    return;
+  }
+  wrap.innerHTML = SLR_STATE.history.map((c) => {
+    const open = SLR_STATE.expanded.has(c.call_id);
+    const started = c.started_at ? new Date(c.started_at * 1000).toLocaleString() : '';
+    const dur = c.duration_s ? `${c.duration_s}s` : '';
+    return `
+      <div class="history-entry ${open ? 'open' : ''}" data-call-id="${escapeHtml(c.call_id)}">
+        <div class="history-meta history-row-head" data-call-id="${escapeHtml(c.call_id)}" style="cursor:pointer">
+          <span class="rule-expand-arrow ${open ? 'open' : ''}" aria-hidden="true">▸</span>
+          <strong>${escapeHtml(c.peer || c.call_id)}</strong>
+          <span class="rule-badge muted">${escapeHtml(dur)}</span>
+          <span class="hint" style="margin-left:auto">${escapeHtml(started)}</span>
+        </div>
+        ${open ? `<div class="sla-transcript" style="margin-top:8px">${renderTurns(c.turns)}</div>` : ''}
+      </div>
+    `;
+  }).join('');
+  if (more) {
+    const remaining = Math.max(0, SLR_STATE.historyTotal - SLR_STATE.history.length);
+    more.hidden = remaining === 0;
+    more.textContent = remaining ? `Load 20 more (${remaining} remaining)` : 'All loaded';
+  }
+}
+
+function renderSlrSchemaEditor() {
+  const wrap = document.getElementById('slr-schema-editor');
+  if (!wrap) return;
+  const rows = SLR_STATE.schemaDraft || [];
+  if (rows.length === 0) {
+    wrap.innerHTML = `<p class="hint">No fields yet. Click "+ Add field" to define what Lena should collect.</p>`;
+    return;
+  }
+  wrap.innerHTML = rows.map((f, i) => `
+    <div class="slr-schema-row">
+      <input data-i="${i}" data-k="name"        type="text" placeholder="field name (key, e.g. name)" value="${escapeHtml(f.name || '')}" />
+      <input data-i="${i}" data-k="label"       type="text" placeholder="Display label" dir="auto" value="${escapeHtml(f.label || '')}" />
+      <input data-i="${i}" data-k="description" type="text" placeholder="What is this? (for the agent)" dir="auto" value="${escapeHtml(f.description || '')}" />
+      <button class="btn secondary danger" data-i="${i}" data-act="del" title="Remove">✕</button>
+    </div>
+  `).join('');
+  wrap.querySelectorAll('input[data-k]').forEach((el) => el.addEventListener('input', onSlrSchemaInput));
+  wrap.querySelectorAll('button[data-act="del"]').forEach((el) => el.addEventListener('click', onSlrSchemaRemove));
+}
+
+function onSlrSchemaInput(e) {
+  const i = parseInt(e.target.dataset.i, 10);
+  const k = e.target.dataset.k;
+  if (!SLR_STATE.schemaDraft[i]) return;
+  SLR_STATE.schemaDraft[i][k] = e.target.value;
+}
+
+function onSlrSchemaRemove(e) {
+  const i = parseInt(e.currentTarget.dataset.i, 10);
+  SLR_STATE.schemaDraft.splice(i, 1);
+  renderSlrSchemaEditor();
+}
+
+function readSlrSchemaFromDom() {
+  // Reads the editor's current state and returns a clean list.
+  const out = [];
+  document.querySelectorAll('#slr-schema-editor .slr-schema-row').forEach((row) => {
+    const inputs = row.querySelectorAll('input[data-k]');
+    const f = {};
+    inputs.forEach((el) => { f[el.dataset.k] = el.value.trim(); });
+    if (f.name) {
+      out.push({ name: f.name, label: f.label || f.name, description: f.description || '' });
+    }
+  });
+  return out;
+}
+
+function renderSlrCollected() {
+  // Live table: columns = schema field names, rows = (active call ▸ then) historical calls
+  // with their `collected` map filled in.
+  const wrap = document.getElementById('slr-collected-table');
+  const cnt  = document.getElementById('slr-collected-count');
+  if (!wrap) return;
+  const fields = SLR_STATE.schemaDraft || [];
+  const allCalls = [
+    ...SLR_STATE.calls.map((c) => ({ ...c, _live: true })),
+    ...SLR_STATE.history,
+  ];
+  const callsWithData = allCalls.filter((c) => c.collected && Object.keys(c.collected).length > 0);
+  if (cnt) cnt.textContent = callsWithData.length;
+  if (fields.length === 0) {
+    wrap.innerHTML = `<p class="hint">Add at least one field in "Information to collect" to define the columns.</p>`;
+    return;
+  }
+  if (callsWithData.length === 0) {
+    wrap.innerHTML = `
+      <table class="slr-collected">
+        <thead><tr>
+          <th>When</th>
+          <th>Caller</th>
+          ${fields.map((f) => `<th dir="auto">${escapeHtml(f.label || f.name)}</th>`).join('')}
+        </tr></thead>
+        <tbody><tr><td colspan="${2 + fields.length}" class="hint">No information collected yet — the table fills as Lena gathers data from callers.</td></tr></tbody>
+      </table>`;
+    return;
+  }
+  wrap.innerHTML = `
+    <table class="slr-collected">
+      <thead><tr>
+        <th>When</th>
+        <th>Caller</th>
+        ${fields.map((f) => `<th dir="auto">${escapeHtml(f.label || f.name)}</th>`).join('')}
+      </tr></thead>
+      <tbody>
+        ${callsWithData.map((c) => {
+          const ts = c.started_at ? new Date(c.started_at * 1000).toLocaleString() : '';
+          const live = c._live ? ' <span class="rule-badge red" title="In progress">LIVE</span>' : '';
+          return `<tr${c._live ? ' class="live"' : ''}>
+            <td>${escapeHtml(ts)}${live}</td>
+            <td>${escapeHtml(c.peer || c.call_id || '')}</td>
+            ${fields.map((f) => `<td dir="auto">${escapeHtml((c.collected && c.collected[f.name]) || '')}</td>`).join('')}
+          </tr>`;
+        }).join('')}
+      </tbody>
+    </table>`;
+}
+
+function renderTurns(turns) {
+  if (!turns || turns.length === 0) {
+    return `<p class="hint" style="margin:4px 0">No transcript captured.</p>`;
+  }
+  return turns.map((t) => {
+    const cls = t.role === 'agent' ? 'agent' : 'you';
+    const label = t.role === 'agent' ? 'agent' : 'caller';
+    return `<div class="log-line ${cls}" dir="auto"><strong>${label}:</strong> ${escapeHtml(t.text || '')}</div>`;
+  }).join('');
+}
+
+function onSlrHistoryClick(e) {
+  const head = e.target.closest('.history-row-head');
+  if (!head) return;
+  const id = head.dataset.callId;
+  if (!id) return;
+  if (SLR_STATE.expanded.has(id)) SLR_STATE.expanded.delete(id);
+  else                            SLR_STATE.expanded.add(id);
+  renderSlrHistory();
+}
+
+async function loadMoreSlrHistory() {
+  try {
+    const data = await SipLiveRep.getHistory(SLR_STATE.historyOffset, 20);
+    SLR_STATE.history.push(...(data.items || []));
+    SLR_STATE.historyTotal = data.total;
+    SLR_STATE.historyOffset = SLR_STATE.history.length;
+    renderSlrHistory();
+  } catch (e) {
+    alert(`Failed to load more: ${e.message}`);
+  }
+}
+
+async function clearSlrHistory() {
+  if (!confirm('Permanently delete all Live Representative call history?')) return;
+  try {
+    await SipLiveRep.clearHistory();
+    SLR_STATE.history = [];
+    SLR_STATE.historyTotal = 0;
+    SLR_STATE.historyOffset = 0;
+    SLR_STATE.expanded.clear();
+    renderSlrHistory();
+  } catch (e) {
+    alert(`Clear failed: ${e.message}`);
+  }
 }
 
 window.addEventListener('hashchange', navigate);

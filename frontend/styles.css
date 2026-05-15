@@ -1589,8 +1589,12 @@ input:disabled, select:disabled, textarea:disabled {
   100% { transform: scale(1);   }
 }
 .rule-actions { display: flex; gap: 6px; flex-shrink: 0; }
-.btn.danger { color: var(--err); border-color: rgba(220, 53, 69, 0.35); }
-.btn.danger:hover { background: rgba(220, 53, 69, 0.08); }
+.btn.danger {
+  background: var(--err);
+  color: #fff;
+  border-color: var(--err);
+}
+.btn.danger:hover { filter: brightness(1.08); }
 
 .rule-row-detail {
   padding: 12px 14px 14px;
@@ -1829,6 +1833,54 @@ input:disabled, select:disabled, textarea:disabled {
 .sip-history-row.warn { border-left-color: var(--warn); }
 .sip-history-row.err  { border-left-color: var(--err); }
 .sip-history-arrow { font-size: 20px; color: var(--text-dim); text-align: center; }
+
+/* Live Representative — chevron rotates when its history row is expanded. */
+.history-row-head .rule-expand-arrow {
+  display: inline-block;
+  transition: transform 0.18s ease;
+}
+.history-row-head .rule-expand-arrow.open { transform: rotate(90deg); }
+.history-entry .history-row-head:hover strong { color: var(--accent-2); }
+
+/* Live Representative — info-schema editor + collected-info table. */
+.slr-schema-editor { display: flex; flex-direction: column; gap: 6px; }
+.slr-schema-row {
+  display: grid;
+  grid-template-columns: 1fr 1fr 1.5fr 36px;
+  gap: 6px;
+  align-items: center;
+}
+.slr-schema-row input {
+  padding: 6px 8px;
+  font-size: 13px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--surface);
+  color: var(--text);
+}
+.slr-schema-row .btn.danger { padding: 6px 0; font-size: 14px; }
+
+.slr-collected {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 13px;
+}
+.slr-collected th, .slr-collected td {
+  padding: 6px 8px;
+  text-align: left;
+  border-bottom: 1px solid var(--border);
+  vertical-align: top;
+}
+.slr-collected thead th {
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--text-dim);
+  background: var(--surface);
+  position: sticky; top: 0;
+}
+.slr-collected tr.live td { background: rgba(80, 160, 255, 0.05); }
+.slr-collected tr:hover td { background: rgba(255, 255, 255, 0.03); }
 .sip-history-peer { font-weight: 600; font-size: 14px; }
 .sip-history-meta { color: var(--text-dim); font-size: 12px; }
 

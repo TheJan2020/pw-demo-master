@@ -63,6 +63,75 @@ class State:
         self.sla_enable_ha_tools: bool = True
         self.sla_only_areas: bool = False
         self.sla_max_call_s: int = 600
+        # Frigate cameras the SIP Live Assistant pipes into Gemini Live as
+        # video frames during a call, so the agent can answer questions like
+        # "is anyone at the front door?".
+        self.sla_cameras: list[str] = []
+        # SIP Live Representative — separate Gemini-Live-backed AudioSocket
+        # service tailored to be Primewave's public-facing rep. Has its own
+        # extension/feature-code on FreePBX (default 8888 → port 8091),
+        # persistent call history, and no HA / camera capabilities by default.
+        self.slr_enabled: bool = False
+        self.slr_bind_host: str = "0.0.0.0"
+        self.slr_bind_port: int = 8091
+        self.slr_system_prompt: str = (
+            "أنتِ لينا، الممثلة الرسمية لخدمة العملاء في شركة برايم ويف "
+            "(Primewave). كلامك دايماً باللهجة اللبنانية، بأسلوب دافئ "
+            "وودود ومحترف، مثل أي ممثل خدمة عملاء محترف بشركة كبيرة.\n"
+            "\n"
+            "اشتغلي كأنّك إنسان حقيقي، استعملي لهجة عفوية، ومتزعزعيش "
+            "بالأسئلة. إذا الزبون سأل سؤال ما إلو علاقة بشغلنا، رجّعيه "
+            "بلطف للموضوع. إذا ما عرفتي إجابة على سؤال تقني محدد، "
+            "اعتذري بصدق وقولي إنّك بتحرصي يتواصل معه أحد المختصين "
+            "لاحقاً — متختلقيش معلومات.\n"
+            "\n"
+            "خلال المكالمة، حاولي بشكل طبيعي وغير مزعج تجمعي المعلومات "
+            "المطلوبة من المتصل (موجودة بالأسفل). كل ما تأكّدتي من معلومة "
+            "جديدة، استدعي وظيفة `save_caller_information` لتخزينها. "
+            "في إمكانك تستدعيها أكثر من مرة، كل ما يتأكد عندك شي جديد. "
+            "ما تتذكري كل المعلومات لآخر المكالمة — احفظيها على دفعات."
+        )
+        self.slr_voice: str = "Aoede"
+        self.slr_greeting: str = (
+            "أهلا فيك معنا، أنا لينا من شركة برايم ويف. كيف فيني ساعدك اليوم؟"
+        )
+        self.slr_max_call_s: int = 900
+        # Free-form description of Primewave's offerings — Lena uses it to
+        # answer questions about what we do, prices, capabilities, etc.
+        self.slr_knowledge: str = (
+            "## خدماتنا في البيت الذكي (Smart Home)\n"
+            "\n"
+            "### أ — الأجهزة والأنظمة\n"
+            "- تحكّم بجميع الأجهزة الكهربائية: إضاءة (Lighting)، تكييف "
+            "وتدفئة (HVAC).\n"
+            "- مستشعرات متنوعة: مستشعرات أبواب، مستشعرات جودة الهواء، "
+            "مستشعرات حرارة ورطوبة.\n"
+            "- أقفال أبواب ذكية (Door Locks)، إنتركوم (Intercom)، أنظمة "
+            "كاميرات مراقبة (CCTV).\n"
+            "- حلول شبكات كاملة: تمديد كابلات، خزانات (Cabinets)، تركيب "
+            "WiFi، نقاط وصول (Access Points) وما إلى ذلك.\n"
+            "\n"
+            "### ب — البروتوكولات اللي نشتغل فيها\n"
+            "- لاسلكية: Zigbee, Z-Wave, WiFi.\n"
+            "- سلكية: DALI, Modbus, BACnet, KNX.\n"
+            "\n"
+            "## نقاط بنحب نضوّي عليها\n"
+            "- في برايم ويف عنا حلول سلكية بأسعار تنافسية جداً ومش غالية. "
+            "صحيح إنّو KNX و DALI والأنظمة السلكية بشكل عام معروفين إنّن "
+            "غاليين، بس عنا حلول بأسعار معقولة وفي متناول الزبون. هاي "
+            "نقطة قوة بميّزنا عن غيرنا."
+        )
+        # Schema describing the information Lena tries to collect during a
+        # call. Each entry: {name, label, description}. The Gemini tool
+        # `save_caller_information` is built dynamically from this list so
+        # adding a new field needs no code change.
+        self.slr_info_schema: list[dict[str, str]] = [
+            {"name": "name",        "label": "الاسم",            "description": "اسم المتصل الثلاثي إن أمكن."},
+            {"name": "address",     "label": "العنوان",          "description": "عنوان المتصل أو الموقع المطلوب تركيب النظام فيه."},
+            {"name": "contact",     "label": "وسيلة التواصل",    "description": "رقم هاتف أو إيميل للتواصل لاحقاً."},
+            {"name": "preference",  "label": "الاهتمامات",       "description": "ما يهتم به المتصل في البيت الذكي: تحكم إضاءة، HVAC، إنتركوم، إلخ."},
+            {"name": "project_phase","label": "مرحلة المشروع",  "description": "مرحلة المشروع الحالية: تصميم، تنفيذ، تجديد، إلخ."},
+        ]
         self._load()
 
     def _load(self) -> None:
@@ -99,6 +168,25 @@ class State:
             self.sla_enable_ha_tools = bool(data.get("sla_enable_ha_tools", True))
             self.sla_only_areas     = bool(data.get("sla_only_areas"))
             self.sla_max_call_s     = int(data.get("sla_max_call_s") or 600)
+            cams = data.get("sla_cameras")
+            if isinstance(cams, list):
+                self.sla_cameras = [c for c in cams if isinstance(c, str)]
+            self.slr_enabled       = bool(data.get("slr_enabled"))
+            self.slr_bind_host     = data.get("slr_bind_host") or "0.0.0.0"
+            self.slr_bind_port     = int(data.get("slr_bind_port") or 8091)
+            self.slr_system_prompt = data.get("slr_system_prompt") or self.slr_system_prompt
+            self.slr_voice         = data.get("slr_voice") or "Aoede"
+            self.slr_greeting      = data.get("slr_greeting") if data.get("slr_greeting") is not None else self.slr_greeting
+            self.slr_max_call_s    = int(data.get("slr_max_call_s") or 900)
+            kb = data.get("slr_knowledge")
+            if isinstance(kb, str):
+                self.slr_knowledge = kb
+            schema = data.get("slr_info_schema")
+            if isinstance(schema, list):
+                self.slr_info_schema = [
+                    s for s in schema
+                    if isinstance(s, dict) and isinstance(s.get("name"), str) and s["name"].strip()
+                ]
         except Exception:
             pass
 
@@ -135,6 +223,16 @@ class State:
                         "sla_enable_ha_tools":  self.sla_enable_ha_tools,
                         "sla_only_areas":       self.sla_only_areas,
                         "sla_max_call_s":       self.sla_max_call_s,
+                        "sla_cameras":          self.sla_cameras,
+                        "slr_enabled":          self.slr_enabled,
+                        "slr_bind_host":        self.slr_bind_host,
+                        "slr_bind_port":        self.slr_bind_port,
+                        "slr_system_prompt":    self.slr_system_prompt,
+                        "slr_voice":            self.slr_voice,
+                        "slr_greeting":         self.slr_greeting,
+                        "slr_max_call_s":       self.slr_max_call_s,
+                        "slr_knowledge":        self.slr_knowledge,
+                        "slr_info_schema":      self.slr_info_schema,
                     },
                     indent=2,
                 )
