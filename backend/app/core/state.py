@@ -96,6 +96,11 @@ class State:
             "أهلا فيك معنا، أنا لينا من شركة برايم ويف. كيف فيني ساعدك اليوم؟"
         )
         self.slr_max_call_s: int = 900
+        # When true, the agent stops speaking the moment the caller starts
+        # (Gemini VAD with HIGH start-of-speech sensitivity, plus we drop the
+        # output audio queue). When false, the agent finishes its turn before
+        # listening.
+        self.slr_interruption_enabled: bool = True
         # Free-form description of Primewave's offerings — Lena uses it to
         # answer questions about what we do, prices, capabilities, etc.
         self.slr_knowledge: str = (
@@ -178,6 +183,8 @@ class State:
             self.slr_voice         = data.get("slr_voice") or "Aoede"
             self.slr_greeting      = data.get("slr_greeting") if data.get("slr_greeting") is not None else self.slr_greeting
             self.slr_max_call_s    = int(data.get("slr_max_call_s") or 900)
+            if "slr_interruption_enabled" in data:
+                self.slr_interruption_enabled = bool(data.get("slr_interruption_enabled"))
             kb = data.get("slr_knowledge")
             if isinstance(kb, str):
                 self.slr_knowledge = kb
@@ -231,6 +238,7 @@ class State:
                         "slr_voice":            self.slr_voice,
                         "slr_greeting":         self.slr_greeting,
                         "slr_max_call_s":       self.slr_max_call_s,
+                        "slr_interruption_enabled": self.slr_interruption_enabled,
                         "slr_knowledge":        self.slr_knowledge,
                         "slr_info_schema":      self.slr_info_schema,
                     },

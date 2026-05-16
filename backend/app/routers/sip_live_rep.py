@@ -20,27 +20,29 @@ router = APIRouter()
 
 
 class SlrConfigIn(BaseModel):
-    enabled:        Optional[bool] = None
-    bind_host:      Optional[str] = None
-    bind_port:      Optional[int] = None
-    system_prompt:  Optional[str] = None
-    voice:          Optional[str] = None
-    greeting:       Optional[str] = None
-    max_call_s:     Optional[int] = None
-    knowledge:      Optional[str] = None
-    info_schema:    Optional[list[dict]] = None
+    enabled:               Optional[bool] = None
+    bind_host:             Optional[str] = None
+    bind_port:             Optional[int] = None
+    system_prompt:         Optional[str] = None
+    voice:                 Optional[str] = None
+    greeting:              Optional[str] = None
+    max_call_s:            Optional[int] = None
+    knowledge:             Optional[str] = None
+    info_schema:           Optional[list[dict]] = None
+    interruption_enabled:  Optional[bool] = None
 
 
 class SlrConfigOut(BaseModel):
-    enabled:        bool
-    bind_host:      str
-    bind_port:      int
-    system_prompt:  str
-    voice:          str
-    greeting:       str
-    max_call_s:     int
-    knowledge:      str
-    info_schema:    list[dict]
+    enabled:               bool
+    bind_host:             str
+    bind_port:             int
+    system_prompt:         str
+    voice:                 str
+    greeting:              str
+    max_call_s:            int
+    knowledge:             str
+    info_schema:           list[dict]
+    interruption_enabled:  bool
 
 
 def _current() -> SlrConfigOut:
@@ -54,6 +56,7 @@ def _current() -> SlrConfigOut:
         max_call_s=int(state.slr_max_call_s or 0),
         knowledge=state.slr_knowledge or "",
         info_schema=list(state.slr_info_schema or []),
+        interruption_enabled=bool(state.slr_interruption_enabled),
     )
 
 
@@ -72,6 +75,8 @@ async def set_config(payload: SlrConfigIn) -> SlrConfigOut:
     if payload.greeting      is not None: state.slr_greeting      = payload.greeting or ""
     if payload.max_call_s    is not None: state.slr_max_call_s    = max(0, int(payload.max_call_s))
     if payload.knowledge     is not None: state.slr_knowledge     = payload.knowledge
+    if payload.interruption_enabled is not None:
+        state.slr_interruption_enabled = bool(payload.interruption_enabled)
     if payload.info_schema   is not None:
         cleaned = []
         for f in payload.info_schema:

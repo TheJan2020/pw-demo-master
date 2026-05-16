@@ -45,7 +45,12 @@ async def get_rule(rule_id: str) -> dict:
     r = engine.get_rule(rule_id)
     if not r:
         raise HTTPException(404, "rule not found")
-    return {"rule": r}
+    out = dict(r)
+    try:
+        out["scoring"] = engine.compute_rule_scoring(rule_id)
+    except Exception:
+        pass
+    return {"rule": out}
 
 
 @router.patch("/rules/{rule_id}")
@@ -99,12 +104,104 @@ async def rule_iterations(
     return {"items": rows, "total": total, "offset": offset, "limit": limit}
 
 
+@router.get("/rules/{rule_id}/incorrect")
+async def rule_incorrect(
+    rule_id: str,
+    offset: int = Query(0, ge=0),
+    limit: int = Query(20, ge=1, le=100),
+) -> dict:
+    """Paginated list of iterations the user has marked as incorrect.
+    Deduped across triggers / iterations storage; newest first."""
+    if not engine.get_rule(rule_id):
+        raise HTTPException(404, "rule not found")
+    rows, total = engine.list_incorrect(rule_id, offset, limit)
+    return {"items": rows, "total": total, "offset": offset, "limit": limit}
+
+
+@router.put("/rules/{rule_id}/iterations/{iteration_id}/score")
+async def score_iteration_standalone(rule_id: str, iteration_id: int,
+                                     payload: dict) -> dict:
+    """Set the review verdict on a standalone iteration (All Iterations tab).
+    The same score is mirrored into any triggered episode that contains this
+    iteration_id so the two views stay in sync."""
+    if not engine.get_rule(rule_id):
+        raise HTTPException(404, "rule not found")
+    score = payload.get("score") if isinstance(payload, dict) else None
+    if score not in (None, "correct", "incorrect"):
+        raise HTTPException(400, "score must be 'correct', 'incorrect', or null")
+    try:
+        scoring = engine.set_iteration_score(rule_id, iteration_id, score)
+    except KeyError:
+        raise HTTPException(404, "iteration not found")
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    return {"ok": True, "scoring": scoring}
+
+
+@router.post("/rules/{rule_id}/iterations/{iteration_id}/promote")
+async def promote_iteration(rule_id: str, iteration_id: int) -> dict:
+    """Convert a non-triggered iteration into a triggered episode
+    (false-negative correction). Increments the rule's trigger_count."""
+    if not engine.get_rule(rule_id):
+        raise HTTPException(404, "rule not found")
+    try:
+        result = engine.promote_iteration_to_triggered(rule_id, iteration_id)
+    except KeyError:
+        raise HTTPException(404, "iteration not found")
+    except ValueError as e:
+        raise HTTPException(409, str(e))
+    return {"ok": True, **result}
+
+
+@router.put("/rules/{rule_id}/triggers/{episode_id}/iterations/{iteration_id}/score")
+async def score_iteration(rule_id: str, episode_id: str, iteration_id: int,
+                          payload: dict) -> dict:
+    """Tag a triggered iteration as correct / incorrect, or clear with null.
+    Returns the rule-level scoring summary so the UI can refresh the badge."""
+    if not engine.get_rule(rule_id):
+        raise HTTPException(404, "rule not found")
+    score = payload.get("score") if isinstance(payload, dict) else None
+    if score not in (None, "correct", "incorrect"):
+        raise HTTPException(400, "score must be 'correct', 'incorrect', or null")
+    try:
+        scoring = engine.score_iteration_in_episode(rule_id, episode_id, iteration_id, score)
+    except FileNotFoundError:
+        raise HTTPException(404, "no triggers stored")
+    except KeyError:
+        raise HTTPException(404, "episode not found")
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    return {"ok": True, "scoring": scoring}
+
+
+@router.delete("/rules/{rule_id}/triggers/{episode_id}/iterations/{iteration_id}")
+async def untrigger_iteration(rule_id: str, episode_id: str, iteration_id: int) -> dict:
+    """Move a single iteration out of a triggered episode (false-positive
+    correction). If the episode has no iterations left, the episode row is
+    removed and the trigger count is decremented."""
+    if not engine.get_rule(rule_id):
+        raise HTTPException(404, "rule not found")
+    try:
+        result = engine.untrigger_iteration(rule_id, episode_id, iteration_id)
+    except FileNotFoundError:
+        raise HTTPException(404, "no triggers stored")
+    except KeyError:
+        raise HTTPException(404, "episode not found")
+    except ValueError:
+        raise HTTPException(404, "iteration not in episode")
+    try:
+        result["scoring"] = engine.compute_rule_scoring(rule_id)
+    except Exception:
+        pass
+    return result
+
+
 @router.delete("/rules/{rule_id}/history")
 async def clear_rule_history(rule_id: str) -> dict:
     if not engine.get_rule(rule_id):
         raise HTTPException(404, "rule not found")
     d = engine._rule_dir(rule_id)  # noqa: SLF001
-    for name in ("triggers.jsonl", "iterations.jsonl"):
+    for name in ("triggers.jsonl", "iterations.jsonl", "scores.json"):
         try:
             (d / name).unlink(missing_ok=True)
         except Exception:

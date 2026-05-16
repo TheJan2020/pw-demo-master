@@ -100,26 +100,45 @@ def clear_history() -> None:
 def _build_system_instruction() -> str:
     """Compose persona + knowledge base + info-collection prompt into one
     system instruction. Pulled fresh from state on every call so edits in
-    the UI take effect on the next call without restarting anything."""
+    the UI take effect on the next call without restarting anything.
+
+    Sections are labelled so persona text can reliably reference the
+    "information to collect" block (e.g. "see below") without ambiguity.
+    """
     parts: list[str] = []
-    parts.append((state.slr_system_prompt or "").strip())
+    persona = (state.slr_system_prompt or "").strip()
+    if persona:
+        parts.append("## PERSONA\n" + persona)
+
     kb = (state.slr_knowledge or "").strip()
     if kb:
-        parts.append("\n## معلومات عن شركتنا وخدماتنا (مرجع لكِ)\n" + kb)
+        parts.append("## KNOWLEDGE BASE — معلومات عن شركتنا وخدماتنا (مرجع لكِ)\n" + kb)
+
     schema = state.slr_info_schema or []
     if schema:
-        parts.append(
-            "\n## المعلومات المطلوب جمعها من المتصل\n"
-            "حاولي خلال الحديث، وبشكل طبيعي، تجمعي هذه المعلومات. "
-            "كل ما تأكدتي من واحدة، استدعي الوظيفة `save_caller_information` "
-            "وحطي القيمة بالحقل المناسب:\n"
-            + "\n".join(
-                f"- `{f.get('name','')}` ({f.get('label','')}): "
-                f"{f.get('description','')}"
-                for f in schema
-            )
+        fields_md = "\n".join(
+            f"- `{f.get('name','')}` ({f.get('label','')}): "
+            f"{f.get('description','')}"
+            for f in schema
         )
-    return "\n".join(parts).strip()
+        parts.append(
+            "## INFORMATION TO COLLECT — المعلومات المطلوب جمعها من المتصل\n"
+            "حاولي خلال الحديث، وبشكل طبيعي وغير مزعج، تجمعي هذه المعلومات:\n"
+            f"{fields_md}\n\n"
+            "### قاعدة إلزامية — لازم تنفذيها\n"
+            "كل ما تأكدتي من معلومة (حتى لو واحدة)، **استدعي فوراً الوظيفة "
+            "`save_caller_information`** وحطي القيمة بالحقل المناسب. "
+            "ممكن تستدعيها أكثر من مرة خلال نفس المكالمة، كل ما تتأكدي من "
+            "شي جديد. لا تنتظري آخر المكالمة. لا تخبّري المتصل أنك حافظة "
+            "المعلومات — احفظيها بصمت بالخلفية وكملي الحوار بشكل طبيعي.\n"
+            "Translation for the model: as soon as you confirm any field "
+            "above, you MUST call the `save_caller_information` function "
+            "tool with that field set. Call it multiple times throughout "
+            "the call, never wait until the end. Do not announce the save "
+            "to the caller — just call the tool silently while continuing "
+            "the conversation."
+        )
+    return "\n\n".join(parts).strip()
 
 
 def _build_collect_tool() -> Optional[types.Tool]:
@@ -258,8 +277,11 @@ class CallSession:
                     logger.warning("call %s: peer error: %r", self.call_id, payload)
                     continue
                 if msg_type == _AS_AUDIO and payload:
-                    # Drop while agent is speaking (half-duplex).
-                    if time.time() < self.echo_until:
+                    # Half-duplex echo gate — only active when interruption
+                    # is OFF. When interruption is ON we always forward caller
+                    # audio so Gemini's VAD can detect speech and signal
+                    # barge-in; the phone network already does echo cancel.
+                    if not state.slr_interruption_enabled and time.time() < self.echo_until:
                         continue
                     pcm16k, self._upstate = audioop.ratecv(
                         payload, _SAMPLE_WIDTH, 1, 8000, 16000, self._upstate,
@@ -325,6 +347,19 @@ class CallSession:
             input_audio_transcription=types.AudioTranscriptionConfig(),
             output_audio_transcription=types.AudioTranscriptionConfig(),
             tools=[collect_tool] if collect_tool else None,
+            # Barge-in: with interruption ON we use HIGH start-of-speech
+            # sensitivity so the agent cuts itself off the instant the caller
+            # speaks. With interruption OFF we disable VAD altogether so the
+            # agent finishes its turn before listening.
+            realtime_input_config=types.RealtimeInputConfig(
+                automatic_activity_detection=types.AutomaticActivityDetection(
+                    disabled=not bool(state.slr_interruption_enabled),
+                    start_of_speech_sensitivity=types.StartSensitivity.START_SENSITIVITY_HIGH,
+                    end_of_speech_sensitivity=types.EndSensitivity.END_SENSITIVITY_HIGH,
+                    silence_duration_ms=600,
+                    prefix_padding_ms=200,
+                ),
+            ),
         )
 
         try:
@@ -376,6 +411,11 @@ class CallSession:
                                             drained += 1
                                         except Exception:
                                             break
+                                    # Also drop the resample leftover and
+                                    # collapse the echo gate so the caller's
+                                    # next syllable isn't gated out.
+                                    self._out_leftover = b""
+                                    self.echo_until = 0.0
                                     if drained:
                                         logger.info("call %s: interrupted — flushed %d queued frames",
                                                     self.call_id, drained)

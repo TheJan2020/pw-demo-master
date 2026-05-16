@@ -2647,9 +2647,15 @@ function renderRuleRow(rule) {
             <div class="rule-count-num rule-count-iter" data-rule-id="${escapeHtml(rule.id)}">${rule.iteration_count || 0}</div>
             <div class="rule-count-lbl">total iterations</div>
           </div>
+          <div class="rule-count rule-accuracy" data-rule-id="${escapeHtml(rule.id)}"
+               title="Accuracy from manually scored triggered iterations.">
+            ${renderRuleAccuracy(rule.scoring)}
+          </div>
         </div>
         <div class="rule-actions">
           <button class="btn secondary" data-rule-action="edit" data-rule-id="${escapeHtml(rule.id)}">Edit</button>
+          <button class="btn secondary" data-rule-action="show-incorrect" data-rule-id="${escapeHtml(rule.id)}"
+                  title="Show every iteration you've marked as incorrect">Show Incorrect</button>
           <button class="btn secondary danger" data-rule-action="delete" data-rule-id="${escapeHtml(rule.id)}">Delete</button>
         </div>
         <button class="rule-expand" data-rule-action="expand" data-rule-id="${escapeHtml(rule.id)}"
@@ -2697,6 +2703,25 @@ function modelSummary(selector) {
   return s;
 }
 
+function renderRuleAccuracy(scoring) {
+  const s = scoring || { total: 0, scored: 0, unscored: 0, correct: 0, incorrect: 0, accuracy_pct: null };
+  const total    = s.total    || 0;
+  const scored   = s.scored   || 0;
+  const unscored = (s.unscored != null) ? s.unscored : Math.max(0, total - scored);
+  const acc      = s.accuracy_pct;
+  const numHtml  = acc == null
+    ? `<span class="rule-acc-na">—</span>`
+    : `${acc}%`;
+  const subHtml  = scored === 0
+    ? `${unscored} unscored`
+    : `${s.correct || 0}/${scored} correct · ${unscored} unscored`;
+  return `
+    <div class="rule-count-num rule-count-acc">${numHtml}</div>
+    <div class="rule-count-lbl">accuracy</div>
+    <div class="rule-acc-sub">${escapeHtml(subHtml)}</div>
+  `;
+}
+
 function scanSummary(scan) {
   if (!scan) return 'no scan';
   const m = scan.mode || 'periodic';
@@ -2717,6 +2742,7 @@ function onRuleAction(e) {
   else if (action === 'edit') openRuleEditor(rule);
   else if (action === 'delete') confirmDeleteRule(rule);
   else if (action === 'clear-history') clearHistory(rule);
+  else if (action === 'show-incorrect') openIncorrectModal(rule);
 }
 
 async function toggleExpanded(rule) {
@@ -2814,6 +2840,169 @@ function renderHistory(rule, kind) {
   wrap.innerHTML = `<div class="history-list">${rows}</div><div style="margin-top:10px;text-align:center">${more}</div>`;
   const btn = document.getElementById(`history-more-${rule.id}-${kind}`);
   if (btn) btn.addEventListener('click', () => loadHistoryPage(rule, kind));
+  wrap.querySelectorAll('.ep-untrigger-btn').forEach((b) => {
+    b.addEventListener('click', (e) => onUntriggerClick(e, rule, kind));
+  });
+  wrap.querySelectorAll('.ep-score-btn').forEach((b) => {
+    b.addEventListener('click', (e) => onScoreClick(e, rule, kind));
+  });
+  wrap.querySelectorAll('.iter-promote-btn').forEach((b) => {
+    b.addEventListener('click', (e) => onPromoteClick(e, rule, kind));
+  });
+}
+
+async function onPromoteClick(e, rule, kind) {
+  const btn = e.currentTarget;
+  const iterationId = parseInt(btn.dataset.iterationId, 10);
+  if (!Number.isFinite(iterationId)) return;
+  if (!confirm(`Mark iteration #${iterationId} as triggered? A new triggered episode will be created from it.`)) return;
+  btn.disabled = true;
+  btn.textContent = 'Promoting…';
+  try {
+    const r = await fetch(
+      `/api/ai-camera/rules/${encodeURIComponent(rule.id)}/iterations/${iterationId}/promote`,
+      { method: 'POST' },
+    );
+    if (!r.ok) {
+      let msg = `http ${r.status}`;
+      try { const err = await r.json(); if (err.detail) msg = err.detail; } catch {}
+      throw new Error(msg);
+    }
+    const data = await r.json();
+    // Patch the cached iteration so it now shows as triggered (and the button hides on re-render).
+    const pag = RULES_STATE.pagination[rule.id]?.[kind];
+    if (pag && Array.isArray(pag.items)) {
+      const row = pag.items.find((it) => Number(it.iteration_id) === iterationId);
+      if (row) row.triggered = true;
+    }
+    rule.trigger_count = (rule.trigger_count || 0) + 1;
+    if (data.scoring) {
+      rule.scoring = data.scoring;
+      const accBox = document.querySelector(`.rule-accuracy[data-rule-id="${CSS.escape(rule.id)}"]`);
+      if (accBox) accBox.innerHTML = renderRuleAccuracy(data.scoring);
+    }
+    renderHistory(rule, kind);
+  } catch (err) {
+    alert(`Failed to promote: ${err.message}`);
+    btn.disabled = false;
+    btn.textContent = 'Mark as triggered';
+  }
+}
+
+async function onScoreClick(e, rule, kind) {
+  const btn = e.currentTarget;
+  const episodeId   = btn.dataset.episodeId || null;    // present for in-episode rows
+  const iterationId = parseInt(btn.dataset.iterationId, 10);
+  const clicked     = btn.dataset.score;                // "correct" | "incorrect"
+  if (!Number.isFinite(iterationId)) return;
+
+  const wasActive = btn.classList.contains('active');
+  const nextScore = wasActive ? null : clicked;
+
+  const group = btn.closest('.ep-score-group');
+  const allBtns = group ? group.querySelectorAll('.ep-score-btn') : [btn];
+  allBtns.forEach((b) => b.disabled = true);
+
+  // Endpoint differs for in-episode vs standalone iterations, but both
+  // accept the same body shape and return the same scoring summary.
+  const url = episodeId
+    ? `/api/ai-camera/rules/${encodeURIComponent(rule.id)}`
+      + `/triggers/${encodeURIComponent(episodeId)}`
+      + `/iterations/${iterationId}/score`
+    : `/api/ai-camera/rules/${encodeURIComponent(rule.id)}`
+      + `/iterations/${iterationId}/score`;
+
+  try {
+    const r = await fetch(url, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ score: nextScore }),
+    });
+    if (!r.ok) throw new Error(`http ${r.status}`);
+    const data = await r.json();
+
+    // Patch the local cache so a re-render shows the new score. The score is
+    // mirrored across both files server-side; in the UI we only need to
+    // update whichever list this row belongs to.
+    const pag = RULES_STATE.pagination[rule.id]?.[kind];
+    if (pag && Array.isArray(pag.items)) {
+      if (episodeId) {
+        const ep = pag.items.find((it) => it.episode_id === episodeId);
+        const seqIt = ep && Array.isArray(ep.sequence)
+          ? ep.sequence.find((s) => Number(s.iteration_id) === iterationId) : null;
+        if (seqIt) {
+          if (nextScore == null) delete seqIt.score;
+          else seqIt.score = nextScore;
+        }
+      } else {
+        const row = pag.items.find((it) => Number(it.iteration_id) === iterationId);
+        if (row) {
+          if (nextScore == null) delete row.score;
+          else row.score = nextScore;
+        }
+      }
+    }
+
+    allBtns.forEach((b) => b.classList.toggle('active', b.dataset.score === nextScore));
+
+    if (data.scoring) {
+      rule.scoring = data.scoring;
+      const accBox = document.querySelector(`.rule-accuracy[data-rule-id="${CSS.escape(rule.id)}"]`);
+      if (accBox) accBox.innerHTML = renderRuleAccuracy(data.scoring);
+    }
+  } catch (err) {
+    alert(`Failed to set score: ${err.message}`);
+  } finally {
+    allBtns.forEach((b) => b.disabled = false);
+  }
+}
+
+async function onUntriggerClick(e, rule, kind) {
+  const btn = e.currentTarget;
+  const episodeId   = btn.dataset.episodeId;
+  const iterationId = parseInt(btn.dataset.iterationId, 10);
+  if (!episodeId || !Number.isFinite(iterationId)) return;
+  if (!confirm(`Mark iteration #${iterationId} as non-triggered? It will be removed from the triggered list.`)) return;
+  btn.disabled = true;
+  btn.textContent = 'Removing…';
+  try {
+    const r = await fetch(
+      `/api/ai-camera/rules/${encodeURIComponent(rule.id)}`
+      + `/triggers/${encodeURIComponent(episodeId)}`
+      + `/iterations/${iterationId}`,
+      { method: 'DELETE' },
+    );
+    if (!r.ok) throw new Error(`http ${r.status}`);
+    const result = await r.json();
+    // Patch the local cache to mirror the backend.
+    const pag = RULES_STATE.pagination[rule.id]?.[kind];
+    if (pag && Array.isArray(pag.items)) {
+      const epIdx = pag.items.findIndex((it) => it.episode_id === episodeId);
+      if (epIdx >= 0) {
+        if (result.episode_removed) {
+          pag.items.splice(epIdx, 1);
+          pag.total = Math.max(0, (pag.total || 0) - 1);
+        } else if (result.episode) {
+          pag.items[epIdx] = result.episode;
+        }
+      }
+    }
+    // Decrement the rule's on-card trigger count when the episode itself was removed.
+    if (result.episode_removed) {
+      rule.trigger_count = Math.max(0, (rule.trigger_count || 0) - 1);
+    }
+    // Removing an iteration changes accuracy denominators — refresh the badge.
+    if (result.scoring) {
+      rule.scoring = result.scoring;
+      const accBox = document.querySelector(`.rule-accuracy[data-rule-id="${CSS.escape(rule.id)}"]`);
+      if (accBox) accBox.innerHTML = renderRuleAccuracy(result.scoring);
+    }
+    renderHistory(rule, kind);
+  } catch (err) {
+    alert(`Failed to mark non-triggered: ${err.message}`);
+    btn.disabled = false;
+    btn.textContent = 'Mark as non-triggered';
+  }
 }
 
 function historyEntryHtml(rule, it) {
@@ -2822,13 +3011,37 @@ function historyEntryHtml(rule, it) {
     return episodeEntryHtml(rule, it);
   }
 
-  const ts = it.ts ? new Date(it.ts * 1000).toLocaleString() : '';
+  const ts = formatDateTime(it.ts);
   const cams = it.snap_cams && it.snap_cams.length ? it.snap_cams : (it.cameras || []);
   const reason = it.verdict_reason || (it.parsed && it.parsed.reason) || '';
   const triggered = !!it.triggered;
   const cls = triggered ? 'triggered' : 'not-triggered';
   const bbox = isValidBbox(it.bbox) ? it.bbox : (it.parsed && isValidBbox(it.parsed.bbox) ? it.parsed.bbox : null);
   const thumbs = cams.map((c) => renderThumbsForCamera(rule, it.iteration_id, c, bbox)).join('');
+  const score = it.score || null;
+  const actionsRow = `
+    <div class="ep-iter-actions iter-actions-row">
+      <div class="ep-score-group" role="group" aria-label="Score iteration">
+        <button class="ep-score-btn ep-score-correct ${score === 'correct' ? 'active' : ''}"
+                data-rule-id="${escapeHtml(rule.id)}"
+                data-iteration-id="${it.iteration_id}"
+                data-score="correct"
+                title="Mark as correct. Click again to clear.">✓ Correct</button>
+        <button class="ep-score-btn ep-score-incorrect ${score === 'incorrect' ? 'active' : ''}"
+                data-rule-id="${escapeHtml(rule.id)}"
+                data-iteration-id="${it.iteration_id}"
+                data-score="incorrect"
+                title="Mark as incorrect. Click again to clear.">✗ Incorrect</button>
+      </div>
+      ${triggered ? '' : `
+        <button class="btn secondary iter-promote-btn"
+                data-rule-id="${escapeHtml(rule.id)}"
+                data-iteration-id="${it.iteration_id}"
+                title="Promote this iteration into the triggered list (false-negative correction)">
+          Mark as triggered
+        </button>`}
+    </div>
+  `;
   return `
     <div class="history-entry ${cls}">
       <div class="history-meta">
@@ -2838,15 +3051,22 @@ function historyEntryHtml(rule, it) {
         <span class="hint" style="margin-left:auto">${ts}</span>
       </div>
       ${reason ? `<div class="history-reason">${escapeHtml(reason)}</div>` : ''}
+      ${actionsRow}
       ${thumbs ? `<div class="history-thumbs">${thumbs}</div>` : ''}
     </div>
   `;
 }
 
 function episodeEntryHtml(rule, ep) {
-  const tsStart = ep.started_ts ? new Date(ep.started_ts * 1000).toLocaleTimeString() : '';
-  const tsLast  = ep.last_ts    ? new Date(ep.last_ts * 1000).toLocaleTimeString()
-                 : (ep.fired_ts ? new Date(ep.fired_ts * 1000).toLocaleTimeString() : tsStart);
+  const tsStart = formatDateTime(ep.started_ts);
+  const formatTime = (epochSeconds) => {
+    if (!epochSeconds) return '';
+    const d = new Date(epochSeconds * 1000);
+    const pad = (n) => String(n).padStart(2, '0');
+    return `${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
+  };
+  const tsLast  = ep.last_ts ? formatTime(ep.last_ts)
+                 : (ep.fired_ts ? formatTime(ep.fired_ts) : tsStart);
   const reason  = ep.verdict_reason || '';
   const count   = ep.sequence.length;
   const durMs   = (ep.last_ts || ep.fired_ts || ep.started_ts || 0) - (ep.started_ts || 0);
@@ -2856,13 +3076,41 @@ function episodeEntryHtml(rule, ep) {
     const cams = seqIt.snap_cams && seqIt.snap_cams.length ? seqIt.snap_cams : (seqIt.cameras || []);
     const bbox = isValidBbox(seqIt.bbox) ? seqIt.bbox : null;
     const thumbs = cams.map((c) => renderThumbsForCamera(rule, seqIt.iteration_id, c, bbox)).join('');
-    const tsIt = seqIt.ts ? new Date(seqIt.ts * 1000).toLocaleTimeString() : '';
+    const tsIt = formatTime(seqIt.ts);
+    const score = seqIt.score || null;
     return `
       <div class="ep-iter">
         <div class="ep-iter-meta">
           <strong>#${seqIt.iteration_id}</strong>
           <span class="hint">${escapeHtml(tsIt)}</span>
           ${seqIt.verdict_reason ? `<span class="hint">— ${escapeHtml(seqIt.verdict_reason)}</span>` : ''}
+          <div class="ep-iter-actions">
+            <div class="ep-score-group" role="group" aria-label="Score iteration">
+              <button class="ep-score-btn ep-score-correct ${score === 'correct' ? 'active' : ''}"
+                      data-rule-id="${escapeHtml(rule.id)}"
+                      data-episode-id="${escapeHtml(ep.episode_id || '')}"
+                      data-iteration-id="${seqIt.iteration_id}"
+                      data-score="correct"
+                      title="Mark as correct (true positive). Click again to clear.">
+                ✓ Correct
+              </button>
+              <button class="ep-score-btn ep-score-incorrect ${score === 'incorrect' ? 'active' : ''}"
+                      data-rule-id="${escapeHtml(rule.id)}"
+                      data-episode-id="${escapeHtml(ep.episode_id || '')}"
+                      data-iteration-id="${seqIt.iteration_id}"
+                      data-score="incorrect"
+                      title="Mark as incorrect (false positive). Click again to clear.">
+                ✗ Incorrect
+              </button>
+            </div>
+            <button class="btn secondary ep-untrigger-btn"
+                    data-rule-id="${escapeHtml(rule.id)}"
+                    data-episode-id="${escapeHtml(ep.episode_id || '')}"
+                    data-iteration-id="${seqIt.iteration_id}"
+                    title="Move this iteration out of the triggered list (false-positive correction)">
+              Mark as non-triggered
+            </button>
+          </div>
         </div>
         ${thumbs ? `<div class="history-thumbs">${thumbs}</div>` : ''}
       </div>
@@ -3086,6 +3334,183 @@ async function confirmDeleteRule(rule) {
     renderRulesList();
   } catch (err) {
     alert(`Delete failed: ${err.message}`);
+  }
+}
+
+// ----- Show Incorrect modal (lazy paginated) ------------------------------
+
+// Per-modal state — re-initialized every open. Held on a module-level var so
+// the IntersectionObserver callback and "Clear score" handler can both reach it.
+let _incorrectModal = null;
+
+function openIncorrectModal(rule) {
+  _incorrectModal = {
+    rule,
+    items: [],
+    offset: 0,
+    total: 0,
+    loading: false,
+    done: false,
+    observer: null,
+  };
+  showModal({
+    title: `Incorrect iterations — ${rule.name || rule.id}`,
+    sub: 'Iterations you marked as incorrect, newest first. Scroll to load more.',
+    bodyHtml: `
+      <div class="incorrect-modal">
+        <div id="incorrect-list" class="incorrect-list">
+          <p class="hint" style="text-align:center;padding:20px 0">Loading…</p>
+          <div id="incorrect-sentinel" class="incorrect-sentinel"></div>
+        </div>
+        <div id="incorrect-footer" class="incorrect-footer hint"></div>
+      </div>
+    `,
+    onClose: () => {
+      if (_incorrectModal?.observer) {
+        try { _incorrectModal.observer.disconnect(); } catch {}
+      }
+      _incorrectModal = null;
+    },
+  });
+  // Defer to next tick so the modal body is in the DOM.
+  setTimeout(() => {
+    loadIncorrectPage().then(() => attachIncorrectObserver());
+  }, 0);
+}
+
+async function loadIncorrectPage() {
+  const m = _incorrectModal;
+  if (!m || m.loading || m.done) return;
+  m.loading = true;
+  try {
+    const r = await fetch(
+      `/api/ai-camera/rules/${encodeURIComponent(m.rule.id)}/incorrect`
+      + `?offset=${m.offset}&limit=20`,
+    );
+    if (!r.ok) throw new Error(`http ${r.status}`);
+    const data = await r.json();
+    m.total = data.total || 0;
+    m.items.push(...(data.items || []));
+    m.offset = m.items.length;
+    if (m.items.length >= m.total) m.done = true;
+    renderIncorrectList();
+  } catch (err) {
+    const list = document.getElementById('incorrect-list');
+    if (list) list.innerHTML = `<p class="hint" style="color:var(--err);text-align:center">Failed to load: ${escapeHtml(err.message)}</p>`;
+  } finally {
+    m.loading = false;
+  }
+}
+
+function renderIncorrectList() {
+  const m = _incorrectModal;
+  if (!m) return;
+  const list = document.getElementById('incorrect-list');
+  const footer = document.getElementById('incorrect-footer');
+  if (!list || !footer) return;
+
+  // Preserve the sentinel through innerHTML replacement — it's the anchor
+  // the IntersectionObserver is watching.
+  const rowsHtml = m.items.length
+    ? m.items.map((it) => incorrectRowHtml(m.rule, it)).join('')
+    : `<p class="hint" style="text-align:center;padding:20px 0">No iterations marked as incorrect.</p>`;
+  list.innerHTML = rowsHtml + `<div id="incorrect-sentinel" class="incorrect-sentinel"></div>`;
+  footer.textContent = !m.items.length
+    ? ''
+    : (m.done
+        ? `Showing all ${m.total} incorrect iteration${m.total === 1 ? '' : 's'}.`
+        : `Showing ${m.items.length} of ${m.total}. Scroll for more…`);
+  // Rewire per-row "Clear score" actions.
+  list.querySelectorAll('[data-incorrect-action="clear"]').forEach((b) => {
+    b.addEventListener('click', onIncorrectClearScore);
+  });
+  // Re-observe the freshly rendered sentinel.
+  if (m.observer) {
+    try { m.observer.disconnect(); } catch {}
+    const sentinel = document.getElementById('incorrect-sentinel');
+    if (sentinel) m.observer.observe(sentinel);
+  }
+}
+
+function incorrectRowHtml(rule, it) {
+  const ts   = formatDateTime(it.ts);
+  const cams = it.snap_cams && it.snap_cams.length ? it.snap_cams : (it.cameras || []);
+  const bbox = isValidBbox(it.bbox) ? it.bbox : null;
+  const thumbs = cams.map((c) => renderThumbsForCamera(rule, it.iteration_id, c, bbox)).join('');
+  const sourceLabel = it.source === 'trigger' ? 'from triggered' : 'from iterations';
+  return `
+    <div class="history-entry triggered incorrect-row">
+      <div class="history-meta">
+        <strong>#${it.iteration_id}</strong>
+        <span class="rule-badge red">INCORRECT</span>
+        <span class="rule-badge muted">${escapeHtml(sourceLabel)}</span>
+        <span class="hint">${escapeHtml(it.trigger_reason || '')}</span>
+        <span class="hint" style="margin-left:auto">${ts}</span>
+      </div>
+      ${it.verdict_reason ? `<div class="history-reason">${escapeHtml(it.verdict_reason)}</div>` : ''}
+      <div class="ep-iter-actions iter-actions-row">
+        <button class="btn secondary"
+                data-incorrect-action="clear"
+                data-iteration-id="${it.iteration_id}"
+                title="Remove the 'incorrect' score from this iteration">
+          Clear score
+        </button>
+      </div>
+      ${thumbs ? `<div class="history-thumbs">${thumbs}</div>` : ''}
+    </div>
+  `;
+}
+
+function attachIncorrectObserver() {
+  const m = _incorrectModal;
+  if (!m) return;
+  const root     = document.getElementById('incorrect-list');
+  const sentinel = document.getElementById('incorrect-sentinel');
+  if (!root || !sentinel) return;
+  m.observer = new IntersectionObserver((entries) => {
+    for (const e of entries) {
+      if (e.isIntersecting && !m.loading && !m.done) {
+        loadIncorrectPage();
+      }
+    }
+  }, { root, rootMargin: '300px 0px' });
+  m.observer.observe(sentinel);
+}
+
+async function onIncorrectClearScore(e) {
+  const m = _incorrectModal;
+  if (!m) return;
+  const btn = e.currentTarget;
+  const iterationId = parseInt(btn.dataset.iterationId, 10);
+  if (!Number.isFinite(iterationId)) return;
+  btn.disabled = true;
+  btn.textContent = 'Clearing…';
+  try {
+    const r = await fetch(
+      `/api/ai-camera/rules/${encodeURIComponent(m.rule.id)}/iterations/${iterationId}/score`,
+      {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ score: null }),
+      },
+    );
+    if (!r.ok) throw new Error(`http ${r.status}`);
+    const data = await r.json();
+    // Drop the row locally so the user sees instant feedback.
+    m.items = m.items.filter((it) => Number(it.iteration_id) !== iterationId);
+    m.total = Math.max(0, m.total - 1);
+    if (m.items.length >= m.total) m.done = true;
+    renderIncorrectList();
+    // Update the rule card's accuracy badge while we're here.
+    if (data.scoring) {
+      m.rule.scoring = data.scoring;
+      const accBox = document.querySelector(`.rule-accuracy[data-rule-id="${CSS.escape(m.rule.id)}"]`);
+      if (accBox) accBox.innerHTML = renderRuleAccuracy(data.scoring);
+    }
+  } catch (err) {
+    alert(`Clear failed: ${err.message}`);
+    btn.disabled = false;
+    btn.textContent = 'Clear score';
   }
 }
 
@@ -5177,6 +5602,15 @@ function escapeHtml(s) {
   }[c]));
 }
 
+// DD/MM/YYYY, HH:MM:SS — used everywhere the app shows a stored timestamp.
+function formatDateTime(epochSeconds) {
+  if (!epochSeconds) return '';
+  const d = new Date(epochSeconds * 1000);
+  const pad = (n) => String(n).padStart(2, '0');
+  return `${pad(d.getDate())}/${pad(d.getMonth() + 1)}/${d.getFullYear()}, `
+       + `${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
+}
+
 function capitalize(s) {
   if (!s) return '';
   return s.charAt(0).toUpperCase() + s.slice(1);
@@ -5310,103 +5744,103 @@ async function renderSipLiveRep(root) {
         <p>Add your key in <a href="#/settings">Settings → Gemini Live Agent</a> first.</p>
       </div>` : ''}
 
-    <div class="split">
-      <div class="card" style="margin:0">
-        <h2>Settings</h2>
-
-        <label class="checkbox-row" style="margin-bottom:12px">
+    <!-- Service strip — compact operational controls. -->
+    <div class="card slr-service-strip">
+      <div class="slr-service-row">
+        <label class="checkbox-row" style="margin:0">
           <input type="checkbox" id="slr-enabled" ${cfg.enabled ? 'checked' : ''} />
-          <span><strong>Enable service</strong> — start the AudioSocket listener so FreePBX can route calls here.</span>
+          <span><strong>Enable</strong></span>
         </label>
-
-        <div style="display:grid;grid-template-columns:1fr 140px;gap:10px">
-          <label class="field" style="margin:0">
-            <span class="lbl">Bind host</span>
-            <input id="slr-host" type="text" value="${escapeHtml(cfg.bind_host)}" placeholder="0.0.0.0" />
-          </label>
-          <label class="field" style="margin:0">
-            <span class="lbl">Port</span>
-            <input id="slr-port" type="number" min="1" max="65535" value="${cfg.bind_port}" />
-          </label>
-        </div>
-
-        <label class="field">
-          <span class="lbl">Persona / system prompt <span class="hint">— who Lena is and how she speaks (Lebanese dialect by default)</span></span>
-          <textarea id="slr-prompt" rows="8" dir="auto">${escapeHtml(cfg.system_prompt)}</textarea>
+        <label class="checkbox-row" style="margin:0"
+               title="When on, the agent stops speaking the moment the caller starts. When off, the agent finishes its sentence before listening.">
+          <input type="checkbox" id="slr-interruption" ${cfg.interruption_enabled ? 'checked' : ''} />
+          <span><strong>Allow interruption</strong></span>
         </label>
-
-        <label class="field">
-          <span class="lbl">Knowledge base <span class="hint">— what Lena knows about our company / products. The agent reads this as reference.</span></span>
-          <textarea id="slr-knowledge" rows="10" dir="auto">${escapeHtml(cfg.knowledge || '')}</textarea>
+        <label class="field" style="margin:0">
+          <span class="lbl">Bind host</span>
+          <input id="slr-host" type="text" value="${escapeHtml(cfg.bind_host)}" placeholder="0.0.0.0" />
         </label>
-
-        <label class="field">
-          <span class="lbl">Information to collect <span class="hint">— Lena will try to gather these during the call. Add/remove fields freely; they become live columns in the table below.</span></span>
-          <div id="slr-schema-editor" class="slr-schema-editor"></div>
-          <button class="btn secondary" id="slr-schema-add" style="margin-top:6px">+ Add field</button>
+        <label class="field" style="margin:0">
+          <span class="lbl">Port</span>
+          <input id="slr-port" type="number" min="1" max="65535" value="${cfg.bind_port}" />
         </label>
-
-        <label class="field">
+        <label class="field" style="margin:0">
+          <span class="lbl">Voice</span>
+          <select id="slr-voice">
+            ${['Aoede','Puck','Charon','Kore','Fenrir'].map((v) =>
+              `<option value="${v}" ${cfg.voice === v ? 'selected' : ''}>${v}</option>`).join('')}
+          </select>
+        </label>
+        <label class="field" style="margin:0">
+          <span class="lbl">Max call (s)</span>
+          <input id="slr-max" type="number" min="0" value="${cfg.max_call_s}" />
+        </label>
+        <label class="field" style="margin:0;flex:1;min-width:220px">
           <span class="lbl">Greeting</span>
           <input id="slr-greeting" type="text" dir="auto" value="${escapeHtml(cfg.greeting)}" />
-          <span class="hint" style="margin-top:6px;display:block">Spoken the moment a call connects.</span>
         </label>
-
-        <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px">
-          <label class="field" style="margin:0">
-            <span class="lbl">Voice</span>
-            <select id="slr-voice">
-              ${['Aoede','Puck','Charon','Kore','Fenrir'].map((v) =>
-                `<option value="${v}" ${cfg.voice === v ? 'selected' : ''}>${v}</option>`).join('')}
-            </select>
-          </label>
-          <label class="field" style="margin:0">
-            <span class="lbl">Max call duration (seconds)</span>
-            <input id="slr-max" type="number" min="0" value="${cfg.max_call_s}" />
-          </label>
-        </div>
-
-        <div class="btn-row" style="margin-top:14px">
-          <button class="btn" id="slr-save">Save &amp; apply</button>
-        </div>
-        <div class="feedback" id="slr-feedback"></div>
-
-        <div class="status-pill" style="margin-top:12px">
+        <button class="btn" id="slr-save">Save &amp; apply</button>
+      </div>
+      <div class="slr-service-row" style="margin-top:8px;align-items:center">
+        <div class="status-pill" style="margin:0">
           <span class="status-dot" id="slr-dot"></span>
           <span class="status-label">Service:</span>
           <span class="status-text" id="slr-status-text">checking…</span>
         </div>
+        <div class="feedback" id="slr-feedback" style="margin-left:auto"></div>
+      </div>
+    </div>
+
+    <!-- Monitoring row — active calls + collected info side-by-side. -->
+    <div class="slr-monitor-grid">
+      <div class="card" style="margin:0">
+        <div class="events-meta">
+          <h2 style="margin:0">Active calls</h2>
+          <span class="count" id="slr-active-count">0</span>
+        </div>
+        <div id="slr-active-list"><p class="hint">No active calls.</p></div>
       </div>
 
-      <div style="display:flex;flex-direction:column;gap:14px">
-        <div class="card" style="margin:0">
-          <div class="events-meta">
-            <h2 style="margin:0">Active calls</h2>
-            <span class="count" id="slr-active-count">0</span>
-          </div>
-          <div id="slr-active-list"><p class="hint">No active calls.</p></div>
+      <div class="card" style="margin:0">
+        <div class="events-meta">
+          <h2 style="margin:0">Collected information</h2>
+          <span class="count" id="slr-collected-count">0</span>
         </div>
+        <div id="slr-collected-table"><p class="hint">No information collected yet.</p></div>
 
-        <div class="card" style="margin:0">
-          <div class="events-meta">
-            <h2 style="margin:0">Collected information</h2>
-            <span class="count" id="slr-collected-count">0</span>
-          </div>
-          <div id="slr-collected-table"><p class="hint">No information collected yet.</p></div>
-          <p class="hint" style="margin-top:6px">Columns are generated live from the "Information to collect" schema on the left.</p>
-        </div>
+        <details class="slr-schema-details" style="margin-top:10px">
+          <summary>Edit "information to collect" schema</summary>
+          <p class="hint" style="margin:6px 0">Add/remove fields freely; they become live columns in the table above.</p>
+          <div id="slr-schema-editor" class="slr-schema-editor"></div>
+          <button class="btn secondary" id="slr-schema-add" style="margin-top:6px">+ Add field</button>
+        </details>
+      </div>
+    </div>
 
-        <div class="card" style="margin:0">
-          <div class="events-meta">
-            <h2 style="margin:0">Call history (permanent)</h2>
-            <span class="count" id="slr-history-count">0</span>
-          </div>
-          <div id="slr-history-list"><p class="hint">No call history yet.</p></div>
-          <div class="btn-row" style="margin-top:10px;justify-content:space-between">
-            <button class="btn secondary" id="slr-history-more">Load 20 more</button>
-            <button class="btn secondary danger" id="slr-history-clear">Clear history</button>
-          </div>
-        </div>
+    <!-- History full-width. -->
+    <div class="card" style="margin-top:14px">
+      <div class="events-meta">
+        <h2 style="margin:0">Call history (permanent)</h2>
+        <span class="count" id="slr-history-count">0</span>
+      </div>
+      <div id="slr-history-list"><p class="hint">No call history yet.</p></div>
+      <div class="btn-row" style="margin-top:10px;justify-content:space-between">
+        <button class="btn secondary" id="slr-history-more">Load 20 more</button>
+        <button class="btn secondary danger" id="slr-history-clear">Clear history</button>
+      </div>
+    </div>
+
+    <!-- Bottom: big boxes for persona + knowledge base. -->
+    <div class="slr-kb-grid">
+      <div class="card slr-kb-card" style="margin:0">
+        <h2>Persona</h2>
+        <p class="hint" style="margin-top:0">Who Lena is and how she speaks (Lebanese dialect by default).</p>
+        <textarea id="slr-prompt" class="slr-kb-textarea" dir="auto">${escapeHtml(cfg.system_prompt)}</textarea>
+      </div>
+      <div class="card slr-kb-card" style="margin:0">
+        <h2>Knowledge base</h2>
+        <p class="hint" style="margin-top:0">What Lena knows about our company / products. The agent reads this as reference.</p>
+        <textarea id="slr-knowledge" class="slr-kb-textarea" dir="auto">${escapeHtml(cfg.knowledge || '')}</textarea>
       </div>
     </div>
   `;
@@ -5421,15 +5855,16 @@ async function renderSipLiveRep(root) {
     // Snapshot the live schema editor rows.
     const info_schema = readSlrSchemaFromDom();
     const patch = {
-      enabled:       document.getElementById('slr-enabled').checked,
-      bind_host:     document.getElementById('slr-host').value.trim() || '0.0.0.0',
-      bind_port:     parseInt(document.getElementById('slr-port').value, 10) || 8091,
-      system_prompt: document.getElementById('slr-prompt').value,
-      knowledge:     document.getElementById('slr-knowledge').value,
+      enabled:              document.getElementById('slr-enabled').checked,
+      interruption_enabled: document.getElementById('slr-interruption').checked,
+      bind_host:            document.getElementById('slr-host').value.trim() || '0.0.0.0',
+      bind_port:            parseInt(document.getElementById('slr-port').value, 10) || 8091,
+      system_prompt:        document.getElementById('slr-prompt').value,
+      knowledge:            document.getElementById('slr-knowledge').value,
       info_schema,
-      greeting:      document.getElementById('slr-greeting').value,
-      voice:         document.getElementById('slr-voice').value,
-      max_call_s:    parseInt(document.getElementById('slr-max').value, 10) || 0,
+      greeting:             document.getElementById('slr-greeting').value,
+      voice:                document.getElementById('slr-voice').value,
+      max_call_s:           parseInt(document.getElementById('slr-max').value, 10) || 0,
     };
     showFeedback(fb, 'ok', 'Saving…');
     try {

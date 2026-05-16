@@ -139,7 +139,15 @@ def _normalize_rule(rule: dict) -> dict:
 
 
 def list_rules() -> list[dict]:
-    return [dict(r) for r in state.ai_camera_rules]
+    out = []
+    for r in state.ai_camera_rules:
+        copy = dict(r)
+        try:
+            copy["scoring"] = compute_rule_scoring(copy["id"])
+        except Exception:
+            pass
+        out.append(copy)
+    return out
 
 
 def get_rule(rule_id: str) -> Optional[dict]:
@@ -283,12 +291,507 @@ def _read_jsonl_desc(path: Path, offset: int, limit: int) -> tuple[list[dict], i
     return rows[offset:offset + limit], total
 
 
+def _scores_path(rule_id: str) -> Path:
+    return _rule_dir(rule_id) / "scores.json"
+
+
+def _load_scores(rule_id: str) -> dict[int, str]:
+    """Read the canonical {iteration_id -> "correct"|"incorrect"} map for a
+    rule. On first call, migrates any inline `score` fields previously
+    written into the JSONL files."""
+    p = _scores_path(rule_id)
+    if p.exists():
+        try:
+            raw = json.loads(p.read_text())
+            return {int(k): v for k, v in raw.items() if v in ("correct", "incorrect")}
+        except Exception:
+            logger.exception("scores.json read failed: %s", p)
+            return {}
+    # Backfill from any inline scores that the previous storage layout left
+    # behind. Read both files; first occurrence wins on conflict.
+    migrated: dict[int, str] = {}
+    for path, inside_episodes in (
+        (_rule_dir(rule_id) / "triggers.jsonl", True),
+        (_rule_dir(rule_id) / "iterations.jsonl", False),
+    ):
+        if not path.exists():
+            continue
+        try:
+            with path.open("r", encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        row = json.loads(line)
+                    except Exception:
+                        continue
+                    if inside_episodes:
+                        for it in (row.get("sequence") or []):
+                            s = it.get("score")
+                            iid = it.get("iteration_id")
+                            if s in ("correct", "incorrect") and iid is not None:
+                                migrated.setdefault(int(iid), s)
+                    else:
+                        s = row.get("score")
+                        iid = row.get("iteration_id")
+                        if s in ("correct", "incorrect") and iid is not None:
+                            migrated.setdefault(int(iid), s)
+        except Exception:
+            logger.exception("scores backfill read failed: %s", path)
+    if migrated:
+        _save_scores(rule_id, migrated)
+    return migrated
+
+
+def _save_scores(rule_id: str, scores: dict[int, str]) -> None:
+    p = _scores_path(rule_id)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    tmp = p.with_suffix(p.suffix + ".tmp")
+    try:
+        tmp.write_text(json.dumps({str(k): v for k, v in scores.items()}))
+        tmp.replace(p)
+    except Exception:
+        logger.exception("scores.json write failed: %s", p)
+        try: tmp.unlink(missing_ok=True)
+        except Exception: pass
+
+
+def _inject_scores_into_triggers(rule_id: str, rows: list[dict]) -> None:
+    scores = _load_scores(rule_id)
+    if not scores:
+        return
+    for ep in rows:
+        for it in (ep.get("sequence") or []):
+            iid = it.get("iteration_id")
+            if iid is None: continue
+            s = scores.get(int(iid))
+            if s: it["score"] = s
+            elif "score" in it and int(iid) not in scores:
+                # Old inline value lingering after migration — strip it so the
+                # canonical map is the only thing the UI ever sees.
+                it.pop("score", None)
+
+
+def _inject_scores_into_iterations(rule_id: str, rows: list[dict]) -> None:
+    scores = _load_scores(rule_id)
+    if not scores:
+        return
+    for row in rows:
+        iid = row.get("iteration_id")
+        if iid is None: continue
+        s = scores.get(int(iid))
+        if s: row["score"] = s
+        elif "score" in row and int(iid) not in scores:
+            row.pop("score", None)
+
+
 def list_triggers(rule_id: str, offset: int, limit: int) -> tuple[list[dict], int]:
-    return _read_jsonl_desc(_rule_dir(rule_id) / "triggers.jsonl", offset, limit)
+    rows, total = _read_jsonl_desc(_rule_dir(rule_id) / "triggers.jsonl", offset, limit)
+    _inject_scores_into_triggers(rule_id, rows)
+    return rows, total
 
 
 def list_iterations(rule_id: str, offset: int, limit: int) -> tuple[list[dict], int]:
-    return _read_jsonl_desc(_rule_dir(rule_id) / "iterations.jsonl", offset, limit)
+    rows, total = _read_jsonl_desc(_rule_dir(rule_id) / "iterations.jsonl", offset, limit)
+    _inject_scores_into_iterations(rule_id, rows)
+    return rows, total
+
+
+def list_incorrect(rule_id: str, offset: int, limit: int) -> tuple[list[dict], int]:
+    """Return paginated iterations the user has tagged as `incorrect`,
+    deduped across both files (iterations.jsonl wins when both exist),
+    newest first. Each row carries: iteration_id, ts, trigger_reason,
+    verdict_reason, cameras, snap_cams, bbox, score, source ("trigger"|"iter").
+    """
+    scores = _load_scores(rule_id)
+    bad_ids = {iid for iid, s in scores.items() if s == "incorrect"}
+    if not bad_ids:
+        return [], 0
+    # Collect raw rows from both files. Build a dict keyed by iteration_id so
+    # iterations that appear in both files only show once.
+    rows_by_id: dict[int, dict] = {}
+
+    iter_path = _rule_dir(rule_id) / "iterations.jsonl"
+    if iter_path.exists():
+        try:
+            with iter_path.open("r", encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        row = json.loads(line)
+                    except Exception:
+                        continue
+                    iid = row.get("iteration_id")
+                    if iid is None or int(iid) not in bad_ids:
+                        continue
+                    rows_by_id[int(iid)] = {
+                        "iteration_id":   int(iid),
+                        "ts":             row.get("ts"),
+                        "trigger_reason": row.get("trigger_reason") or "",
+                        "verdict_reason": row.get("verdict_reason") or (
+                            (row.get("parsed") or {}).get("reason")
+                            if isinstance(row.get("parsed"), dict) else ""
+                        ),
+                        "cameras":        row.get("cameras") or [],
+                        "snap_cams":      row.get("snap_cams") or row.get("cameras") or [],
+                        "bbox":           row.get("bbox") or (
+                            (row.get("parsed") or {}).get("bbox")
+                            if isinstance(row.get("parsed"), dict) else None
+                        ),
+                        "triggered":      bool(row.get("triggered")),
+                        "source":         "iter",
+                    }
+        except Exception:
+            logger.exception("list_incorrect (iterations) failed: %s", iter_path)
+
+    trig_path = _rule_dir(rule_id) / "triggers.jsonl"
+    if trig_path.exists():
+        try:
+            with trig_path.open("r", encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        ep = json.loads(line)
+                    except Exception:
+                        continue
+                    for it in (ep.get("sequence") or []):
+                        iid = it.get("iteration_id")
+                        if iid is None or int(iid) not in bad_ids:
+                            continue
+                        if int(iid) in rows_by_id:
+                            continue   # iterations.jsonl already populated this one
+                        rows_by_id[int(iid)] = {
+                            "iteration_id":   int(iid),
+                            "ts":             it.get("ts"),
+                            "trigger_reason": it.get("trigger_reason") or "",
+                            "verdict_reason": it.get("verdict_reason") or "",
+                            "cameras":        it.get("cameras") or [],
+                            "snap_cams":      it.get("snap_cams") or it.get("cameras") or [],
+                            "bbox":           it.get("bbox"),
+                            "triggered":      True,
+                            "episode_id":     ep.get("episode_id"),
+                            "source":         "trigger",
+                        }
+        except Exception:
+            logger.exception("list_incorrect (triggers) failed: %s", trig_path)
+
+    # Stamp scores (currently always 'incorrect' but explicit so the UI can
+    # render the buttons in their correct state).
+    for r in rows_by_id.values():
+        r["score"] = "incorrect"
+
+    ordered = sorted(rows_by_id.values(),
+                     key=lambda r: (r.get("ts") or 0), reverse=True)
+    total = len(ordered)
+    return ordered[offset:offset + limit], total
+
+
+def _collect_iteration_ids(rule_id: str) -> set[int]:
+    """Distinct iteration_ids that exist anywhere on disk for this rule."""
+    ids: set[int] = set()
+    for path, inside_episodes in (
+        (_rule_dir(rule_id) / "triggers.jsonl", True),
+        (_rule_dir(rule_id) / "iterations.jsonl", False),
+    ):
+        if not path.exists():
+            continue
+        try:
+            with path.open("r", encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        row = json.loads(line)
+                    except Exception:
+                        continue
+                    if inside_episodes:
+                        for it in (row.get("sequence") or []):
+                            iid = it.get("iteration_id")
+                            if iid is not None:
+                                ids.add(int(iid))
+                    else:
+                        iid = row.get("iteration_id")
+                        if iid is not None:
+                            ids.add(int(iid))
+        except Exception:
+            logger.exception("collect iteration_ids failed: %s", path)
+    return ids
+
+
+def compute_rule_scoring(rule_id: str) -> dict:
+    """Aggregate scoring from the canonical scores.json, anchored against
+    the distinct iteration_ids that actually exist on disk. Returns:
+        {total, scored, unscored, correct, incorrect, accuracy_pct|null}
+    """
+    iter_ids = _collect_iteration_ids(rule_id)
+    scores = _load_scores(rule_id)
+    # Only count scores for iterations that still exist (orphans from removed
+    # episodes/iterations are ignored without bothering to delete them).
+    scored_ids = iter_ids & set(scores.keys())
+    correct = sum(1 for iid in scored_ids if scores[iid] == "correct")
+    incorrect = sum(1 for iid in scored_ids if scores[iid] == "incorrect")
+    total = len(iter_ids)
+    scored = len(scored_ids)
+    accuracy = round(100.0 * correct / scored, 1) if scored else None
+    return {
+        "total":         total,
+        "scored":        scored,
+        "unscored":      total - scored,
+        "correct":       correct,
+        "incorrect":     incorrect,
+        "accuracy_pct":  accuracy,
+    }
+
+
+def set_iteration_score(rule_id: str, iteration_id: int,
+                        score: Optional[str]) -> dict:
+    """Tag (or untag) an iteration with a review verdict. Stored in the
+    canonical scores.json keyed by iteration_id, so both the Triggers and
+    All Iterations views read the same value.
+
+    Raises KeyError if the iteration isn't found anywhere on disk.
+    Returns the updated rule-level scoring summary.
+    """
+    if score not in (None, "correct", "incorrect"):
+        raise ValueError("invalid score")
+    iid = int(iteration_id)
+    if iid not in _collect_iteration_ids(rule_id):
+        raise KeyError("iteration not found")
+    scores = _load_scores(rule_id)
+    if score is None:
+        scores.pop(iid, None)
+    else:
+        scores[iid] = score
+    _save_scores(rule_id, scores)
+    return compute_rule_scoring(rule_id)
+
+
+def score_iteration_in_episode(
+    rule_id: str, episode_id: str, iteration_id: int, score: Optional[str],
+) -> dict:
+    """Compatibility shim — kept for the PUT endpoint that takes episode_id
+    in its path. Episode lookup is informational only; the score is keyed by
+    iteration_id alone."""
+    return set_iteration_score(rule_id, iteration_id, score)
+
+
+def promote_iteration_to_triggered(rule_id: str, iteration_id: int) -> dict:
+    """Convert a non-triggered standalone iteration into a brand-new
+    triggered episode (one iteration in the sequence). Used to correct
+    a false-negative from the All Iterations tab.
+
+    Returns {"episode": <new episode>, "scoring": <updated summary>}.
+    Raises KeyError if the iteration isn't in iterations.jsonl, or
+    ValueError if it's already part of a triggered episode.
+    """
+    iter_path = _rule_dir(rule_id) / "iterations.jsonl"
+    if not iter_path.exists():
+        raise KeyError("no iterations stored")
+
+    # Locate the source row.
+    src: Optional[dict] = None
+    rows: list[dict] = []
+    try:
+        with iter_path.open("r", encoding="utf-8") as f:
+            for line in f:
+                s = line.strip()
+                if not s:
+                    continue
+                try:
+                    row = json.loads(s)
+                except Exception:
+                    continue
+                if int(row.get("iteration_id", -1)) == int(iteration_id):
+                    src = row
+                rows.append(row)
+    except Exception:
+        logger.exception("promote: read iterations failed: %s", iter_path)
+        raise
+    if src is None:
+        raise KeyError("iteration not found")
+
+    # Refuse if this iteration already lives in some triggered episode.
+    trig_path = _rule_dir(rule_id) / "triggers.jsonl"
+    episodes: list[dict] = []
+    if trig_path.exists():
+        try:
+            with trig_path.open("r", encoding="utf-8") as f:
+                for line in f:
+                    s = line.strip()
+                    if not s:
+                        continue
+                    try:
+                        ep = json.loads(s)
+                    except Exception:
+                        continue
+                    for it in (ep.get("sequence") or []):
+                        if int(it.get("iteration_id", -1)) == int(iteration_id):
+                            raise ValueError("iteration already in a triggered episode")
+                    episodes.append(ep)
+        except ValueError:
+            raise
+        except Exception:
+            logger.exception("promote: read triggers failed: %s", trig_path)
+            raise
+
+    # Build the new single-iteration episode. Mirror the shape produced by the
+    # live engine so the UI renders it identically.
+    new_iter_entry = {
+        "iteration_id":   int(iteration_id),
+        "ts":             src.get("ts") or time.time(),
+        "trigger_reason": src.get("trigger_reason") or "",
+        "verdict_reason": src.get("verdict_reason") or (
+            (src.get("parsed") or {}).get("reason") if isinstance(src.get("parsed"), dict) else ""
+        ),
+        "cameras":        src.get("cameras") or [],
+        "snap_cams":      src.get("snap_cams") or src.get("cameras") or [],
+        "bbox":           src.get("bbox") or (
+            (src.get("parsed") or {}).get("bbox") if isinstance(src.get("parsed"), dict) else None
+        ),
+    }
+    # Carry over an existing score so promotion doesn't silently clear it.
+    if src.get("score"):
+        new_iter_entry["score"] = src["score"]
+
+    new_ep = {
+        "episode_id":      f"ep_promoted_{int(time.time()*1000)}_{int(iteration_id)}",
+        "rule_id":         rule_id,
+        "rule_name":       (get_rule(rule_id) or {}).get("name") or rule_id,
+        "started_ts":      new_iter_entry["ts"],
+        "fired_ts":        new_iter_entry["ts"],
+        "last_ts":         new_iter_entry["ts"],
+        "iteration_id":    int(iteration_id),
+        "trigger_reason":  new_iter_entry["trigger_reason"],
+        "verdict_reason":  new_iter_entry["verdict_reason"],
+        "cameras":         new_iter_entry["cameras"],
+        "snap_cams":       new_iter_entry["snap_cams"],
+        "bbox":            new_iter_entry["bbox"],
+        "min_duration_s":  0,
+        "provider":        src.get("provider"),
+        "model":           src.get("model"),
+        "sequence":        [new_iter_entry],
+        "promoted":        True,   # marker so we know this came from a manual promote
+    }
+
+    _append_jsonl(trig_path, new_ep)
+
+    # Flip the standalone iteration's `triggered` field so the All Iterations
+    # view reflects the correction next time it's loaded.
+    if src.get("triggered") is not True:
+        src["triggered"] = True
+        tmp = iter_path.with_suffix(iter_path.suffix + ".tmp")
+        try:
+            with tmp.open("w", encoding="utf-8") as f:
+                for r in rows:
+                    f.write(json.dumps(r, separators=(",", ":")) + "\n")
+            tmp.replace(iter_path)
+        except Exception:
+            logger.exception("promote: rewrite iterations failed: %s", iter_path)
+
+    rule = get_rule(rule_id)
+    if rule is not None:
+        rule["trigger_count"] = int(rule.get("trigger_count", 0)) + 1
+        state.save()
+
+    return {"episode": new_ep, "scoring": compute_rule_scoring(rule_id)}
+
+
+def untrigger_iteration(rule_id: str, episode_id: str, iteration_id: int) -> dict:
+    """Remove one iteration from a triggered episode in triggers.jsonl.
+    If the episode's sequence becomes empty, the episode row is removed and
+    the rule's `trigger_count` decremented.
+
+    Returns:
+      {"removed": True, "episode_removed": bool, "episode": <updated or None>}
+      or raises FileNotFoundError / KeyError / ValueError as appropriate.
+    """
+    path = _rule_dir(rule_id) / "triggers.jsonl"
+    if not path.exists():
+        raise FileNotFoundError("no triggers")
+    try:
+        with path.open("r", encoding="utf-8") as f:
+            raw_lines = f.readlines()
+    except Exception:
+        logger.exception("untrigger: read failed: %s", path)
+        raise
+    episodes: list[dict] = []
+    for line in raw_lines:
+        s = line.strip()
+        if not s:
+            continue
+        try:
+            episodes.append(json.loads(s))
+        except Exception:
+            continue
+
+    target_idx = next(
+        (i for i, ep in enumerate(episodes) if ep.get("episode_id") == episode_id),
+        -1,
+    )
+    if target_idx < 0:
+        raise KeyError("episode not found")
+
+    ep = episodes[target_idx]
+    seq = list(ep.get("sequence") or [])
+    before = len(seq)
+    seq = [it for it in seq if int(it.get("iteration_id", -1)) != int(iteration_id)]
+    if len(seq) == before:
+        raise ValueError("iteration not in episode")
+
+    episode_removed = False
+    updated_ep: dict | None = None
+    if not seq:
+        episodes.pop(target_idx)
+        episode_removed = True
+        rule = get_rule(rule_id)
+        if rule is not None:
+            rule["trigger_count"] = max(0, int(rule.get("trigger_count", 0)) - 1)
+            state.save()
+    else:
+        ep["sequence"] = seq
+        # Refresh top-level summary fields from the trailing iteration so the
+        # episode card keeps showing accurate "last" metadata after removal.
+        last = seq[-1]
+        ep["last_ts"]        = last.get("ts", ep.get("last_ts"))
+        ep["iteration_id"]   = last.get("iteration_id", ep.get("iteration_id"))
+        ep["verdict_reason"] = last.get("verdict_reason", ep.get("verdict_reason"))
+        ep["cameras"]        = last.get("cameras", ep.get("cameras"))
+        ep["snap_cams"]      = last.get("snap_cams", ep.get("snap_cams"))
+        if last.get("bbox"):
+            ep["bbox"]       = last["bbox"]
+        updated_ep = ep
+
+    # Atomic rewrite.
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    try:
+        with tmp.open("w", encoding="utf-8") as f:
+            for e in episodes:
+                f.write(json.dumps(e, separators=(",", ":")) + "\n")
+        tmp.replace(path)
+    except Exception:
+        logger.exception("untrigger: rewrite failed: %s", path)
+        try: tmp.unlink(missing_ok=True)
+        except Exception: pass
+        raise
+
+    # Best-effort: drop the snapshots for that iteration so the disk doesn't
+    # keep growing with false-positive frames.
+    try:
+        snap_dir = _snap_dir(rule_id)
+        if snap_dir.exists():
+            for f in snap_dir.glob(f"{int(iteration_id)}_*.jpg"):
+                try: f.unlink()
+                except Exception: pass
+    except Exception:
+        pass
+
+    return {"removed": True, "episode_removed": episode_removed, "episode": updated_ep}
 
 
 # ============================================================
