@@ -17,7 +17,12 @@ from .services.mqtt import mqtt_service
 from .services.sip_live_agent import sip_live_agent_service
 from .services.sip_live_rep import sip_live_rep_service
 
+# Per-vertical demo apps (see DEMOSITEMAP.md).
+from .demos import landing as demos_landing
+from .demos.clinic import router as demos_clinic
+
 FRONTEND_DIR = Path(__file__).resolve().parents[2] / "frontend"
+DEMOS_DIR = FRONTEND_DIR / "demos"
 
 
 @asynccontextmanager
@@ -52,10 +57,29 @@ app.include_router(sip.router,            prefix="/api/sip",            tags=["s
 app.include_router(sip_live_agent.router, prefix="/api/sip-live-agent", tags=["sip-live-agent"])
 app.include_router(sip_live_rep.router,   prefix="/api/sip-live-rep",   tags=["sip-live-rep"])
 
+# Per-vertical demos. `/demo` is the 6-card landing page; each vertical
+# has a static SPA mount under `/demo/<slug>/` and its API at
+# `/api/demo/<slug>/*`. The session cookie lives at path `/` with a
+# per-slug name (`pw_demo_clinic`, `pw_demo_restaurant`, …) so verticals
+# don't clobber each other in the same browser.
+app.include_router(demos_landing.router,  prefix="/demo",                 tags=["demos"])
+app.include_router(demos_clinic.router,   prefix="/api/demo/clinic",      tags=["demo-clinic"])
+
 
 @app.get("/api/health")
 async def app_health() -> dict:
     return {"status": "ok"}
+
+
+# Per-vertical SPA mounts. These come BEFORE the root `/` static mount so
+# `/demo/clinic/assets/...` requests hit the vertical's built bundle, not
+# the main admin app's frontend folder.
+if (DEMOS_DIR / "clinic").is_dir():
+    app.mount(
+        "/demo/clinic",
+        StaticFiles(directory=str(DEMOS_DIR / "clinic"), html=True),
+        name="demo-clinic-spa",
+    )
 
 
 # Serve the frontend last so /api/* takes precedence.
@@ -68,7 +92,17 @@ app.mount(
 
 @app.exception_handler(404)
 async def spa_fallback(request, exc):  # noqa: ARG001
-    # Let unknown non-API paths fall through to index.html for hash-based routing.
-    if request.url.path.startswith("/api"):
-        return FileResponse(FRONTEND_DIR / "index.html", status_code=404)
+    from fastapi.responses import JSONResponse
+
+    path = request.url.path
+    # Admin-app API paths should 404 as JSON.
+    if path.startswith("/api"):
+        return JSONResponse({"detail": "Not found"}, status_code=404)
+    # SPA fallback for the Clinic demo — a direct GET on
+    # /demo/clinic/dashboard (or any TanStack Router client route) should
+    # return the clinic's index.html so the SPA can take over.
+    if path.startswith("/demo/clinic/"):
+        clinic_index = DEMOS_DIR / "clinic" / "index.html"
+        if clinic_index.exists():
+            return FileResponse(clinic_index)
     return FileResponse(FRONTEND_DIR / "index.html")
