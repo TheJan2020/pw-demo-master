@@ -1,0 +1,1 @@
+import{u as o,j as e}from"./index-C71y6EDq.js";import{P as r}from"./Placeholder-D0CKb4NE.js";import"./createLucideIcon-xzTr5zp6.js";function m(){const{t}=o();return e.jsx(r,{title:t("callCenter")})}export{m as component};
