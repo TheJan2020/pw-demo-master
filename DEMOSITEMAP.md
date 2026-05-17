@@ -797,22 +797,87 @@ lsof -nP -iTCP:8092 -sTCP:LISTEN     # macOS / BSD
 # or: ss -lntp | grep 8092            # Linux
 ```
 
+### Call recording + History (IMPLEMENTED)
+
+Every call is now persisted to disk when it hangs up, and surfaced
+on a new `/call-center/history` page:
+
+- **Storage layout**: `data/demos/clinic/calls/<id>/`
+  where `<id>` = `YYYYMMDDTHHMMSS_<call_id>` (sortable timestamp +
+  short uid). Three files per directory:
+    - `caller.wav` — 8 kHz signed-linear mono, what the caller said
+      (captured straight from the AudioSocket frames before any
+      resampling, so it's lossless).
+    - `agent.wav` — 8 kHz signed-linear mono, what the agent said
+      *as the caller heard it* (captured after the 24 → 8 kHz
+      downsample, immediately before the AudioSocket send).
+    - `meta.json` — `{id, call_id, started_at, ended_at, duration_s,
+      peer, uuid, caller_phone, turns[], voice, persona_chars,
+      kb_chars}`. `turns[]` is the in-call transcript as a list of
+      `{role: "caller"|"agent", text, ts}`, role-collapsed so multi-
+      chunk transcript fragments come out as one turn.
+- **Endpoints** (router.py):
+    - `GET /api/demo/clinic/agent/calls?limit=100` — list summaries.
+    - `GET /api/demo/clinic/agent/calls/{id}` — full meta + turns.
+    - `GET /api/demo/clinic/agent/calls/{id}/audio/{caller|agent}`
+      — streams the WAV.
+    - `DELETE /api/demo/clinic/agent/calls/{id}` — removes the
+      entire directory.
+- **Dashboard ↔ WS hookup**: the Clinic SPA's Call Center →
+  Dashboard now subscribes to `/api/demo/clinic/agent/ws`. Active
+  calls + the live transcript stream are real-time. New calls
+  default to `caller_name = "New patient"` until a lookup tool
+  resolves them (see deferred work below).
+- **History page**: lists calls newest-first, expand a row to play
+  the caller + agent WAVs (HTML5 `<audio controls>`) and read the
+  full transcript. Per-row Delete wipes the directory after a
+  confirm dialog.
+- **Patient `id_number`**: the Patient schema gained a national /
+  Iqama ID field, 10 digits — `1xxxxxxxxx` Saudi national,
+  `2xxxxxxxxx` resident. Seeded with the ~80/20 split that matches
+  the typical clinic mix. Visible in the Patients table and
+  validated in the edit dialog. The Live Agent's intake flow now
+  asks for this when verifying a returning caller.
+
 ### Open follow-ups (not in this commit)
 
-- **Function-call tools** for the agent — `lookup_patient(phone | file)`,
-  `list_free_slots(date, clinic_id)`, `create_appointment(...)`,
-  `cancel_appointment(id)`. Each one needs the backend to mirror /
-  query the clinic data layer; the SPA currently keeps everything in
-  the browser's localStorage, so the bridge is either:
-  (a) move the data to backend (`data/demos/clinic/{patients,appointments}.json`),
-  (b) have the SPA push snapshots to the backend on dashboard load,
+- **Function-call tools** for the agent — `lookup_patient_by_phone`,
+  `lookup_patient_by_name`, `lookup_patient_by_file_number`,
+  `lookup_patient_by_id_number`, `list_free_slots(date, clinic_id)`,
+  `create_appointment(...)`, `cancel_appointment(id)`,
+  `create_patient(...)`. Each one needs the backend to mirror /
+  query the clinic data layer; the SPA currently keeps everything
+  in the browser's localStorage, so the bridge is either:
+  (a) move the data to backend
+      (`data/demos/clinic/{patients,appointments}.json` with REST
+      endpoints; SPA syncs on dashboard load + after edits),
+  (b) have the SPA push snapshots to the backend on dashboard load
+      and after every mutation,
   (c) keep agent stateless and surface only the persona + KB (today).
-  Option (a) is the productisation path; (c) is the current MVP.
-- **Activity feed sync** — the Clinic SPA's Dashboard activity feed
-  is purely client-side. Once the function tools land, the agent's
-  real actions should publish into the same `agent_activity`
-  collection (via `/api/demo/clinic/agent/ws` events) so they show
-  up live without needing the Simulate buttons.
+  Option (a) is the productisation path; (b) is a useful interim;
+  (c) is the current MVP. The persona has been updated with the
+  intake-flow script so the agent already *asks* for the right
+  fields — it just can't *act on* them until the tools land.
+- **SIP CALLERID → AudioSocket UUID**: the agent doesn't currently
+  receive the caller's phone number — `chan_audiosocket` only
+  carries audio + a UUID. To enable `lookup_patient_by_phone` we
+  need to either:
+    - Encode the CALLERID in the UUID (set via dialplan from
+      `${CALLERID(num)}`, then the service splits on a delimiter),
+      OR
+    - Push CALLERID over a separate channel (AMI / ARI / a small
+      HTTP webhook from the dialplan to the backend) keyed by call
+      UUID.
+  Either is straightforward Asterisk dialplan work + a 20-line
+  backend lookup table.
+- **Activity feed real-event sync**: the Clinic SPA's Dashboard
+  activity feed is currently driven by the Simulate buttons. Once
+  the function tools land, real `create_patient` /
+  `create_appointment` / `cancel_appointment` / `reschedule_*` calls
+  from the agent should publish into the same `agent_activity`
+  collection (via `/api/demo/clinic/agent/ws` events that include
+  the patient_id / appointment_id) so they show up live and remain
+  cascade-deletable from the dashboard.
 
 ---
 

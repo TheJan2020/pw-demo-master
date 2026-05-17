@@ -8,6 +8,7 @@ import logging
 from typing import Optional
 
 from fastapi import APIRouter, HTTPException, Request, Response, WebSocket, WebSocketDisconnect
+from fastapi.responses import FileResponse
 from pydantic import BaseModel
 import asyncio
 
@@ -16,6 +17,7 @@ from . import config
 from .live_agent import (
     clinic_live_agent_service,
     load_kb, load_persona, save_kb, save_persona,
+    list_saved_calls, load_saved_call, call_audio_path, delete_saved_call,
 )
 from ..auth import (
     clear_session,
@@ -144,6 +146,40 @@ async def agent_set_prompt(payload: PromptIn) -> dict:
     if payload.persona is not None: save_persona(payload.persona)
     if payload.kb      is not None: save_kb(payload.kb)
     return {"ok": True, "persona": load_persona(), "kb": load_kb()}
+
+
+# ----- Saved-call History --------------------------------------------------
+
+@router.get("/agent/calls")
+async def agent_list_calls(limit: int = 100) -> dict:
+    """List recorded calls newest-first. Cheap — just stats every meta.json
+    in data/demos/clinic/calls."""
+    return {"items": list_saved_calls(max(1, min(500, limit)))}
+
+
+@router.get("/agent/calls/{call_id}")
+async def agent_get_call(call_id: str) -> dict:
+    meta = load_saved_call(call_id)
+    if meta is None:
+        raise HTTPException(404, "call not found")
+    return meta
+
+
+@router.get("/agent/calls/{call_id}/audio/{side}")
+async def agent_get_call_audio(call_id: str, side: str):
+    """Stream the caller-side or agent-side WAV. `side` ∈ {caller, agent}."""
+    p = call_audio_path(call_id, side)
+    if p is None:
+        raise HTTPException(404, "audio not found")
+    return FileResponse(str(p), media_type="audio/wav",
+                        filename=f"{call_id}-{side}.wav")
+
+
+@router.delete("/agent/calls/{call_id}")
+async def agent_delete_call(call_id: str) -> dict:
+    if not delete_saved_call(call_id):
+        raise HTTPException(404, "call not found")
+    return {"ok": True}
 
 
 @router.websocket("/agent/ws")

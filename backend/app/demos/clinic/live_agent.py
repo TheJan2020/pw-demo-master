@@ -27,10 +27,12 @@ from __future__ import annotations
 
 import asyncio
 import audioop
+import json
 import logging
 import struct
 import time
 import uuid
+import wave
 from pathlib import Path
 from typing import Optional
 
@@ -57,6 +59,7 @@ _GEMINI_API_VERSION = "v1alpha"
 _DATA_DIR = Path(__file__).resolve().parents[3] / "data" / "demos" / "clinic"
 _PERSONA_PATH = _DATA_DIR / "persona.txt"
 _KB_PATH      = _DATA_DIR / "kb.txt"
+_CALLS_DIR    = _DATA_DIR / "calls"
 
 
 # ============================================================================
@@ -84,6 +87,23 @@ Riyadh. You answer phone calls and route them politely and efficiently.
 
 ## Greeting (always Arabic)
 "السلام عليكم، عيادات برايم ميت. أنا ليلى. كيف أقدر أخدمك؟"
+
+## Caller intake flow — RUN THIS FIRST, EVERY CALL
+Establish who's calling before doing anything else.
+
+1. If a phone lookup tool returns a known patient, greet them by name
+   and skip to the request.
+2. Otherwise ask: "هل أنتِ مريض جديد، أم لديكِ ملف عندنا؟" / "Are you a
+   new patient, or do you have a file with us already?"
+3. **Returning patient:** ask for the file number (A/B/C + 6 digits).
+   If unknown, cross-confirm any two of: full name, date of birth,
+   national/Iqama ID (10 digits, 1xxxxxxxxx Saudi / 2xxxxxxxxx
+   resident).
+4. **New patient:** collect full name (EN + AR), mobile (+9665X XXX
+   XXXX), national/Iqama ID, date of birth, city, reason for visit.
+   Read the generated file number back at the end.
+5. **Only after identity is confirmed** continue into the booking /
+   question / cancellation flow.
 
 ## You CAN
 - Take new appointment requests — collect patient name, mobile,
@@ -228,6 +248,24 @@ class CallSession:
         self.echo_until: float = 0.0
         self.heard_text = ""
         self.spoken_text = ""
+        # Persistent per-call recording state — flushed to disk in
+        # ClinicLiveAgentService._handle's finally block via _save_recording.
+        # We store raw 8 kHz signed-linear from both directions so the WAVs
+        # round-trip without resampling losses.
+        self._caller_pcm8k: list[bytes] = []
+        self._agent_pcm8k:  list[bytes] = []
+        self.turns: list[dict] = []   # [{role, text, ts}]
+        # Optional caller phone — populated if the dialplan ever passes
+        # CALLERID via an out-of-band channel (TODO; see DEMOSITEMAP).
+        self.caller_phone: Optional[str] = None
+
+    def _append_turn(self, role: str, text: str) -> None:
+        # Extend the last turn if the speaker hasn't switched, else start a
+        # new one — keeps the transcript readable and the file small.
+        if self.turns and self.turns[-1]["role"] == role:
+            self.turns[-1]["text"] += text
+        else:
+            self.turns.append({"role": role, "text": text, "ts": time.time()})
 
     # ---- wire protocol -----------------------------------------------------
     @staticmethod
@@ -287,6 +325,9 @@ class CallSession:
                     logger.warning("clinic call %s: peer error: %r", self.call_id, payload)
                     continue
                 if msg_type == _AS_AUDIO and payload:
+                    # Capture the raw 8 kHz caller frame before any
+                    # resampling — recording stays lossless.
+                    self._caller_pcm8k.append(payload)
                     # Half-duplex gate only when interruption is OFF (mirrors
                     # the fix landed for sip_live_rep — see its comments).
                     if not state.cda_interruption_enabled and time.time() < self.echo_until:
@@ -323,6 +364,10 @@ class CallSession:
                 buf = self._out_leftover + pcm8k
                 n_complete = (len(buf) // FRAME) * FRAME
                 if n_complete:
+                    # Capture what we actually sent to the caller, in the
+                    # same 8 kHz wire format — recording is the call as
+                    # the caller heard it.
+                    self._agent_pcm8k.append(buf[:n_complete])
                     await self._send_audio(buf[:n_complete])
                 self._out_leftover = buf[n_complete:]
         except Exception as e:
@@ -417,6 +462,7 @@ class CallSession:
                                 it = getattr(sc, "input_transcription", None)
                                 if it and getattr(it, "text", None):
                                     self.heard_text += it.text
+                                    self._append_turn("caller", it.text)
                                     self.svc._broadcast({
                                         "type": "transcript", "call_id": self.call_id,
                                         "who": "caller", "text": it.text,
@@ -424,6 +470,7 @@ class CallSession:
                                 ot = getattr(sc, "output_transcription", None)
                                 if ot and getattr(ot, "text", None):
                                     self.spoken_text += ot.text
+                                    self._append_turn("agent", ot.text)
                                     self.svc._broadcast({
                                         "type": "transcript", "call_id": self.call_id,
                                         "who": "agent", "text": ot.text,
@@ -585,9 +632,162 @@ class ClinicLiveAgentService:
             logger.exception("clinic call %s crashed", call_id)
         finally:
             self._calls.pop(call_id, None)
-            self._broadcast({"type": "call_ended", "call_id": call_id})
+            # Persist the call's recording + transcript to disk so the
+            # History page can replay it. Always best-effort — a failing
+            # save must never block the cleanup.
+            try:
+                saved_id = _save_recording(session)
+                self._broadcast({"type": "call_ended", "call_id": call_id,
+                                 "saved_call_id": saved_id})
+            except Exception:
+                logger.exception("clinic call %s: failed to save recording", call_id)
+                self._broadcast({"type": "call_ended", "call_id": call_id})
             try: writer.close()
             except Exception: pass
+
+
+# ============================================================================
+# Call persistence — WAV (caller + agent) + JSON transcript
+# ============================================================================
+
+def _write_wav(path: Path, frames: list[bytes], rate_hz: int = 8000) -> None:
+    """Write a list of signed-linear 16-bit mono PCM byte chunks as a WAV."""
+    if not frames:
+        return
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with wave.open(str(path), "wb") as w:
+        w.setnchannels(1)
+        w.setsampwidth(2)
+        w.setframerate(rate_hz)
+        w.writeframes(b"".join(frames))
+
+
+def _save_recording(session: CallSession) -> Optional[str]:
+    """Persist the just-ended call. Returns the storage id used on disk —
+    a sortable timestamp + short uid so the History page lists in time order
+    even when the underlying call_ids are random hex.
+
+    Layout under data/demos/clinic/calls/<dir>/ :
+        meta.json    — { call_id, started_at, ended_at, duration_s,
+                         peer, uuid, caller_phone, persona_chars,
+                         kb_chars, turns: [{role, text, ts}] }
+        caller.wav   — 8 kHz mono, what the caller said
+        agent.wav    — 8 kHz mono, what the agent said (post-resample)
+    """
+    if (
+        not session.turns
+        and not session._caller_pcm8k
+        and not session._agent_pcm8k
+    ):
+        # Empty call (no audio, no transcript) — usually a probe / failed
+        # handshake. Skip to keep the History clean.
+        return None
+
+    ended_at = time.time()
+    started_at = session.started_at
+    ts = time.strftime("%Y%m%dT%H%M%S", time.localtime(started_at))
+    dir_id = f"{ts}_{session.call_id}"
+    call_dir = _CALLS_DIR / dir_id
+
+    try:
+        _write_wav(call_dir / "caller.wav", session._caller_pcm8k)
+    except Exception:
+        logger.exception("write caller.wav failed")
+    try:
+        _write_wav(call_dir / "agent.wav", session._agent_pcm8k)
+    except Exception:
+        logger.exception("write agent.wav failed")
+
+    meta = {
+        "id":            dir_id,
+        "call_id":       session.call_id,
+        "started_at":    started_at,
+        "ended_at":      ended_at,
+        "duration_s":    int(ended_at - started_at),
+        "peer":          session.peer,
+        "uuid":          session.uuid,
+        "caller_phone":  session.caller_phone,
+        "turns":         list(session.turns),
+        "persona_chars": len(load_persona()),
+        "kb_chars":      len(load_kb()),
+        "voice":         state.cda_voice or "Aoede",
+    }
+    try:
+        call_dir.mkdir(parents=True, exist_ok=True)
+        (call_dir / "meta.json").write_text(
+            json.dumps(meta, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+    except Exception:
+        logger.exception("write meta.json failed")
+
+    return dir_id
+
+
+def list_saved_calls(limit: int = 100) -> list[dict]:
+    """Return saved-call summaries (newest first)."""
+    if not _CALLS_DIR.exists():
+        return []
+    rows: list[dict] = []
+    for call_dir in _CALLS_DIR.iterdir():
+        if not call_dir.is_dir():
+            continue
+        meta_path = call_dir / "meta.json"
+        if not meta_path.exists():
+            continue
+        try:
+            meta = json.loads(meta_path.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        rows.append({
+            "id":           meta.get("id") or call_dir.name,
+            "call_id":      meta.get("call_id"),
+            "started_at":   meta.get("started_at"),
+            "ended_at":     meta.get("ended_at"),
+            "duration_s":   meta.get("duration_s", 0),
+            "peer":         meta.get("peer"),
+            "caller_phone": meta.get("caller_phone"),
+            "turn_count":   len(meta.get("turns") or []),
+            "has_caller_wav": (call_dir / "caller.wav").exists(),
+            "has_agent_wav":  (call_dir / "agent.wav").exists(),
+        })
+    rows.sort(key=lambda r: r.get("started_at") or 0, reverse=True)
+    return rows[:limit]
+
+
+def load_saved_call(call_id: str) -> Optional[dict]:
+    """Return the full meta.json for one saved call, or None."""
+    call_dir = _CALLS_DIR / call_id
+    meta_path = call_dir / "meta.json"
+    if not meta_path.exists():
+        return None
+    try:
+        return json.loads(meta_path.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+
+
+def call_audio_path(call_id: str, side: str) -> Optional[Path]:
+    """Resolve the WAV path for one side ('caller' or 'agent'). Returns
+    None if the file doesn't exist — caller should 404."""
+    if side not in ("caller", "agent"):
+        return None
+    p = _CALLS_DIR / call_id / f"{side}.wav"
+    return p if p.exists() else None
+
+
+def delete_saved_call(call_id: str) -> bool:
+    """Wipe one saved call's directory. Returns True if anything was
+    removed."""
+    call_dir = _CALLS_DIR / call_id
+    if not call_dir.exists():
+        return False
+    for f in call_dir.iterdir():
+        try: f.unlink()
+        except Exception: pass
+    try: call_dir.rmdir()
+    except Exception: pass
+    return True
 
 
 clinic_live_agent_service = ClinicLiveAgentService()
