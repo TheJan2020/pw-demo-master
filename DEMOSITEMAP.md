@@ -136,6 +136,121 @@ state. Both machines' Claude Code sessions read it on startup.
 
 ---
 
+## Day-to-day git workflow (multi-repo sync)
+
+The project spans **multiple git repos** living as siblings of each
+other on disk:
+
+```
+~/Documents/New Projects 2026/
+├── PWDemoMaster/          ← FastAPI backend + admin app + deployed SPA bundles
+│                            git remote: github.com/TheJan2020/pw-demo-master
+└── prime-mate-clinic/     ← Lovable React source for the Clinic vertical
+                             git remote: github.com/TheJan2020/prime-mate-clinic
+```
+
+Future verticals add more siblings (`prime-mate-restaurant/`,
+`prime-mate-gym/`, etc.). All commands below assume your working
+directory is the **parent folder** (`New Projects 2026/`).
+
+### Pull every repo at once
+
+```bash
+for repo in PWDemoMaster prime-mate-clinic; do
+  echo "=== $repo ==="
+  (cd "$repo" && git pull --ff-only) || break
+done
+```
+
+The `--ff-only` flag stops the loop if a repo has diverging commits
+that need a manual merge (better than getting auto-merge commits you
+didn't ask for).
+
+### Status across every repo
+
+```bash
+for repo in PWDemoMaster prime-mate-clinic; do
+  echo "=== $repo ==="
+  (cd "$repo" && git status --short --branch)
+done
+```
+
+### Push every repo at once
+
+Push only sends already-committed work. Run from the parent folder
+after you've staged + committed in each repo:
+
+```bash
+for repo in PWDemoMaster prime-mate-clinic; do
+  echo "=== $repo ==="
+  (cd "$repo" && git push)
+done
+```
+
+### Full "edit Lovable source → ship" pipeline (one block, copy-paste)
+
+Whenever you change clinic React source, this gets the change all the
+way to the deployed bundle on both repos. Run from the **parent
+folder**:
+
+```bash
+# 1. Commit + push the Lovable source repo
+(cd prime-mate-clinic && git add -A && git commit -m "DESCRIBE THE CHANGE" && git push)
+
+# 2. Rebuild the SPA, replace the deployed bundle in PWDemoMaster
+(cd prime-mate-clinic && rm -rf dist && npm run build) \
+  && rm -rf PWDemoMaster/frontend/demos/clinic/* \
+  && cp -r prime-mate-clinic/dist/client/* PWDemoMaster/frontend/demos/clinic/
+
+# 3. Commit + push PWDemoMaster
+(cd PWDemoMaster && git add frontend/demos/clinic && git commit -m "Rebuild clinic SPA" && git push)
+```
+
+(Replace the commit messages with something meaningful, obviously.)
+
+### Optional: shell function for convenience
+
+Add to `~/.zshrc` or `~/.bashrc` for a `pw` command that operates on
+every repo. Adjust the `_PW_REPOS` list when new vertical repos are
+added:
+
+```bash
+_PW_REPOS=(PWDemoMaster prime-mate-clinic)
+_PW_ROOT="$HOME/Documents/New Projects 2026"
+
+pw() {
+  local cmd="$1"
+  case "$cmd" in
+    pull|status|push|fetch)
+      for r in "${_PW_REPOS[@]}"; do
+        echo "=== $r ==="
+        (cd "$_PW_ROOT/$r" && git "$cmd")
+      done ;;
+    *)
+      echo "usage: pw {pull|status|push|fetch}" >&2
+      return 1 ;;
+  esac
+}
+```
+
+After sourcing your rc file you can run `pw pull`, `pw status`,
+`pw push`, `pw fetch` from anywhere.
+
+### When you only edit backend / admin app
+
+If your change is purely inside `PWDemoMaster/` (backend, admin
+frontend, DEMOSITEMAP.md, etc.) you skip the Lovable rebuild — just
+commit and push that one repo. The clinic SPA bundle isn't affected.
+
+### After a `git pull` brings in a new clinic SPA bundle
+
+Just restart the FastAPI backend (`./run.sh`) and hard-refresh the
+browser (Cmd-Shift-R). The bundle is plain static files — no
+`npm install` needed unless you'll be editing the Lovable source on
+that machine yourself.
+
+---
+
 ## 1. Verticals (initial set)
 
 | Vertical          | URL prefix                | Demo creds         |
