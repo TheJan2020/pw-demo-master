@@ -252,6 +252,50 @@ def build_tools() -> list[types.Tool]:
             ),
         ),
         types.FunctionDeclaration(
+            name="list_clinics",
+            description="List the clinics (departments) that actually exist in "
+                        "this center. Returns id, name, specialty, and location "
+                        "for each. ALWAYS call this before claiming a clinic or "
+                        "specialty exists — do NOT guess names from the caller's "
+                        "phrasing.",
+            parameters=types.Schema(
+                type=types.Type.OBJECT,
+                properties={
+                    "specialty": types.Schema(
+                        type=types.Type.STRING,
+                        description="Optional fuzzy match (case-insensitive substring) "
+                                    "on the English specialty, e.g. 'card' for cardiology.",
+                    ),
+                },
+            ),
+        ),
+        types.FunctionDeclaration(
+            name="list_providers",
+            description="List the people (doctors, nurses, techs) who actually "
+                        "work at this center. Returns id, name, role, and "
+                        "specialty for each. ALWAYS call this before naming a "
+                        "doctor — do NOT invent names.",
+            parameters=types.Schema(
+                type=types.Type.OBJECT,
+                properties={
+                    "specialty": types.Schema(
+                        type=types.Type.STRING,
+                        description="Optional fuzzy match on specialty.",
+                    ),
+                    "clinic_id": types.Schema(
+                        type=types.Type.STRING,
+                        description="Optional clinic id to restrict to that clinic's "
+                                    "head + matching-specialty staff.",
+                    ),
+                    "role": types.Schema(
+                        type=types.Type.STRING,
+                        description="Optional role filter: 'doctor', 'nurse', "
+                                    "'tech', or 'admin'.",
+                    ),
+                },
+            ),
+        ),
+        types.FunctionDeclaration(
             name="list_free_slots",
             description="List available appointment slot start times for one "
                         "clinic on one date. Already filters past times and slots "
@@ -339,6 +383,12 @@ def execute_tool(name: str, args: dict, ctx: dict) -> dict:
             return _t_lookup_id(args.get("id_number") or "")
         if name == "lookup_patient_by_file_number":
             return _t_lookup_file(args.get("file_number") or "")
+        if name == "list_clinics":
+            return _t_list_clinics(args.get("specialty"))
+        if name == "list_providers":
+            return _t_list_providers(args.get("specialty"),
+                                     args.get("clinic_id"),
+                                     args.get("role"))
         if name == "list_free_slots":
             return _t_list_free_slots(args.get("date") or "", args.get("clinic_id"))
         if name == "create_patient":
@@ -393,6 +443,85 @@ def _t_lookup_file(file_number: str) -> dict:
         if (p.get("file_number") or "").upper() == target:
             return {"found": True, "patient": _patient_for_agent(p)}
     return {"found": False, "patient": None}
+
+
+def _clinic_for_agent(c: dict) -> dict:
+    return {
+        "clinic_id":    c.get("id"),
+        "name":         c.get("name"),
+        "name_ar":      c.get("name_ar"),
+        "specialty":    c.get("specialty"),
+        "specialty_ar": c.get("specialty_ar"),
+        "location":     c.get("location"),
+        "location_ar":  c.get("location_ar"),
+        "head_provider_id": c.get("head_id"),
+    }
+
+
+def _provider_for_agent(p: dict) -> dict:
+    return {
+        "provider_id": p.get("id"),
+        "name":        p.get("name"),
+        "name_ar":     p.get("name_ar"),
+        "role":        p.get("role"),
+        "specialty":   p.get("specialty"),
+        "specialty_ar": p.get("specialty_ar"),
+    }
+
+
+def _t_list_clinics(specialty: Optional[str]) -> dict:
+    snap = load_snapshot()
+    rows = [c for c in snap.get("clinics", []) if c.get("active", True)]
+    if specialty:
+        needle = specialty.strip().lower()
+        rows = [
+            c for c in rows
+            if needle in (c.get("specialty") or "").lower()
+            or needle in (c.get("specialty_ar") or "").lower()
+            or needle in (c.get("name") or "").lower()
+            or needle in (c.get("name_ar") or "").lower()
+        ]
+    return {
+        "count":   len(rows),
+        "clinics": [_clinic_for_agent(c) for c in rows],
+        "note":    "These are the ONLY clinics that exist. Do not invent others.",
+    }
+
+
+def _t_list_providers(specialty: Optional[str],
+                      clinic_id: Optional[str],
+                      role: Optional[str]) -> dict:
+    snap = load_snapshot()
+    rows = [p for p in snap.get("providers", []) if p.get("active", True)]
+    if role:
+        rows = [p for p in rows if (p.get("role") or "").lower() == role.strip().lower()]
+    if specialty:
+        needle = specialty.strip().lower()
+        rows = [
+            p for p in rows
+            if needle in (p.get("specialty") or "").lower()
+            or needle in (p.get("specialty_ar") or "").lower()
+            or needle in (p.get("name") or "").lower()
+            or needle in (p.get("name_ar") or "").lower()
+        ]
+    if clinic_id:
+        clinic = next((c for c in snap.get("clinics", [])
+                       if c.get("id") == clinic_id), None)
+        if clinic:
+            clinic_spec = (clinic.get("specialty") or "").lower()
+            head = clinic.get("head_id")
+            rows = [
+                p for p in rows
+                if p.get("id") == head
+                or (p.get("specialty") or "").lower() == clinic_spec
+            ]
+        else:
+            rows = []
+    return {
+        "count":     len(rows),
+        "providers": [_provider_for_agent(p) for p in rows],
+        "note":      "These are the ONLY people on staff. Do not invent doctors.",
+    }
 
 
 def _t_list_free_slots(date: str, clinic_id: Optional[str]) -> dict:

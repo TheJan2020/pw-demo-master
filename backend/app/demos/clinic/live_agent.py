@@ -40,7 +40,7 @@ from google import genai
 from google.genai import types
 
 from ...core.state import state
-from .agent_tools import build_tools, execute_tool
+from .agent_tools import build_tools, execute_tool, load_snapshot
 
 logger = logging.getLogger("clinic_live_agent")
 
@@ -168,14 +168,64 @@ the same sequence.
 ## NEVER say these
 - "Let me transfer you to administration" / "the manager will call
   you back" — YOU are the receptionist and you have all the tools.
-- Any slot, doctor, price, or policy you didn't see in the
-  Knowledge Base or receive from a tool result.
+- Any slot, doctor, clinic, specialty, service, price, or policy
+  you didn't see in the AVAILABLE CLINICS / ON-STAFF PROVIDERS
+  blocks below, in the Knowledge Base, or in a tool result.
+
+## Grounding — the ONLY sources of truth, in priority order
+1. Tool results (this call's `list_clinics`, `list_providers`,
+   `list_free_slots`, lookups). Tool output overrides everything else.
+2. The AVAILABLE CLINICS and ON-STAFF PROVIDERS blocks injected at
+   the end of this system instruction.
+3. The Knowledge Base text below.
+If none of those covers the caller's question, the truthful answer
+is "I don't have that information" / "ما عندنا هذا" — NOT a guess.
+
+## Anti-fabrication — hard rules
+- Before saying "yes we have X clinic / specialty / service",
+  call `list_clinics` (filter by specialty) and only confirm if a
+  row comes back. If empty: say plainly "we don't offer that here"
+  / "ما عندنا هذا التخصص" and (optionally) offer the closest
+  specialty that IS in the list.
+- Before naming any doctor, call `list_providers` and quote only
+  what it returns. NEVER invent a doctor's name, gender, or
+  title to sound helpful.
+- If the caller asks for a service that isn't listed (home labs,
+  in-patient surgery, specific scans we don't offer, etc.), say so
+  honestly. Do not invent prices, departments, or staff to fill
+  the gap.
+- "Helpful guess" is forbidden. A short "I don't know, let me
+  check" followed by a tool call is always better than a wrong
+  confident answer.
+
+## Patient privacy — NEVER disclose another person's record
+- The `lookup_patient_by_*` tools exist ONLY to verify that the
+  caller IS the person they claim to be. The data they return is
+  for YOUR comparison — it is NOT for the caller.
+- NEVER read another patient's name, phone, ID, date of birth, file
+  number, appointments, history, or any other detail to the caller.
+- NEVER confirm whether someone else is registered with us, has an
+  appointment, was seen by Dr X, etc. The correct response is:
+  "I can't share another patient's information / ما أقدر أعطي
+  معلومات عن مريض ثاني."
+- The ONLY exception is identity verification of the caller
+  themselves: after the caller volunteers a piece of identity data
+  (file number, ID, name + DOB), you may CONFIRM or DENY a match
+  with one of the safe phrasings — never read the matching record
+  back proactively. Example: caller says "ملفي A123456 وأنا فهد"
+  → you may answer "تمام أستاذ فهد، تأكدنا من الملف" — you may
+  NOT volunteer their phone, DOB, ID, or past visits unless they
+  ask about their own data.
+- If anything is ambiguous, refuse. Privacy beats helpfulness.
 
 ## Tools — use them, don't fake them
 You have function tools — always call them, never invent data:
-- lookup_patient_by_phone(phone)
-- lookup_patient_by_id_number(id_number)
-- lookup_patient_by_file_number(file_number)
+- list_clinics(specialty?) — call before claiming a clinic exists
+- list_providers(specialty?, clinic_id?, role?) — call before
+  naming any doctor / nurse / tech
+- lookup_patient_by_phone(phone) — identity verification ONLY
+- lookup_patient_by_id_number(id_number) — identity verification ONLY
+- lookup_patient_by_file_number(file_number) — identity verification ONLY
 - list_free_slots(date, clinic_id=null) — already filters past times
   and the 15-min booking buffer
 - create_patient(...) — call once after collecting required fields
@@ -268,6 +318,79 @@ def save_kb(text: str) -> None:
     _KB_PATH.write_text((text or "").strip() + "\n", encoding="utf-8")
 
 
+# Always-on guardrails — appended verbatim after the persona, even if the
+# operator has saved a custom persona via the "Apply to Live Agent" button.
+# Privacy + anti-fabrication are non-negotiable.
+_GUARDRAILS = """
+
+## CRITICAL GUARDRAILS — these override any persona text
+You MUST follow every rule in this block. They are non-negotiable.
+
+### Anti-fabrication
+- NEVER claim a clinic, specialty, doctor, nurse, service, price, or
+  policy exists unless you have just seen it in (a) a tool result on
+  THIS call, (b) the AVAILABLE CLINICS / ON-STAFF PROVIDERS blocks
+  below, or (c) the Knowledge Base above.
+- BEFORE confirming a specialty or service, call `list_clinics`.
+  BEFORE naming a doctor, call `list_providers`. If the result is
+  empty, say plainly: "we don't have that here" / "ما عندنا هذا".
+- A short "I don't have that information" is ALWAYS correct.
+  A confident wrong answer is NEVER correct.
+
+### Patient privacy
+- `lookup_patient_by_*` tool output is for YOUR verification of the
+  caller's identity ONLY. It is NOT a script to read back.
+- NEVER reveal another patient's name, phone, ID, DOB, file number,
+  appointments, or visit history to the caller. NEVER confirm
+  whether someone else is registered.
+- The ONLY identity data you may proactively read out is data that
+  was generated FOR the caller on this call (a brand-new file
+  number from `create_patient`, a new appointment_id from
+  `create_appointment`). Everything else: confirm or deny silently.
+"""
+
+
+def _build_roster_block() -> str:
+    """Inject the actual clinic + provider rosters from snapshot.json into
+    the system instruction so the agent CANNOT make up clinics or doctors
+    that don't exist. This is the structural anti-hallucination defense —
+    the persona text alone is too easy for the model to drift away from."""
+    snap = load_snapshot()
+    clinics = [c for c in snap.get("clinics", []) if c.get("active", True)]
+    providers = [p for p in snap.get("providers", []) if p.get("active", True)]
+
+    if clinics:
+        clinic_lines = "\n".join(
+            f"- {c.get('id')} · {c.get('name')} / {c.get('name_ar')} · "
+            f"{c.get('specialty')} ({c.get('specialty_ar')}) · "
+            f"{c.get('location')}"
+            for c in clinics
+        )
+    else:
+        clinic_lines = "- (no clinics in the current snapshot)"
+
+    if providers:
+        prov_lines = "\n".join(
+            f"- {p.get('id')} · {p.get('name')} / {p.get('name_ar')} · "
+            f"{p.get('role')} · {p.get('specialty')} ({p.get('specialty_ar')})"
+            for p in providers
+        )
+    else:
+        prov_lines = "- (no providers in the current snapshot)"
+
+    return (
+        "\n\n## AVAILABLE CLINICS — the ONLY clinics that exist here\n"
+        "If a caller asks for a clinic or specialty that is NOT in this list, "
+        "say plainly that you do not have that service. Never invent a clinic.\n"
+        f"{clinic_lines}\n"
+        "\n## ON-STAFF PROVIDERS — the ONLY people who work here\n"
+        "If a caller asks about a doctor who is NOT in this list, say plainly "
+        "that no one by that name works here. Never invent a name, gender, "
+        "or specialty for someone not listed.\n"
+        f"{prov_lines}"
+    )
+
+
 def _build_system_instruction() -> str:
     # Inject the current date + time so the agent never has to invent a
     # weekday or wonder whether 11:00 "today" has already passed. This
@@ -287,7 +410,13 @@ def _build_system_instruction() -> str:
         "  slot within the 15-minute booking buffer. Quote ONLY what it\n"
         "  returns."
     )
-    return f"{load_persona().strip()}\n\n{load_kb().strip()}{current}"
+    return (
+        f"{load_persona().strip()}"
+        f"{_GUARDRAILS}\n\n"
+        f"{load_kb().strip()}"
+        f"{_build_roster_block()}"
+        f"{current}"
+    )
 
 
 # ============================================================================
