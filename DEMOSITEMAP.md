@@ -68,7 +68,7 @@ per-vertical Lovable source repos are *separate* — they live as siblings
 of PWDemoMaster on whichever machine they were last edited on. They are
 synced through GitHub (their own repos, not vendored into PWDemoMaster).
 
-### Clinic source — current sync state (as of 2026-05-17)
+### Clinic source — current sync state (as of 2026-05-17, end-of-day)
 
 - **Machine A** initially had the built-out Clinic source (CRUD pages
   for Clinics / Providers / Appointments + `src/lib/demoStore.ts`) but
@@ -82,6 +82,83 @@ synced through GitHub (their own repos, not vendored into PWDemoMaster).
 - **Net result:** the canonical Clinic source now lives on **Machine
   B + GitHub**. Machine A's local working copy is stale and probably
   diverges from what's now on `origin/main`.
+
+#### Switching to Machine A — what to pull, and what's new
+
+Both repos are fully pushed to `origin/main`. From Machine A, run:
+
+```bash
+export PW_ROOT="$HOME/Documents/New Projects 2026"
+for repo in PWDemoMaster prime-mate-clinic; do
+  echo "=== $repo ===" && (cd "$PW_ROOT/$repo" && git pull --ff-only)
+done
+```
+
+Then verify there's nothing locally divergent:
+
+```bash
+for repo in PWDemoMaster prime-mate-clinic; do
+  echo "=== $repo ===" && (cd "$PW_ROOT/$repo" && git status --short --branch)
+done
+```
+
+Recent work since the last machine-A session, in rough order of how
+it affects what you'll see on screen:
+
+**Clinic Live Agent — backend (`PWDemoMaster`):**
+
+- `c40e93b` Fabrication detector now treats bare `HH:MM` (no AM/PM)
+  as ambiguous and checks both AM and +12 interpretations. Closes
+  the false-positive that was telling the agent to apologise for
+  successful 4:30 PM reschedules.
+- `4e4cef8` Three new tools: `list_patient_appointments`,
+  `cancel_appointment`, `reschedule_appointment`. Plus a
+  slot-time fabrication check so the agent can't quote off-hours
+  slots like "6:30 PM" that `list_free_slots` never returned.
+- `9007d09` Real-time fabrication detector + in-session correction.
+  CallSession tracks every `file_number` / `appointment_id` /
+  `patient_id` returned by a successful tool call; if the agent
+  SPEAKS one that isn't in the whitelist, the backend injects a
+  system-override correction back into the live Gemini session AND
+  broadcasts a `fabrication` WS event for the Dashboard's red panel.
+- `8a3340f` `create_patient` now only requires `name`. Plus a
+  GUARDRAIL block listing the six questions the agent MUST ASK
+  (especially the national ID, which had been getting skipped).
+- `55654e8` Broadcasts a `tool_result` event on every tool call
+  outcome — drives the new "Recent tool errors" panel on the
+  Dashboard so silent failures stop being silent.
+- `7279e75` Fixed call sessions hanging after Asterisk drops TCP —
+  `_write_loop` / `_read_loop` / `feed` / `receive` all now signal
+  `stop_evt` in a `finally` so `CallSession.run()` always finalises.
+- `7ead997` Always-on `_GUARDRAILS` block + per-call roster
+  injection (snapshot's clinics + providers go into every system
+  instruction). Anti-fabrication and patient-privacy rules are now
+  structural and can't be bypassed by editing the persona text.
+- `6f95312` `mixed.wav` (caller+agent overlay) + Gemini offline
+  transcript enhancement. History page shows a "Full call" player
+  and prefers the cleaned transcript when present.
+
+**Clinic Live Agent — frontend (`prime-mate-clinic`):**
+
+- `91f7303` Agent mutation drain lifted from Dashboard to `_app.tsx`
+  layout. Cancellations / reschedules / creations the agent does
+  now apply to localStorage regardless of which page the user is
+  viewing during a call, and the backend's `snapshot.json` can no
+  longer be overwritten with stale SPA state.
+- `d6f5e47` Dashboard activity feed handles the new
+  `appointment_cancelled` / `appointment_rescheduled` mutations
+  (reschedule shows old → new time).
+- `0fdec9f` New red Dashboard panel for fabricated identifiers.
+- `18f7e26` New red Dashboard panel for tool errors.
+- `f88459d` Live transcript no longer wiped on WS reconnect
+  (snapshot now merges instead of replacing).
+- `22ddf5b` History page shows the new "Full call" audio player and
+  the enhanced offline transcript with status banner.
+
+After the pull, the bundle under `frontend/demos/clinic/` already
+matches the latest `prime-mate-clinic/src` — no rebuild needed for
+just reading or running. If you EDIT clinic React code on Machine
+A, run the standard pipeline from §"Full edit → ship" below.
 
 ### Required action — Machine A owner, next session
 
