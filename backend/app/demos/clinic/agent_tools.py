@@ -316,10 +316,15 @@ def build_tools() -> list[types.Tool]:
         types.FunctionDeclaration(
             name="create_patient",
             description="Create a new patient file. Returns the assigned "
-                        "patient_id and file_number. Only 'name' and 'phone' "
-                        "are strictly required — pass whatever else the caller "
-                        "gave you. Missing fields can be filled in at the "
-                        "reception desk on arrival.",
+                        "patient_id and file_number. Only 'name' is strictly "
+                        "required — pass whatever else the caller gave you "
+                        "(phone, id_number, date_of_birth, gender, city). "
+                        "Empty / omitted fields are accepted and reception "
+                        "fills them in on arrival. You MUST still ASK the "
+                        "caller for phone and national/Iqama ID — the "
+                        "tool's permissiveness is so the create still "
+                        "succeeds when the caller declines to share, NOT a "
+                        "licence to skip the questions.",
             parameters=types.Schema(
                 type=types.Type.OBJECT,
                 properties={
@@ -342,7 +347,7 @@ def build_tools() -> list[types.Tool]:
                     "city":          types.Schema(type=types.Type.STRING),
                     "city_ar":       types.Schema(type=types.Type.STRING),
                 },
-                required=["name", "phone"],
+                required=["name"],
             ),
         ),
         types.FunctionDeclaration(
@@ -614,13 +619,16 @@ def _t_create_patient(args: dict, ctx: dict) -> dict:
     dob = (args.get("date_of_birth") or "").strip()
     gender = (args.get("gender") or "").strip().lower()
 
-    if not name or not phone:
-        return {"error": "Missing required field — at minimum 'name' and 'phone' are required."}
-    # gender + dob + id_number are STRONGLY preferred but not strictly
-    # required: callers on a noisy line can't always relay every digit
-    # of their ID, and the alternative — the agent inventing a fake
-    # file_number to save face — is worse than a record with a flag
-    # to collect the missing fields on arrival.
+    # ONLY `name` is strictly required. Everything else (phone, ID, DOB,
+    # gender, city) is accepted when present and stored empty otherwise.
+    # Rationale: the agent has been observed inventing a fake
+    # file_number rather than admit "I couldn't complete the record",
+    # which is the worse failure mode. Letting the create succeed with
+    # just a name means there's at least a real, agent-issued
+    # identifier to show the caller, and reception fills in the rest
+    # on arrival.
+    if not name:
+        return {"error": "Missing required field — at minimum 'name' is required."}
     if id_number and not _ID_PATTERN.match(id_number):
         # Caller provided something but it's not in the Saudi format —
         # drop it rather than error; reception can fix at the desk.
