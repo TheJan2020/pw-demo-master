@@ -60,6 +60,82 @@ cd lovable-clinic && rm -rf dist && npm run build \
 
 ---
 
+## Two-machine source-of-truth state
+
+We work on this project from **two machines**, syncing the PWDemoMaster
+repo (FastAPI backend + admin app + built clinic SPA) over git. The
+per-vertical Lovable source repos are *separate* — they live as siblings
+of PWDemoMaster on whichever machine they were last edited on. They are
+synced through GitHub (their own repos, not vendored into PWDemoMaster).
+
+### Clinic source — current sync state (as of 2026-05-17)
+
+- **Machine A** initially had the built-out Clinic source (CRUD pages
+  for Clinics / Providers / Appointments + `src/lib/demoStore.ts`) but
+  it was never pushed to `prime-mate-clinic`'s GitHub repo.
+- **Machine B** cloned the *placeholder-stage* repo from
+  https://github.com/TheJan2020/prime-mate-clinic.git, then rebuilt the
+  CRUD pages + `demoStore.ts` from scratch using the recipe in §2b. The
+  rebuilt source was pushed to `prime-mate-clinic`'s `origin/main`.
+  The corresponding production build was copied into
+  `PWDemoMaster/frontend/demos/clinic/` and committed.
+- **Net result:** the canonical Clinic source now lives on **Machine
+  B + GitHub**. Machine A's local working copy is stale and probably
+  diverges from what's now on `origin/main`.
+
+### Required action — Machine A owner, next session
+
+The cleanest reconciliation is for Machine A to **discard its local
+prime-mate-clinic working tree and re-clone from GitHub**, since the
+Machine B rebuild is now the authoritative version:
+
+```bash
+# from the parent of the lovable-clinic / prime-mate-clinic dir
+mv prime-mate-clinic prime-mate-clinic.backup-machine-a  # safety net
+git clone https://github.com/TheJan2020/prime-mate-clinic.git
+cd prime-mate-clinic
+npm install
+# verify it builds the same bundle that's already deployed:
+rm -rf dist && npm run build
+diff -r dist/client/ ../PWDemoMaster/frontend/demos/clinic/   # should be no diff except hashed filenames
+```
+
+If Machine A had any *additional* in-flight work in the old
+`prime-mate-clinic.backup-machine-a/`, cherry-pick those files into the
+fresh clone manually. Don't try to merge — the rebuild was deliberately
+clean.
+
+Then from Machine A: `cd PWDemoMaster && git pull` to pick up the new
+DEMOSITEMAP and the deployed bundle.
+
+### Rules going forward — keep both machines from drifting
+
+1. **Always push immediately** after edits to a Lovable source repo.
+   Don't accumulate uncommitted CRUD work locally; that's how this
+   divergence happened in the first place.
+2. **Rebuild + deploy + commit in PWDemoMaster as one atomic step**
+   after every Lovable source edit:
+   ```bash
+   cd prime-mate-clinic
+   git add -A && git commit -m "…" && git push
+   rm -rf dist && npm run build
+   rm -rf ../PWDemoMaster/frontend/demos/clinic/*
+   cp -r dist/client/* ../PWDemoMaster/frontend/demos/clinic/
+   cd ../PWDemoMaster && git add -A && git commit -m "Rebuild clinic SPA" && git push
+   ```
+3. **DEMOSITEMAP.md is the canonical sync log.** When sync state
+   changes — when a vertical's source moves between machines, when a
+   build is deployed, when a vertical's "**built**" / "placeholder"
+   status flips — update §2b plus this section in the same commit.
+4. **Other verticals (Restaurant, Gym, etc.):** when their Lovable
+   repos are created, each one gets its own GitHub remote and its own
+   sub-section here describing which machine is the source of truth.
+
+This file is the canonical source-of-truth for the two-machine sync
+state. Both machines' Claude Code sessions read it on startup.
+
+---
+
 ## 1. Verticals (initial set)
 
 | Vertical          | URL prefix                | Demo creds         |
