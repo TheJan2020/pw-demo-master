@@ -1,1 +1,0 @@
-import{u as o,j as e}from"./index-eOliFwoy.js";import{P as s}from"./Placeholder-Br5nrDsh.js";import"./createLucideIcon-8xAKuuVW.js";function m(){const{t}=o();return e.jsx(s,{title:t("settings")})}export{m as component};
