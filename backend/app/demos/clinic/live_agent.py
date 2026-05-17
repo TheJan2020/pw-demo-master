@@ -623,9 +623,11 @@ class CallSession:
                         try: self.audio_in.put_nowait(pcm16k)
                         except Exception: pass
         except (asyncio.IncompleteReadError, ConnectionResetError):
-            self.stop_evt.set()
+            pass
         except Exception:
             logger.exception("clinic call %s: read loop crashed", self.call_id)
+        finally:
+            # Always signal — same reason as _write_loop's finally.
             self.stop_evt.set()
 
     async def _write_loop(self) -> None:
@@ -656,6 +658,15 @@ class CallSession:
                 self._out_leftover = buf[n_complete:]
         except Exception as e:
             logger.warning("clinic call %s: write loop ended: %s", self.call_id, e)
+        finally:
+            # The transport may have died before the read loop noticed
+            # (e.g. Asterisk closed TCP without sending an AudioSocket
+            # HANGUP frame, or wrote() raised on a half-closed socket).
+            # If we don't signal stop_evt, run() stays parked on
+            # `await self.stop_evt.wait()` and the whole call session
+            # never finalises — Gemini eventually closes the WS idle,
+            # and we accumulate zombie sessions.
+            self.stop_evt.set()
 
     async def _gemini_loop(self) -> None:
         if not state.gemini_api_key:
@@ -718,124 +729,153 @@ class CallSession:
                         logger.warning("clinic call %s: greeting failed: %s", self.call_id, e)
 
                 async def feed():
-                    while not self.stop_evt.is_set():
-                        try:
-                            chunk = await asyncio.wait_for(self.audio_in.get(), timeout=1.0)
-                        except asyncio.TimeoutError:
-                            continue
-                        if not chunk:
-                            continue
-                        await session.send_realtime_input(
-                            audio=types.Blob(data=chunk, mime_type="audio/pcm;rate=16000"),
-                        )
+                    try:
+                        while not self.stop_evt.is_set():
+                            try:
+                                chunk = await asyncio.wait_for(self.audio_in.get(), timeout=1.0)
+                            except asyncio.TimeoutError:
+                                continue
+                            if not chunk:
+                                continue
+                            await session.send_realtime_input(
+                                audio=types.Blob(data=chunk, mime_type="audio/pcm;rate=16000"),
+                            )
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception as e:
+                        # Swallow Gemini's "WS already closed" once the
+                        # session is winding down; we don't want it to
+                        # propagate as an unretrieved task exception.
+                        logger.info("clinic call %s: feed loop ended: %r",
+                                    self.call_id, e)
+                    finally:
+                        self.stop_evt.set()
 
                 async def receive():
-                    while not self.stop_evt.is_set():
-                        async for resp in session.receive():
-                            data_bytes = getattr(resp, "data", None)
-                            if data_bytes:
-                                try: self.audio_out.put_nowait(data_bytes)
-                                except asyncio.QueueFull:
-                                    try: self.audio_out.get_nowait()
-                                    except Exception: pass
+                    try:
+                        while not self.stop_evt.is_set():
+                            async for resp in session.receive():
+                                data_bytes = getattr(resp, "data", None)
+                                if data_bytes:
                                     try: self.audio_out.put_nowait(data_bytes)
-                                    except Exception: pass
-                            sc = getattr(resp, "server_content", None)
-                            if sc:
-                                if getattr(sc, "interrupted", False):
-                                    drained = 0
-                                    while not self.audio_out.empty():
-                                        try:
-                                            self.audio_out.get_nowait()
-                                            drained += 1
-                                        except Exception: break
-                                    self._out_leftover = b""
-                                    self.echo_until = 0.0
-                                    if drained:
-                                        logger.info("clinic call %s: interrupted (%d frames dropped)", self.call_id, drained)
-                                it = getattr(sc, "input_transcription", None)
-                                if it and getattr(it, "text", None):
-                                    self.heard_text += it.text
-                                    self._append_turn("caller", it.text)
-                                    self.svc._broadcast({
-                                        "type": "transcript", "call_id": self.call_id,
-                                        "who": "caller", "text": it.text,
-                                    })
-                                ot = getattr(sc, "output_transcription", None)
-                                if ot and getattr(ot, "text", None):
-                                    self.spoken_text += ot.text
-                                    self._append_turn("agent", ot.text)
-                                    self.svc._broadcast({
-                                        "type": "transcript", "call_id": self.call_id,
-                                        "who": "agent", "text": ot.text,
-                                    })
-                            # Tool call → execute → return FunctionResponse.
-                            tc = getattr(resp, "tool_call", None)
-                            if tc:
-                                responses = []
-                                for fc in (tc.function_calls or []):
-                                    args = dict(fc.args or {})
-                                    logger.info("clinic call %s: tool_call %s(%s)",
-                                                self.call_id, fc.name, args)
-                                    self.svc._broadcast({
-                                        "type":     "tool_call",
-                                        "call_id":  self.call_id,
-                                        "name":     fc.name,
-                                        "args":     args,
-                                    })
-                                    # If the lookup succeeded, update the
-                                    # Dashboard's caller name + phone.
-                                    result = execute_tool(fc.name, args, tool_ctx)
-                                    # Always broadcast the outcome so the
-                                    # Dashboard can flag tool errors
-                                    # (e.g. create_appointment failing with
-                                    # "patient not found") instead of the
-                                    # user only finding out when the
-                                    # appointment doesn't appear.
-                                    has_error = isinstance(result, dict) and bool(result.get("error"))
-                                    self.svc._broadcast({
-                                        "type":     "tool_result",
-                                        "call_id":  self.call_id,
-                                        "name":     fc.name,
-                                        "args":     args,
-                                        "ok":       (not has_error),
-                                        "error":    (result.get("error") if has_error else None),
-                                        "result":   None if has_error else result,
-                                    })
-                                    if fc.name.startswith("lookup_patient") and isinstance(result, dict) and result.get("found"):
-                                        p = result.get("patient") or {}
-                                        self.caller_phone = p.get("phone") or self.caller_phone
+                                    except asyncio.QueueFull:
+                                        try: self.audio_out.get_nowait()
+                                        except Exception: pass
+                                        try: self.audio_out.put_nowait(data_bytes)
+                                        except Exception: pass
+                                sc = getattr(resp, "server_content", None)
+                                if sc:
+                                    if getattr(sc, "interrupted", False):
+                                        drained = 0
+                                        while not self.audio_out.empty():
+                                            try:
+                                                self.audio_out.get_nowait()
+                                                drained += 1
+                                            except Exception: break
+                                        self._out_leftover = b""
+                                        self.echo_until = 0.0
+                                        if drained:
+                                            logger.info("clinic call %s: interrupted (%d frames dropped)", self.call_id, drained)
+                                    it = getattr(sc, "input_transcription", None)
+                                    if it and getattr(it, "text", None):
+                                        self.heard_text += it.text
+                                        self._append_turn("caller", it.text)
                                         self.svc._broadcast({
-                                            "type":    "caller_identified",
-                                            "call_id": self.call_id,
-                                            "name":    p.get("name") or p.get("name_ar"),
-                                            "phone":   p.get("phone"),
+                                            "type": "transcript", "call_id": self.call_id,
+                                            "who": "caller", "text": it.text,
                                         })
-                                    responses.append(types.FunctionResponse(
-                                        id=fc.id, name=fc.name,
-                                        response={"result": result},
-                                    ))
-                                if responses:
-                                    try:
-                                        await session.send_tool_response(function_responses=responses)
-                                    except Exception:
-                                        logger.exception("send_tool_response failed")
-                                # If a tool requested hangup, drop out cleanly
-                                # after the agent's closing line finishes.
-                                if tool_ctx.get("end_requested"):
-                                    # Give the agent ~3s to finish its
-                                    # spoken goodbye before we close the
-                                    # AudioSocket.
-                                    asyncio.create_task(self._delayed_stop(3.0))
+                                    ot = getattr(sc, "output_transcription", None)
+                                    if ot and getattr(ot, "text", None):
+                                        self.spoken_text += ot.text
+                                        self._append_turn("agent", ot.text)
+                                        self.svc._broadcast({
+                                            "type": "transcript", "call_id": self.call_id,
+                                            "who": "agent", "text": ot.text,
+                                        })
+                                # Tool call → execute → return FunctionResponse.
+                                tc = getattr(resp, "tool_call", None)
+                                if tc:
+                                    responses = []
+                                    for fc in (tc.function_calls or []):
+                                        args = dict(fc.args or {})
+                                        logger.info("clinic call %s: tool_call %s(%s)",
+                                                    self.call_id, fc.name, args)
+                                        self.svc._broadcast({
+                                            "type":     "tool_call",
+                                            "call_id":  self.call_id,
+                                            "name":     fc.name,
+                                            "args":     args,
+                                        })
+                                        # If the lookup succeeded, update the
+                                        # Dashboard's caller name + phone.
+                                        result = execute_tool(fc.name, args, tool_ctx)
+                                        # Always broadcast the outcome so the
+                                        # Dashboard can flag tool errors
+                                        # (e.g. create_appointment failing with
+                                        # "patient not found") instead of the
+                                        # user only finding out when the
+                                        # appointment doesn't appear.
+                                        has_error = isinstance(result, dict) and bool(result.get("error"))
+                                        self.svc._broadcast({
+                                            "type":     "tool_result",
+                                            "call_id":  self.call_id,
+                                            "name":     fc.name,
+                                            "args":     args,
+                                            "ok":       (not has_error),
+                                            "error":    (result.get("error") if has_error else None),
+                                            "result":   None if has_error else result,
+                                        })
+                                        if fc.name.startswith("lookup_patient") and isinstance(result, dict) and result.get("found"):
+                                            p = result.get("patient") or {}
+                                            self.caller_phone = p.get("phone") or self.caller_phone
+                                            self.svc._broadcast({
+                                                "type":    "caller_identified",
+                                                "call_id": self.call_id,
+                                                "name":    p.get("name") or p.get("name_ar"),
+                                                "phone":   p.get("phone"),
+                                            })
+                                        responses.append(types.FunctionResponse(
+                                            id=fc.id, name=fc.name,
+                                            response={"result": result},
+                                        ))
+                                    if responses:
+                                        try:
+                                            await session.send_tool_response(function_responses=responses)
+                                        except Exception:
+                                            logger.exception("send_tool_response failed")
+                                    # If a tool requested hangup, drop out cleanly
+                                    # after the agent's closing line finishes.
+                                    if tool_ctx.get("end_requested"):
+                                        # Give the agent ~3s to finish its
+                                        # spoken goodbye before we close the
+                                        # AudioSocket.
+                                        asyncio.create_task(self._delayed_stop(3.0))
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception as e:
+                        # Gemini's WS closes with ConnectionClosedOK at the
+                        # end of a normal call — don't escalate, just log
+                        # and signal the rest of the pipeline to shut down.
+                        logger.info("clinic call %s: receive loop ended: %r",
+                                    self.call_id, e)
+                    finally:
+                        self.stop_evt.set()
 
                 feeder = asyncio.create_task(feed())
                 receiver = asyncio.create_task(receive())
+                stopper = asyncio.create_task(self.stop_evt.wait())
                 done, pending = await asyncio.wait(
-                    {feeder, receiver, asyncio.create_task(self.stop_evt.wait())},
+                    {feeder, receiver, stopper},
                     return_when=asyncio.FIRST_COMPLETED,
                 )
                 for t in pending:
                     t.cancel()
+                # Drain results from completed tasks so their exceptions
+                # don't surface as "Task exception was never retrieved".
+                for t in done:
+                    try: t.exception()
+                    except (asyncio.CancelledError, asyncio.InvalidStateError):
+                        pass
 
         except Exception:
             logger.exception("clinic call %s: Gemini Live failed", self.call_id)
