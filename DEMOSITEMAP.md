@@ -83,24 +83,66 @@ synced through GitHub (their own repos, not vendored into PWDemoMaster).
   B + GitHub**. Machine A's local working copy is stale and probably
   diverges from what's now on `origin/main`.
 
-#### Switching to Machine A — what to pull, and what's new
+#### Switching to Machine A (Windows) — what to pull, and what's new
 
-Both repos are fully pushed to `origin/main`. From Machine A, run:
+Both repos are fully pushed to `origin/main`. Pick **one** of the
+two shells below — Git Bash is preferred because every other
+snippet in this file works verbatim there.
+
+**Option A — Git Bash (recommended)**
+
+Git Bash ships with Git for Windows. Open it (Start menu → "Git
+Bash") and run the same commands the macOS machine uses:
 
 ```bash
-export PW_ROOT="$HOME/Documents/New Projects 2026"
+export PW_ROOT="/c/Users/$USER/Documents/New Projects 2026"
 for repo in PWDemoMaster prime-mate-clinic; do
   echo "=== $repo ===" && (cd "$PW_ROOT/$repo" && git pull --ff-only)
 done
-```
 
-Then verify there's nothing locally divergent:
-
-```bash
+# Verify clean:
 for repo in PWDemoMaster prime-mate-clinic; do
   echo "=== $repo ===" && (cd "$PW_ROOT/$repo" && git status --short --branch)
 done
 ```
+
+If the projects live somewhere other than `Documents/New Projects
+2026`, just adjust `PW_ROOT` — Git Bash accepts both `/c/Users/…`
+and `C:/Users/…` style paths.
+
+**Option B — PowerShell**
+
+```powershell
+$env:PW_ROOT = "$env:USERPROFILE\Documents\New Projects 2026"
+foreach ($repo in "PWDemoMaster", "prime-mate-clinic") {
+  Write-Host "=== $repo ==="
+  Push-Location "$env:PW_ROOT\$repo"
+  git pull --ff-only
+  Pop-Location
+}
+
+# Verify clean:
+foreach ($repo in "PWDemoMaster", "prime-mate-clinic") {
+  Write-Host "=== $repo ==="
+  Push-Location "$env:PW_ROOT\$repo"
+  git status --short --branch
+  Pop-Location
+}
+```
+
+**Windows-only path notes for the rest of this file:**
+
+- The Python venv interpreter on Windows is
+  `.venv\Scripts\python.exe` (PowerShell) or
+  `.venv/Scripts/python.exe` (Git Bash), NOT `.venv/bin/python`.
+  Activate with `.venv\Scripts\Activate.ps1` (PowerShell) or
+  `source .venv/Scripts/activate` (Git Bash).
+- `npm run build` works identically on either shell.
+- All `git`, `npm`, `node` commands work identically on either shell.
+- The "edit Lovable source → ship" copy step uses `cp -r` on macOS;
+  Git Bash also has `cp -r`. In PowerShell use
+  `Copy-Item -Recurse -Force` instead, and
+  `Remove-Item -Recurse -Force` instead of `rm -rf`.
 
 Recent work since the last machine-A session, in rough order of how
 it affects what you'll see on screen:
