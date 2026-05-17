@@ -321,10 +321,14 @@ class CallSession:
         self.spoken_text = ""
         # Persistent per-call recording state — flushed to disk in
         # ClinicLiveAgentService._handle's finally block via _save_recording.
-        # We store raw 8 kHz signed-linear from both directions so the WAVs
-        # round-trip without resampling losses.
+        # Caller frames arrive continuously over AudioSocket (one every 20 ms),
+        # so concatenating them yields a perfect wall-clock timeline of what
+        # the caller sent. Agent chunks are intermittent (Gemini only emits
+        # while it's actually speaking) so we tag each chunk with the
+        # seconds-since-call-start offset at which it left the wire, so the
+        # mixer can overlay it at the right position.
         self._caller_pcm8k: list[bytes] = []
-        self._agent_pcm8k:  list[bytes] = []
+        self._agent_pcm8k:  list[tuple[float, bytes]] = []
         self.turns: list[dict] = []   # [{role, text, ts}]
         # Optional caller phone — populated if the dialplan ever passes
         # CALLERID via an out-of-band channel (TODO; see DEMOSITEMAP).
@@ -446,9 +450,13 @@ class CallSession:
                 if n_complete:
                     # Capture what we actually sent to the caller, in the
                     # same 8 kHz wire format — recording is the call as
-                    # the caller heard it.
-                    self._agent_pcm8k.append(buf[:n_complete])
-                    await self._send_audio(buf[:n_complete])
+                    # the caller heard it. Stamp with seconds-since-call-start
+                    # so the mixer can place it at the right offset on the
+                    # caller timeline.
+                    offset_s = time.time() - self.started_at
+                    chunk = buf[:n_complete]
+                    self._agent_pcm8k.append((offset_s, chunk))
+                    await self._send_audio(chunk)
                 self._out_leftover = buf[n_complete:]
         except Exception as e:
             logger.warning("clinic call %s: write loop ended: %s", self.call_id, e)
@@ -771,6 +779,11 @@ class ClinicLiveAgentService:
                 saved_id = _save_recording(session)
                 self._broadcast({"type": "call_ended", "call_id": call_id,
                                  "saved_call_id": saved_id})
+                # Kick off the offline transcript pass — runs in the
+                # background so the next call (or hangup) isn't blocked
+                # by the Gemini upload.
+                if saved_id:
+                    asyncio.create_task(_enhance_transcript(saved_id))
             except Exception:
                 logger.exception("clinic call %s: failed to save recording", call_id)
                 self._broadcast({"type": "call_ended", "call_id": call_id})
@@ -792,6 +805,82 @@ def _write_wav(path: Path, frames: list[bytes], rate_hz: int = 8000) -> None:
         w.setsampwidth(2)
         w.setframerate(rate_hz)
         w.writeframes(b"".join(frames))
+
+
+def _write_agent_wav(path: Path,
+                     agent_chunks: list[tuple[float, bytes]],
+                     total_s: float,
+                     rate_hz: int = 8000) -> None:
+    """Render the agent-only timeline as a full-call WAV — silence between
+    the chunks, audio inside them — so the reader hears the agent talk in
+    real call time, not back-to-back."""
+    if not agent_chunks:
+        return
+    path.parent.mkdir(parents=True, exist_ok=True)
+    bytes_per_sec = rate_hz * 2  # 16-bit mono
+    last = agent_chunks[-1]
+    span_s = max(total_s, last[0] + (len(last[1]) / bytes_per_sec))
+    total_bytes = int(span_s * bytes_per_sec)
+    if total_bytes <= 0:
+        return
+    buf = bytearray(total_bytes)
+    for offset_s, chunk in agent_chunks:
+        start = int(offset_s * bytes_per_sec) & ~1  # align to sample boundary
+        end = start + len(chunk)
+        if end > len(buf):
+            buf.extend(b"\x00" * (end - len(buf)))
+        buf[start:end] = chunk
+    with wave.open(str(path), "wb") as w:
+        w.setnchannels(1)
+        w.setsampwidth(2)
+        w.setframerate(rate_hz)
+        w.writeframes(bytes(buf))
+
+
+def _write_mixed_wav(path: Path,
+                     caller_frames: list[bytes],
+                     agent_chunks: list[tuple[float, bytes]],
+                     total_s: float,
+                     rate_hz: int = 8000) -> None:
+    """Overlay the agent timeline on top of the caller timeline at the
+    correct offsets, sample-by-sample (audioop.add). Produces a single
+    'as the room sounded' WAV — perfect for listening back and for
+    feeding a single audio stream to the offline transcript model."""
+    bytes_per_sec = rate_hz * 2  # 16-bit mono
+    caller_bytes = b"".join(caller_frames)
+    span_s = total_s
+    if agent_chunks:
+        last = agent_chunks[-1]
+        span_s = max(span_s, last[0] + (len(last[1]) / bytes_per_sec))
+    span_s = max(span_s, len(caller_bytes) / bytes_per_sec)
+    total_bytes = int(span_s * bytes_per_sec)
+    if total_bytes <= 0:
+        return
+    path.parent.mkdir(parents=True, exist_ok=True)
+
+    mixed = bytearray(total_bytes)
+    # Lay the caller down first.
+    n = min(len(caller_bytes), total_bytes)
+    mixed[:n] = caller_bytes[:n]
+    # Then add the agent chunks on top.
+    for offset_s, chunk in agent_chunks:
+        start = int(offset_s * bytes_per_sec) & ~1
+        end = start + len(chunk)
+        if end > len(mixed):
+            mixed.extend(b"\x00" * (end - len(mixed)))
+        existing = bytes(mixed[start:end])
+        if len(existing) < len(chunk):
+            existing = existing + b"\x00" * (len(chunk) - len(existing))
+        try:
+            summed = audioop.add(existing, chunk, 2)
+        except audioop.error:
+            summed = chunk
+        mixed[start:start + len(summed)] = summed
+    with wave.open(str(path), "wb") as w:
+        w.setnchannels(1)
+        w.setsampwidth(2)
+        w.setframerate(rate_hz)
+        w.writeframes(bytes(mixed))
 
 
 def _save_recording(session: CallSession) -> Optional[str]:
@@ -817,6 +906,7 @@ def _save_recording(session: CallSession) -> Optional[str]:
 
     ended_at = time.time()
     started_at = session.started_at
+    duration_s = max(0.0, ended_at - started_at)
     ts = time.strftime("%Y%m%dT%H%M%S", time.localtime(started_at))
     dir_id = f"{ts}_{session.call_id}"
     call_dir = _CALLS_DIR / dir_id
@@ -826,20 +916,27 @@ def _save_recording(session: CallSession) -> Optional[str]:
     except Exception:
         logger.exception("write caller.wav failed")
     try:
-        _write_wav(call_dir / "agent.wav", session._agent_pcm8k)
+        _write_agent_wav(call_dir / "agent.wav", session._agent_pcm8k, duration_s)
     except Exception:
         logger.exception("write agent.wav failed")
+    try:
+        _write_mixed_wav(call_dir / "mixed.wav", session._caller_pcm8k,
+                         session._agent_pcm8k, duration_s)
+    except Exception:
+        logger.exception("write mixed.wav failed")
 
     meta = {
         "id":            dir_id,
         "call_id":       session.call_id,
         "started_at":    started_at,
         "ended_at":      ended_at,
-        "duration_s":    int(ended_at - started_at),
+        "duration_s":    int(duration_s),
         "peer":          session.peer,
         "uuid":          session.uuid,
         "caller_phone":  session.caller_phone,
         "turns":         list(session.turns),
+        "enhanced_turns": None,           # filled in by background task
+        "enhanced_status": "pending",     # pending → running → done | failed
         "persona_chars": len(load_persona()),
         "kb_chars":      len(load_kb()),
         "voice":         state.cda_voice or "Aoede",
@@ -880,8 +977,13 @@ def list_saved_calls(limit: int = 100) -> list[dict]:
             "peer":         meta.get("peer"),
             "caller_phone": meta.get("caller_phone"),
             "turn_count":   len(meta.get("turns") or []),
+            "enhanced_status":     meta.get("enhanced_status") or (
+                "done" if meta.get("enhanced_turns") else "pending"
+            ),
+            "enhanced_turn_count": len(meta.get("enhanced_turns") or []),
             "has_caller_wav": (call_dir / "caller.wav").exists(),
             "has_agent_wav":  (call_dir / "agent.wav").exists(),
+            "has_mixed_wav":  (call_dir / "mixed.wav").exists(),
         })
     rows.sort(key=lambda r: r.get("started_at") or 0, reverse=True)
     return rows[:limit]
@@ -900,12 +1002,145 @@ def load_saved_call(call_id: str) -> Optional[dict]:
 
 
 def call_audio_path(call_id: str, side: str) -> Optional[Path]:
-    """Resolve the WAV path for one side ('caller' or 'agent'). Returns
-    None if the file doesn't exist — caller should 404."""
-    if side not in ("caller", "agent"):
+    """Resolve the WAV path for one side ('caller', 'agent', or 'mixed').
+    Returns None if the file doesn't exist — caller should 404."""
+    if side not in ("caller", "agent", "mixed"):
         return None
     p = _CALLS_DIR / call_id / f"{side}.wav"
     return p if p.exists() else None
+
+
+# ============================================================================
+# Offline transcript enhancement — Gemini "audio understanding"
+# ============================================================================
+# Gemini Live's live transcription is approximate and sometimes mis-renders
+# the Arabic / English mix. After the call ends we re-transcribe the mixed
+# WAV with a non-Live Gemini model (response_schema = list of turns) and
+# patch meta.json with `enhanced_turns`. The History page prefers that
+# field when it's present and falls back to the live transcript otherwise.
+
+_ENHANCE_MODELS = [
+    "gemini-2.5-flash",
+    "gemini-2.0-flash",
+    "gemini-1.5-flash",
+]
+
+
+def _patch_meta(call_dir: Path, patch: dict) -> None:
+    meta_path = call_dir / "meta.json"
+    try:
+        meta = json.loads(meta_path.read_text(encoding="utf-8"))
+    except Exception:
+        return
+    meta.update(patch)
+    try:
+        meta_path.write_text(
+            json.dumps(meta, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+    except Exception:
+        logger.exception("patch meta.json failed for %s", call_dir.name)
+
+
+async def _enhance_transcript(call_dir_id: str) -> None:
+    """Re-transcribe mixed.wav with Gemini offline and store the result
+    on disk as `enhanced_turns`. Best-effort — never raises."""
+    call_dir = _CALLS_DIR / call_dir_id
+    mixed_path = call_dir / "mixed.wav"
+    if not mixed_path.exists():
+        _patch_meta(call_dir, {"enhanced_status": "failed",
+                               "enhanced_error": "mixed.wav missing"})
+        return
+    if not state.gemini_api_key:
+        _patch_meta(call_dir, {"enhanced_status": "failed",
+                               "enhanced_error": "Gemini API key not set"})
+        return
+
+    _patch_meta(call_dir, {"enhanced_status": "running"})
+    try:
+        wav_bytes = mixed_path.read_bytes()
+        client = genai.Client(api_key=state.gemini_api_key)
+        audio_part = types.Part.from_bytes(
+            data=wav_bytes, mime_type="audio/wav",
+        )
+        prompt = (
+            "This is a phone-call recording between a Saudi clinic "
+            "receptionist named Layla (الوكيل / agent — usually Arabic, "
+            "may switch to English) and a caller (المتصل / caller). "
+            "Produce an accurate, faithful transcript as a JSON array of "
+            "turns in the order they were spoken. Each turn object has "
+            "two keys:\n"
+            "  - role: \"agent\" or \"caller\"\n"
+            "  - text: what was actually said, preserving the original "
+            "language (Arabic stays Arabic, English stays English). Do "
+            "NOT translate. Do NOT paraphrase. Do NOT add commentary.\n"
+            "Merge consecutive utterances from the same speaker. Skip "
+            "silence, breathing, and DTMF tones. If a section is "
+            "unintelligible, write [unintelligible] for that turn's text."
+        )
+        schema = types.Schema(
+            type=types.Type.ARRAY,
+            items=types.Schema(
+                type=types.Type.OBJECT,
+                properties={
+                    "role": types.Schema(
+                        type=types.Type.STRING,
+                        enum=["agent", "caller"],
+                    ),
+                    "text": types.Schema(type=types.Type.STRING),
+                },
+                required=["role", "text"],
+            ),
+        )
+        cfg = types.GenerateContentConfig(
+            response_mime_type="application/json",
+            response_schema=schema,
+        )
+
+        last_err: Optional[Exception] = None
+        text: Optional[str] = None
+        for model in _ENHANCE_MODELS:
+            try:
+                resp = await client.aio.models.generate_content(
+                    model=model,
+                    contents=[audio_part, prompt],
+                    config=cfg,
+                )
+                text = getattr(resp, "text", None)
+                if text:
+                    break
+            except Exception as e:
+                last_err = e
+                logger.warning("enhance %s: model %s failed: %s",
+                               call_dir_id, model, e)
+                continue
+        if not text:
+            raise last_err or RuntimeError("no model returned text")
+
+        turns = json.loads(text)
+        if not isinstance(turns, list):
+            raise ValueError("model output is not a JSON array")
+        clean: list[dict] = []
+        for t in turns:
+            if not isinstance(t, dict): continue
+            role = str(t.get("role") or "").strip().lower()
+            body = str(t.get("text") or "").strip()
+            if role not in ("agent", "caller") or not body:
+                continue
+            clean.append({"role": role, "text": body})
+
+        _patch_meta(call_dir, {
+            "enhanced_turns":  clean,
+            "enhanced_status": "done",
+            "enhanced_error":  None,
+        })
+        logger.info("enhance %s: stored %d turns", call_dir_id, len(clean))
+    except Exception as e:
+        logger.exception("enhance %s failed", call_dir_id)
+        _patch_meta(call_dir, {
+            "enhanced_status": "failed",
+            "enhanced_error":  f"{type(e).__name__}: {e}",
+        })
 
 
 def delete_saved_call(call_id: str) -> bool:
