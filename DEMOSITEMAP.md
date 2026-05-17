@@ -150,15 +150,22 @@ other on disk:
 ```
 
 Future verticals add more siblings (`prime-mate-restaurant/`,
-`prime-mate-gym/`, etc.). All commands below assume your working
-directory is the **parent folder** (`New Projects 2026/`).
+`prime-mate-gym/`, etc.).
+
+All snippets below use an absolute `PW_ROOT` variable so they work
+**from any working directory** — including from inside one of the
+repos. Set it once per shell (or add to `~/.zshrc`):
+
+```bash
+export PW_ROOT="$HOME/Documents/New Projects 2026"
+```
 
 ### Pull every repo at once
 
 ```bash
 for repo in PWDemoMaster prime-mate-clinic; do
   echo "=== $repo ==="
-  (cd "$repo" && git pull --ff-only) || break
+  (cd "$PW_ROOT/$repo" && git pull --ff-only) || break
 done
 ```
 
@@ -171,39 +178,39 @@ didn't ask for).
 ```bash
 for repo in PWDemoMaster prime-mate-clinic; do
   echo "=== $repo ==="
-  (cd "$repo" && git status --short --branch)
+  (cd "$PW_ROOT/$repo" && git status --short --branch)
 done
 ```
 
 ### Push every repo at once
 
-Push only sends already-committed work. Run from the parent folder
-after you've staged + committed in each repo:
+Push only sends already-committed work. Run after you've staged +
+committed in each repo:
 
 ```bash
 for repo in PWDemoMaster prime-mate-clinic; do
   echo "=== $repo ==="
-  (cd "$repo" && git push)
+  (cd "$PW_ROOT/$repo" && git push)
 done
 ```
 
 ### Full "edit Lovable source → ship" pipeline (one block, copy-paste)
 
 Whenever you change clinic React source, this gets the change all the
-way to the deployed bundle on both repos. Run from the **parent
-folder**:
+way to the deployed bundle on both repos. Works from any directory
+(uses the absolute `PW_ROOT` from above):
 
 ```bash
 # 1. Commit + push the Lovable source repo
-(cd prime-mate-clinic && git add -A && git commit -m "DESCRIBE THE CHANGE" && git push)
+(cd "$PW_ROOT/prime-mate-clinic" && git add -A && git commit -m "DESCRIBE THE CHANGE" && git push)
 
 # 2. Rebuild the SPA, replace the deployed bundle in PWDemoMaster
-(cd prime-mate-clinic && rm -rf dist && npm run build) \
-  && rm -rf PWDemoMaster/frontend/demos/clinic/* \
-  && cp -r prime-mate-clinic/dist/client/* PWDemoMaster/frontend/demos/clinic/
+(cd "$PW_ROOT/prime-mate-clinic" && rm -rf dist && npm run build) \
+  && rm -rf "$PW_ROOT/PWDemoMaster/frontend/demos/clinic/"* \
+  && cp -r "$PW_ROOT/prime-mate-clinic/dist/client/"* "$PW_ROOT/PWDemoMaster/frontend/demos/clinic/"
 
 # 3. Commit + push PWDemoMaster
-(cd PWDemoMaster && git add frontend/demos/clinic && git commit -m "Rebuild clinic SPA" && git push)
+(cd "$PW_ROOT/PWDemoMaster" && git add frontend/demos/clinic && git commit -m "Rebuild clinic SPA" && git push)
 ```
 
 (Replace the commit messages with something meaningful, obviously.)
@@ -215,8 +222,8 @@ every repo. Adjust the `_PW_REPOS` list when new vertical repos are
 added:
 
 ```bash
+export PW_ROOT="$HOME/Documents/New Projects 2026"
 _PW_REPOS=(PWDemoMaster prime-mate-clinic)
-_PW_ROOT="$HOME/Documents/New Projects 2026"
 
 pw() {
   local cmd="$1"
@@ -224,7 +231,7 @@ pw() {
     pull|status|push|fetch)
       for r in "${_PW_REPOS[@]}"; do
         echo "=== $r ==="
-        (cd "$_PW_ROOT/$r" && git "$cmd")
+        (cd "$PW_ROOT/$r" && git "$cmd")
       done ;;
     *)
       echo "usage: pw {pull|status|push|fetch}" >&2
