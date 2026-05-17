@@ -665,6 +665,142 @@ memory and 6× the lifecycle bookkeeping.
 
 ---
 
+## 6b. Clinic Live Agent — IMPLEMENTED (per-vertical port, the fallback model)
+
+We went with the **per-vertical-port fallback** for the Clinic demo —
+not UUID multiplexing — because it isolates the demo from the admin
+SLA / SLR services and lets a single FreePBX install grow one
+vertical at a time without touching shared code.
+
+### Port allocation (locked)
+
+| Service                                 | Port  | State namespace |
+| --------------------------------------- | ----- | --------------- |
+| Admin Live Assistant (SLA)              | 8090  | `sla_*`         |
+| Admin Live Representative (SLR / Lena)  | 8091  | `slr_*`         |
+| **Clinic Demo Live Agent (Layla)**      | **8092** | **`cda_*`**  |
+| Restaurant Demo Live Agent (future)     | 8093  | `rda_*`         |
+| Gym / School / Developer / Gas Station  | 8094–8097 | …          |
+
+8090 and 8091 are reserved for the PWDemoMaster admin app — the
+clinic demo and every future vertical demo claims the next free port
+above them.
+
+### Code map
+
+- `backend/app/demos/clinic/live_agent.py`
+  - `ClinicLiveAgentService` — TCP listener + per-call dispatch +
+    pub/sub bus for the Dashboard WebSocket.
+  - `CallSession` — AudioSocket framing, audio resample, Gemini Live
+    session, transcription forwarding, deadline-killer.
+  - `load_persona() / load_kb() / save_persona() / save_kb()` —
+    on-disk overrides at `data/demos/clinic/persona.txt` and
+    `…/kb.txt`. Default seeds in the same module (kept in sync with
+    the Clinic SPA's `clinicLiveData.ts` seeds).
+- `backend/app/demos/clinic/router.py` — REST surface:
+  - `GET/POST /api/demo/clinic/agent/config`  — toggle, host, port,
+    voice, greeting, max_call_s, interruption_enabled.
+  - `GET /api/demo/clinic/agent/status` — service running flag, host
+    + port, list of active calls, persona/KB char counts, gemini-key
+    flag.
+  - `GET/POST /api/demo/clinic/agent/prompt` — read / write the
+    persona + KB texts.
+  - `WS /api/demo/clinic/agent/ws` — push `call_started` /
+    `call_ended` / `transcript` events for the Dashboard.
+- `backend/app/core/state.py` — `cda_*` fields (enabled, bind_host,
+  bind_port = 8092, voice = "Aoede", greeting (Arabic), max_call_s,
+  interruption_enabled). Persisted to `data/state.json`.
+- `backend/app/main.py` — `clinic_live_agent_service.apply_config()`
+  at lifespan startup; `.stop()` at shutdown.
+
+### Frontend wiring
+
+The Clinic SPA's Knowledge Base + Persona pages each gain an
+**"Apply to Live Agent"** button (`src/components/PromptEditor.tsx`).
+Clicking it POSTs the saved body to `/api/demo/clinic/agent/prompt`,
+which writes the file. The service rereads from disk on every
+inbound call so no restart is needed to roll out an updated prompt.
+
+The button is disabled while the editor has unsaved changes — Save
+first, then Apply.
+
+### FreePBX dialplan (Clinic — extension 9001)
+
+Add to `/etc/asterisk/extensions_custom.conf` on the FreePBX box:
+
+```ini
+[pwdemo-clinic-agent]
+exten => s,1,NoOp(Clinic Live Agent — Layla)
+ same => n,Answer()
+ same => n,Set(AUDIOSOCKET_UUID=clinic-demo-00000000-0000-0000-0000-000000000001)
+ same => n,AudioSocket(${AUDIOSOCKET_UUID},192.168.100.89:8092)
+ same => n,Hangup()
+```
+
+(Replace `192.168.100.89` with the IP of the machine running
+PWDemoMaster.)
+
+Then in the FreePBX UI:
+
+1. **Admin → Custom Destinations** → add target
+   `pwdemo-clinic-agent,s,1`, description `Clinic Live Agent`.
+2. **Applications → Misc Applications** → add feature code `9001`,
+   destination = the Custom Destination above.
+3. Submit + Apply Config.
+4. SSH the FreePBX box and reload Asterisk:
+
+   ```bash
+   /usr/sbin/asterisk -rx "module reload chan_audiosocket app_audiosocket"
+   /usr/sbin/asterisk -rx "dialplan reload"
+   ```
+
+5. From any registered SIP extension, dial `9001`. The call lands
+   on AudioSocket port 8092, the backend opens a Gemini Live
+   session with the current clinic persona + KB, and Layla picks up
+   with the Arabic greeting.
+
+### Backend deploy steps (one-time per machine)
+
+```bash
+# 1. Pull the latest backend code
+cd "$PW_ROOT/PWDemoMaster"
+git pull --ff-only
+
+# 2. (no new Python deps were added — same .venv)
+# 3. Make sure the data dir exists for prompt overrides
+mkdir -p data/demos/clinic
+
+# 4. Enable the agent in state.json (or via the UI):
+curl -s -X POST http://localhost:8080/api/demo/clinic/agent/config \
+  -H "content-type: application/json" \
+  -d '{"enabled": true, "bind_port": 8092}'
+
+# 5. Restart the FastAPI backend so the lifespan picks up the new
+#    service (./run.sh, or whatever wrapper you use).
+# 6. Sanity-check the listener is up:
+lsof -nP -iTCP:8092 -sTCP:LISTEN     # macOS / BSD
+# or: ss -lntp | grep 8092            # Linux
+```
+
+### Open follow-ups (not in this commit)
+
+- **Function-call tools** for the agent — `lookup_patient(phone | file)`,
+  `list_free_slots(date, clinic_id)`, `create_appointment(...)`,
+  `cancel_appointment(id)`. Each one needs the backend to mirror /
+  query the clinic data layer; the SPA currently keeps everything in
+  the browser's localStorage, so the bridge is either:
+  (a) move the data to backend (`data/demos/clinic/{patients,appointments}.json`),
+  (b) have the SPA push snapshots to the backend on dashboard load,
+  (c) keep agent stateless and surface only the persona + KB (today).
+  Option (a) is the productisation path; (c) is the current MVP.
+- **Activity feed sync** — the Clinic SPA's Dashboard activity feed
+  is purely client-side. Once the function tools land, the agent's
+  real actions should publish into the same `agent_activity`
+  collection (via `/api/demo/clinic/agent/ws` events) so they show
+  up live without needing the Simulate buttons.
+
+---
+
 ## 7. Open decisions to lock before Phase 1
 
 1. **First two verticals to build end-to-end** — ✅ **Clinic + Restaurant** (locked).

@@ -20,6 +20,7 @@ from .services.sip_live_rep import sip_live_rep_service
 # Per-vertical demo apps (see DEMOSITEMAP.md).
 from .demos import landing as demos_landing
 from .demos.clinic import router as demos_clinic
+from .demos.clinic.live_agent import clinic_live_agent_service
 
 FRONTEND_DIR = Path(__file__).resolve().parents[2] / "frontend"
 DEMOS_DIR = FRONTEND_DIR / "demos"
@@ -35,9 +36,11 @@ async def lifespan(_app: FastAPI):
     await ai_camera_engine.start_engine()
     sip_live_agent_service.apply_config()
     sip_live_rep_service.apply_config()
+    clinic_live_agent_service.apply_config()
     try:
         yield
     finally:
+        await clinic_live_agent_service.stop()
         await sip_live_rep_service.stop()
         await sip_live_agent_service.stop()
         await ai_camera_engine.stop_engine()

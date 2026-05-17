@@ -96,6 +96,22 @@ class State:
             "أهلا فيك معنا، أنا لينا من شركة برايم ويف. كيف فيني ساعدك اليوم؟"
         )
         self.slr_max_call_s: int = 900
+        # ---- Clinic Demo Live Agent (cda_*) ---------------------------------
+        # AudioSocket service dedicated to the Clinic vertical demo (Layla,
+        # the clinic receptionist). Lives on its own port so it never clashes
+        # with the admin demos' SLA (8090) or SLR (8091). Persona + KB are
+        # read from data/demos/clinic/persona.txt and .../kb.txt — the Clinic
+        # SPA's KB / Persona pages publish to those files via the
+        # /api/demo/clinic/agent/prompt endpoint.
+        self.cda_enabled: bool = False
+        self.cda_bind_host: str = "0.0.0.0"
+        self.cda_bind_port: int = 8092
+        self.cda_voice: str = "Aoede"
+        self.cda_greeting: str = (
+            "السلام عليكم، عيادات برايم ميت. أنا ليلى. كيف أقدر أخدمك؟"
+        )
+        self.cda_max_call_s: int = 900
+        self.cda_interruption_enabled: bool = True
         # When true, the agent stops speaking the moment the caller starts
         # (Gemini VAD with HIGH start-of-speech sensitivity, plus we drop the
         # output audio queue). When false, the agent finishes its turn before
@@ -185,6 +201,15 @@ class State:
             self.slr_max_call_s    = int(data.get("slr_max_call_s") or 900)
             if "slr_interruption_enabled" in data:
                 self.slr_interruption_enabled = bool(data.get("slr_interruption_enabled"))
+            # Clinic Demo Live Agent (cda_*)
+            self.cda_enabled       = bool(data.get("cda_enabled"))
+            self.cda_bind_host     = data.get("cda_bind_host") or "0.0.0.0"
+            self.cda_bind_port     = int(data.get("cda_bind_port") or 8092)
+            self.cda_voice         = data.get("cda_voice") or "Aoede"
+            self.cda_greeting      = data.get("cda_greeting") if data.get("cda_greeting") is not None else self.cda_greeting
+            self.cda_max_call_s    = int(data.get("cda_max_call_s") or 900)
+            if "cda_interruption_enabled" in data:
+                self.cda_interruption_enabled = bool(data.get("cda_interruption_enabled"))
             kb = data.get("slr_knowledge")
             if isinstance(kb, str):
                 self.slr_knowledge = kb
@@ -239,6 +264,13 @@ class State:
                         "slr_greeting":         self.slr_greeting,
                         "slr_max_call_s":       self.slr_max_call_s,
                         "slr_interruption_enabled": self.slr_interruption_enabled,
+                        "cda_enabled":          self.cda_enabled,
+                        "cda_bind_host":        self.cda_bind_host,
+                        "cda_bind_port":        self.cda_bind_port,
+                        "cda_voice":            self.cda_voice,
+                        "cda_greeting":         self.cda_greeting,
+                        "cda_max_call_s":       self.cda_max_call_s,
+                        "cda_interruption_enabled": self.cda_interruption_enabled,
                         "slr_knowledge":        self.slr_knowledge,
                         "slr_info_schema":      self.slr_info_schema,
                     },
