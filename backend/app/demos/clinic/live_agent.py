@@ -82,9 +82,10 @@ _TIME_24H = re.compile(
 # /api/demo/clinic/agent/prompt. Service rereads per call so the user
 # doesn't need to restart anything.
 _DATA_DIR = Path(__file__).resolve().parents[4] / "data" / "demos" / "clinic"
-_PERSONA_PATH = _DATA_DIR / "persona.txt"
-_KB_PATH      = _DATA_DIR / "kb.txt"
-_CALLS_DIR    = _DATA_DIR / "calls"
+_PERSONA_PATH     = _DATA_DIR / "persona.txt"
+_KB_PATH          = _DATA_DIR / "kb.txt"
+_ESCALATION_PATH  = _DATA_DIR / "escalation.json"
+_CALLS_DIR        = _DATA_DIR / "calls"
 
 
 # ============================================================================
@@ -349,6 +350,111 @@ def save_kb(text: str) -> None:
     _KB_PATH.write_text((text or "").strip() + "\n", encoding="utf-8")
 
 
+# ----- Escalation (flag for supervisor) -------------------------------------
+# Operator-editable triggers for when the agent should flag a call for a
+# human supervisor. Persisted to data/demos/clinic/escalation.json so the
+# user can tune them without redeploying the backend. Read per-call (no
+# restart needed) by `_build_system_instruction()` and by the auto-detect
+# pass in CallSession.
+
+DEFAULT_ESCALATION = {
+    "keywords_en": [
+        "manager", "supervisor", "talk to a person", "human being",
+        "speak to a human", "real person", "complaint", "this is ridiculous",
+        "you're useless", "you are useless", "i want to escalate",
+    ],
+    "keywords_ar": [
+        "مدير", "مديرة", "ابغى احكي مع واحد", "ابغى احكي مع بشر",
+        "اريد بشر", "شكوى", "اشتكي", "هذا جنون", "أنت ما تفهم",
+    ],
+    "scenarios": [
+        "The caller has raised their voice or used strong language across multiple turns.",
+        "The caller has asked the same question 3+ times and is clearly not getting what they need.",
+        "The caller mentioned a medical emergency that you cannot triage.",
+        "The caller is threatening to file a complaint or contact regulators.",
+        "You have tried to help but cannot resolve the issue, and continuing would only frustrate the caller more.",
+    ],
+    # The internal PBX extension a supervisor should dial to join a flagged
+    # call. Surfaced on the Dashboard so the operator can pick it up from
+    # their existing softphone with one click. Empty string = no extension
+    # configured; the click-to-dial button is hidden in that case.
+    "supervisor_extension":     "",
+    # PBX integration (Asterisk Manager Interface). Used by the future
+    # backend-originated auto-dial path (panoramisk integration). Stored
+    # here so the operator can edit them from Call Center → Configuration
+    # without touching files. data/demos/clinic/escalation.json is
+    # gitignored, so secrets stay on the machine they were entered on.
+    "ami_host":                 "",
+    "ami_port":                 5038,
+    "ami_username":             "",
+    "ami_secret":               "",
+    # WhatsApp via WasenderApi (https://wasenderapi.com). Per-session
+    # API key — the WhatsApp number is paired once on the WasenderApi
+    # dashboard, after which this key authorises send-message calls.
+    # `wasender_session_id` is needed for the inbox view (message-logs
+    # endpoint takes a session id in its path). Find it on the
+    # WasenderApi dashboard under your paired WhatsApp number; sending
+    # works without it, the inbox does not.
+    # See backend/app/demos/clinic/wasender.py for the wrapper.
+    "wasender_api_key":         "",
+    "wasender_session_id":      "",
+    # Tunables for the backend's auto-detection passes — kept here so the
+    # whole escalation config is editable from a single page.
+    "auto_keyword_match":       True,
+    "auto_on_tool_errors":      True,
+    "tool_error_threshold":     3,
+}
+
+
+def load_escalation_config() -> dict:
+    """Return the operator-saved escalation config, falling back to
+    DEFAULT_ESCALATION when the file is missing / unreadable / malformed.
+    The returned dict has every key from DEFAULT_ESCALATION (so callers
+    can assume all keys exist) — saved overrides merge on top."""
+    cfg = {k: (list(v) if isinstance(v, list) else v) for k, v in DEFAULT_ESCALATION.items()}
+    if _ESCALATION_PATH.exists():
+        try:
+            raw = _ESCALATION_PATH.read_text(encoding="utf-8")
+            data = json.loads(raw)
+            if isinstance(data, dict):
+                for k in cfg:
+                    if k in data and isinstance(data[k], type(cfg[k])):
+                        cfg[k] = data[k]
+        except Exception:
+            logger.exception("failed to read %s — falling back to defaults", _ESCALATION_PATH)
+    return cfg
+
+
+def save_escalation_config(patch: dict) -> dict:
+    """Merge `patch` into the on-disk escalation config and return the
+    new full config. Unknown keys are ignored; type mismatches are
+    silently dropped (the UI is the authority on shape)."""
+    current = load_escalation_config()
+    for k, v in (patch or {}).items():
+        if k not in current:
+            continue
+        if isinstance(current[k], list) and isinstance(v, list):
+            # Coerce list items to str + strip + drop blanks; keeps the
+            # file tidy regardless of whitespace the UI sent.
+            current[k] = [str(x).strip() for x in v if str(x).strip()]
+        elif isinstance(current[k], bool):
+            current[k] = bool(v)
+        elif isinstance(current[k], int) and not isinstance(v, bool):
+            try: current[k] = max(1, int(v))
+            except Exception: pass
+        elif isinstance(current[k], str):
+            # Trim + length-cap; the AMI secret can be up to ~256 chars,
+            # supervisor_extension is short, both fit comfortably under
+            # this ceiling and the cap exists only to prevent abuse.
+            current[k] = str(v or "").strip()[:256]
+    _DATA_DIR.mkdir(parents=True, exist_ok=True)
+    _ESCALATION_PATH.write_text(
+        json.dumps(current, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    return current
+
+
 # Always-on guardrails — appended verbatim after the persona, even if the
 # operator has saved a custom persona via the "Apply to Live Agent" button.
 # Privacy + anti-fabrication are non-negotiable.
@@ -391,6 +497,20 @@ You MUST follow every rule in this block. They are non-negotiable.
   that exact HH:MM on this call. The clinic's hours are bounded —
   if you haven't seen a slot in the tool output, it isn't
   available. Run list_free_slots first; only offer what came back.
+- **Slot discipline is strict — there is no "close to" a slot.**
+  The clinic runs on a fixed 30-minute grid (09:00, 09:30, 10:00 …).
+  If the caller asks for 9:15, 4:45, or "around five", do NOT try to
+  book that time and do NOT round it silently — say "the closest open
+  slot is …" and name an actual HH:MM from your latest list_free_slots
+  result. If you call create_appointment or reschedule_appointment
+  with an off-grid time (e.g. 16:45 when the grid is :00/:30), the
+  tool will reject it and you will have to apologise to the caller —
+  avoid that by never proposing off-grid times in the first place.
+- BEFORE every booking or rescheduling, the LAST tool you should
+  have called is list_free_slots for the day + clinic in question.
+  If the caller drifted to a different day or specialty mid-call,
+  re-run list_free_slots — never reuse a stale result from earlier
+  in the conversation.
 - Specifically: NEVER tell the caller "your appointment is
   confirmed" / "تم حجز موعدك" UNLESS `create_appointment` just
   returned a response containing an `appointment_id`. If it
@@ -405,6 +525,29 @@ You MUST follow every rule in this block. They are non-negotiable.
   complete the record on arrival.
 - Treat "I called the tool" and "the tool returned a value" as
   separate facts. The second is the only one you can quote from.
+
+### Speaking numbers — ALWAYS digit by digit
+When you SAY any of these to the caller, read every digit one at a
+time. Never group them as cardinals like "seven hundred", "twenty
+three", "one thousand". A phone caller hears digits more reliably
+than spoken numerals.
+
+  - Phone numbers          (e.g. +966 5 0 1 2 3 4 5 6 7,
+                            "plus nine six six, five, zero, one, …")
+  - National / Iqama IDs   ("one, zero, four, five, …")
+  - File numbers           ("A, one, two, three, four, five, six")
+  - Appointment IDs        ("A P T, zero, zero, four, two")
+  - One-time codes, slot/room/queue numbers, anything alphanumeric
+
+English example: file_number "A700123" → "A, seven, zero, zero, one,
+two, three" — NEVER "A seven hundred thousand one hundred twenty
+three". Arabic example: "أ، سبعة، صفر، صفر، واحد، اثنين، ثلاثة" —
+NEVER "سبعمية وثلاثة وعشرين".
+
+Exception: ages, durations in minutes/hours, prices, and dates spoken
+naturally ("thirty minutes", "two hours", "thirty riyals", "May
+seventeenth") — those stay as cardinals. The rule applies to
+identifiers, not quantities.
 
 ### Time format — speak 12-hour, with AM/PM
 - Internally the tools use 24-hour time ("13:00", "16:30"). When
@@ -424,8 +567,14 @@ You MUST follow every rule in this block. They are non-negotiable.
   is your job to romanise. Standard transliteration is fine
   (Fahad, Mohammed, Abdulrahman, Aisha …).
 - For `name_ar`: write the exact Arabic spelling the caller gave.
-- For `gender`: infer from the voice / first name / honorifics.
-  Only ask explicitly if you genuinely cannot tell.
+- For `gender`: **NEVER ASK the caller about their gender.**
+  Always INFER it silently from the caller's voice timbre, the first
+  name they gave, and any honorifics they used ("سيد" / "Mr." → male;
+  "سيدة" / "أم" / "Mrs." / "Miss" → female). If you genuinely cannot
+  tell, pass an empty string — reception will fill it in at the desk.
+  An empty gender on the record is fine. A WRONG gender on the record
+  is not — patients find it embarrassing and unprofessional. When in
+  doubt, leave it empty; never guess just to fill the field.
 
 ### Changing an existing booking
 - If the caller asks to CHANGE, MOVE, RESCHEDULE, or CANCEL an
@@ -532,29 +681,107 @@ def _build_roster_block() -> str:
 
 def _build_system_instruction() -> str:
     # Inject the current date + time so the agent never has to invent a
-    # weekday or wonder whether 11:00 "today" has already passed. This
-    # block is regenerated on every inbound call.
+    # weekday or wonder whether 11:00 "today" has already passed. We also
+    # emit tomorrow and day-after-tomorrow precomputed — the agent has
+    # been observed saying "tomorrow is the 15th" when today was the 17th
+    # (off-by-two mental-arithmetic mistake). Giving it the answer in
+    # YYYY-MM-DD form removes the failure mode.
+    import datetime as _dt
     now = time.localtime()
     weekday_en = ["Sunday", "Monday", "Tuesday", "Wednesday",
                   "Thursday", "Friday", "Saturday"][(now.tm_wday + 1) % 7]
     weekday_ar = ["الأحد", "الإثنين", "الثلاثاء", "الأربعاء",
                   "الخميس", "الجمعة", "السبت"][(now.tm_wday + 1) % 7]
+    today_d  = _dt.date(now.tm_year, now.tm_mon, now.tm_mday)
+    tom_d    = today_d + _dt.timedelta(days=1)
+    dat_d    = today_d + _dt.timedelta(days=2)
+    weekday_en_of = lambda d: ["Sunday", "Monday", "Tuesday", "Wednesday",
+                                "Thursday", "Friday", "Saturday"][(d.weekday() + 1) % 7]
+    weekday_ar_of = lambda d: ["الأحد", "الإثنين", "الثلاثاء", "الأربعاء",
+                                "الخميس", "الجمعة", "السبت"][(d.weekday() + 1) % 7]
     current = (
         "\n\n## CURRENT TIME (authoritative — do not invent a different day)\n"
-        f"- Today: {time.strftime('%Y-%m-%d', now)} ({weekday_en} / {weekday_ar})\n"
+        f"- Today: {today_d.isoformat()} ({weekday_en} / {weekday_ar})\n"
+        f"- Tomorrow: {tom_d.isoformat()} ({weekday_en_of(tom_d)} / {weekday_ar_of(tom_d)})\n"
+        f"- Day after tomorrow: {dat_d.isoformat()} ({weekday_en_of(dat_d)} / {weekday_ar_of(dat_d)})\n"
         f"- Right now: {time.strftime('%H:%M', now)} ({time.tzname[0]})\n"
+        "- When the caller says 'tomorrow' / 'بكرة' / 'غداً', use the\n"
+        "  EXACT date from the 'Tomorrow' line above. NEVER recompute\n"
+        "  a date from the weekday name — you have been observed making\n"
+        "  off-by-one and off-by-two errors doing that.\n"
         "- When referring to today say 'اليوم' / 'today' — never the\n"
         "  weekday name on its own.\n"
         "- The `list_free_slots` tool already filters past times and any\n"
         "  slot within the 15-minute booking buffer. Quote ONLY what it\n"
         "  returns."
     )
+    # Escalation triggers — operator-editable. Defines exactly when the
+    # agent should call `flag_for_supervisor`. We render the saved
+    # keywords + scenarios into the prompt every call so changes from
+    # Call Center → Configuration take effect on the next dial without
+    # restarting the service.
+    esc = load_escalation_config()
+    kw_en = [w for w in esc.get("keywords_en", []) if str(w).strip()]
+    kw_ar = [w for w in esc.get("keywords_ar", []) if str(w).strip()]
+    scen  = [s for s in esc.get("scenarios",   []) if str(s).strip()]
+    escalation_block = (
+        "\n\n## ESCALATION — flag for a human supervisor\n"
+        "Use JUDGMENT, not a checklist. Read the situation and call\n"
+        "`flag_for_supervisor(reason, severity)` silently — do NOT tell\n"
+        "the caller you're flagging. Keep talking normally; a supervisor\n"
+        "joins quietly or takes over.\n"
+        "\n"
+        "### When to flag (any of these — interpret broadly, ignore exact wording)\n"
+        "1. The caller sounds **angry, frustrated, upset, sarcastic, or\n"
+        "   raises their voice** — even subtly. Trust your read of the tone.\n"
+        "2. The caller wants to speak to a **human, person, manager,\n"
+        "   supervisor, or anyone other than an AI**. Any language, any\n"
+        "   phrasing — the EXACT WORDS DO NOT MATTER. 'I want a manager',\n"
+        "   'أبغى أحكي مع المدير', 'is there a real person?', 'human please',\n"
+        "   'أحكي مع بشر', 'put me through to someone' — all the same request.\n"
+        "3. The caller is **repeating the same request and not getting\n"
+        "   what they need**, or you've said the same thing 3+ times.\n"
+        "4. The caller mentions a **medical emergency you cannot triage**.\n"
+        "5. The caller **threatens to file a complaint** or contact regulators.\n"
+        "6. You **feel stuck** — multiple tool errors, the situation is\n"
+        "   beyond what your tools can resolve, or continuing would only\n"
+        "   make things worse.\n"
+    )
+    if kw_en or kw_ar or scen:
+        escalation_block += (
+            "\n### Operator-provided hints (illustrative, NOT a closed list)\n"
+            "These are examples of what to watch for, written by the operations\n"
+            "team. Use them as hints — rely on the SITUATION, not exact matches.\n"
+        )
+        if kw_en:
+            escalation_block += "- Example English phrasings: " + ", ".join(f'"{w}"' for w in kw_en) + "\n"
+        if kw_ar:
+            escalation_block += "- Example Arabic phrasings: " + ", ".join(f'"{w}"' for w in kw_ar) + "\n"
+        if scen:
+            escalation_block += "- Scenarios flagged by operations:\n"
+            for s in scen:
+                escalation_block += f"  · {s}\n"
+    escalation_block += (
+        "\n### How to call it\n"
+        "- `reason` = one short sentence the supervisor will read on the\n"
+        "  Dashboard. Be specific: 'Caller asked for manager twice (angry)'.\n"
+        "- `severity` = 'high' for anger, complaints, emergencies, threats\n"
+        "  to escalate. 'normal' otherwise.\n"
+        "- **Re-flag every time a trigger occurs again.** If a supervisor\n"
+        "  acknowledged your earlier flag and the caller is again asking\n"
+        "  for the manager or remains angry, FLAG AGAIN. Multiple flags on\n"
+        "  the same call signal escalating urgency and are NEVER spam.\n"
+        "  Treat each occurrence as fresh — never reason 'I already\n"
+        "  flagged this'.\n"
+    )
+
     return (
         f"{load_persona().strip()}"
         f"{_GUARDRAILS}\n\n"
         f"{load_kb().strip()}"
         f"{_build_roster_block()}"
         f"{current}"
+        f"{escalation_block}"
     )
 
 
@@ -619,6 +846,44 @@ class CallSession:
         # Optional caller phone — populated if the dialplan ever passes
         # CALLERID via an out-of-band channel (TODO; see DEMOSITEMAP).
         self.caller_phone: Optional[str] = None
+        # Supervisor flag — non-None when the agent (or auto-detect)
+        # has raised this call for a human to take over. Snapshots
+        # include it so a Dashboard that connects after the flag was
+        # raised still sees the red row. Cleared by ack_flag().
+        self.active_flag: Optional[dict] = None
+
+    # ----- supervisor flag plumbing ------------------------------------
+    def set_flag(self, flag: dict) -> None:
+        """Mark this call as needing supervisor attention. Broadcasts
+        a `supervisor_flag` event AND persists on the session so that
+        Dashboards that connect later (via snapshot) see the flag too.
+        Re-flagging overwrites — operator sees the latest reason."""
+        payload = {
+            "reason":   str(flag.get("reason") or "").strip() or "(no reason given)",
+            "severity": (flag.get("severity") or "normal").strip().lower(),
+            "source":   flag.get("source") or "agent",
+            "ts":       time.time(),
+        }
+        if payload["severity"] not in ("low", "normal", "high"):
+            payload["severity"] = "normal"
+        self.active_flag = payload
+        self.svc._broadcast({
+            "type":    "supervisor_flag",
+            "call_id": self.call_id,
+            "flag":    payload,
+        })
+
+    def ack_flag(self) -> bool:
+        """Operator-side acknowledgement. Returns True if there was a
+        flag to clear, False otherwise."""
+        if self.active_flag is None:
+            return False
+        self.active_flag = None
+        self.svc._broadcast({
+            "type":    "supervisor_flag_ack",
+            "call_id": self.call_id,
+        })
+        return True
 
     async def _check_fabrications(self, session) -> None:
         """Scan the agent's accumulated transcribed speech for
@@ -829,9 +1094,18 @@ class CallSession:
                     # Capture the raw 8 kHz caller frame before any
                     # resampling — recording stays lossless.
                     self._caller_pcm8k.append(payload)
-                    # Half-duplex gate only when interruption is OFF (mirrors
-                    # the fix landed for sip_live_rep — see its comments).
-                    if not state.cda_interruption_enabled and time.time() < self.echo_until:
+                    # Half-duplex echo gate — always active. Caller audio is
+                    # dropped for ~350ms past the end of the agent's last
+                    # outgoing frame, regardless of interruption mode. The
+                    # gate window is short enough that real barge-in still
+                    # works (the caller's *next* syllable lands as soon as
+                    # the agent stops talking), but blocks the agent's own
+                    # voice from echoing back through speakerphone/weak
+                    # echo-cancellation paths and (a) triggering Gemini's
+                    # VAD into self-interrupting mid-sentence (caused 10s
+                    # voice freezes) and (b) feeding garbage into
+                    # input_transcription (caused weird/garbled words).
+                    if time.time() < self.echo_until:
                         continue
                     pcm16k, self._upstate = audioop.ratecv(
                         payload, _SAMPLE_WIDTH, 1, 8000, 16000, self._upstate,
@@ -906,6 +1180,9 @@ class CallSession:
             "call_id":        self.call_id,
             "broadcast":      self.svc._broadcast,
             "end_requested":  False,
+            # Exposed so `flag_for_supervisor` can mutate the session
+            # state + broadcast in one shot (see CallSession.set_flag).
+            "set_flag":       self.set_flag,
         }
 
         cfg = types.LiveConnectConfig(
@@ -922,10 +1199,15 @@ class CallSession:
             ),
             input_audio_transcription=types.AudioTranscriptionConfig(),
             output_audio_transcription=types.AudioTranscriptionConfig(),
+            # Barge-in: LOW start-of-speech sensitivity so faint echo /
+            # breathing / line noise can't be mis-classified as speech and
+            # cause the agent to self-interrupt (the 10-second voice freeze
+            # symptom). Real caller speech still triggers reliably; the
+            # always-on echo gate above is belt to LOW's braces.
             realtime_input_config=types.RealtimeInputConfig(
                 automatic_activity_detection=types.AutomaticActivityDetection(
                     disabled=not bool(state.cda_interruption_enabled),
-                    start_of_speech_sensitivity=types.StartSensitivity.START_SENSITIVITY_HIGH,
+                    start_of_speech_sensitivity=types.StartSensitivity.START_SENSITIVITY_LOW,
                     end_of_speech_sensitivity=types.EndSensitivity.END_SENSITIVITY_HIGH,
                     silence_duration_ms=600,
                     prefix_padding_ms=200,
@@ -1213,9 +1495,17 @@ class ClinicLiveAgentService:
                 "duration_s": int(time.time() - c.started_at),
                 "heard":      c.heard_text[-400:],
                 "spoken":     c.spoken_text[-400:],
+                # Replayed on (re)connect so dashboards that came online
+                # AFTER a supervisor flag was raised still see the red row.
+                "flag":       c.active_flag,
             }
             for c in self._calls.values()
         ]
+
+    def get_call(self, call_id: str) -> Optional[CallSession]:
+        """Look up a live CallSession by id — used by the router's
+        acknowledge_flag endpoint."""
+        return self._calls.get(call_id)
 
     def apply_config(self) -> None:
         """Idempotent — call after edits to cda_enabled / host / port."""

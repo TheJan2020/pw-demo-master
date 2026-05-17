@@ -10,6 +10,19 @@ __pycache__/
 # Project state — contains tokens & API keys, must not be committed
 data/state.json
 
+# Per-vertical demo runtime state — call recordings, patient snapshots,
+# escalation.json (AMI secret + WhatsApp API key). Per-machine, never
+# travels through git. The other machine re-enters credentials via the
+# Configuration page; see TOCOPY.md.
+data/demos/
+
+# AI-Camera runtime — snapshot images + iteration logs accumulate
+# constantly; not source.
+data/ai_camera/
+
+# Claude Code's local-only permission settings — per-machine, not source.
+.claude/settings.local.json
+
 # Node (in case we add it later)
 node_modules/
 

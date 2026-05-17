@@ -89,6 +89,42 @@ def _normalize_phone(s: str) -> str:
     return _DIGITS.sub("", s or "")
 
 
+def _format_saudi_mobile(s: str) -> str:
+    """Canonicalise Saudi mobile input to E.164 '+9665XXXXXXXX'.
+
+    Saudi mobiles are 9-digit national numbers that start with 5
+    (e.g. 501234567). Callers say them in lots of shapes:
+
+      "0501234567"            → +966501234567   (national trunk prefix)
+      "501234567"             → +966501234567   (bare 9-digit)
+      "966501234567"          → +966501234567   (country code, no plus)
+      "+966 50 123 4567"      → +966501234567   (already E.164, formatted)
+      "00966501234567"        → +966501234567   (international dial)
+
+    Returns an empty string on anything that isn't a recognisable
+    Saudi mobile (wrong length, wrong leading digit, missing 5-prefix
+    after stripping). Empty is the safe sentinel — the caller record
+    gets created without a phone instead of with a bogus one.
+    """
+    d = _DIGITS.sub("", s or "")
+    if not d:
+        return ""
+    # Drop international access prefix '00' if present.
+    if d.startswith("00"):
+        d = d[2:]
+    # Strip country code if leading.
+    if d.startswith("966"):
+        d = d[3:]
+    # Strip national trunk '0' if leading (only meaningful for a 10-digit
+    # national-format input like 0501234567).
+    if len(d) == 10 and d.startswith("0"):
+        d = d[1:]
+    # What remains must be the 9-digit national number starting with 5.
+    if len(d) != 9 or not d.startswith("5"):
+        return ""
+    return f"+966{d}"
+
+
 def _phones_equal(a: str, b: str) -> bool:
     """Match phones loosely — last 9 digits is enough to handle ±country code."""
     na, nb = _normalize_phone(a), _normalize_phone(b)
@@ -338,7 +374,16 @@ def build_tools() -> list[types.Tool]:
                                                               "an English spelling."),
                     "name_ar":       types.Schema(type=types.Type.STRING,
                                                   description="Full name in Arabic."),
-                    "phone":         types.Schema(type=types.Type.STRING),
+                    "phone":         types.Schema(type=types.Type.STRING,
+                                                  description="Saudi mobile in any "
+                                                              "shape — '0501234567', "
+                                                              "'501234567', "
+                                                              "'+966 50 123 4567'. "
+                                                              "The tool canonicalises "
+                                                              "to '+9665XXXXXXXX' and "
+                                                              "stores '' if it can't "
+                                                              "(wrong length, wrong "
+                                                              "leading digit)."),
                     "id_number":     types.Schema(type=types.Type.STRING),
                     "date_of_birth": types.Schema(type=types.Type.STRING,
                                                   description="YYYY-MM-DD"),
@@ -425,6 +470,37 @@ def build_tools() -> list[types.Tool]:
             ),
         ),
         types.FunctionDeclaration(
+            name="flag_for_supervisor",
+            description=(
+                "Raise a red flag for a human supervisor to take over this "
+                "call. The Dashboard surfaces the flagged row in red with "
+                "the reason you provide. Use this when the caller is angry, "
+                "frustrated, repeatedly misunderstood, threatens to escalate, "
+                "asks for a manager / human, or whenever continuing alone "
+                "would only make things worse. KEEP TALKING to the caller "
+                "after calling this tool — do NOT mention 'I'm flagging this' "
+                "out loud. A supervisor will join silently or take over."
+            ),
+            parameters=types.Schema(
+                type=types.Type.OBJECT,
+                properties={
+                    "reason":   types.Schema(
+                        type=types.Type.STRING,
+                        description="One short sentence the supervisor sees on the "
+                                    "Dashboard, e.g. 'Caller has asked for a manager twice' "
+                                    "or 'Repeated tool failure on appointment lookup'.",
+                    ),
+                    "severity": types.Schema(
+                        type=types.Type.STRING,
+                        description="'high' = drop everything and join now (angry, "
+                                    "complaint, emergency); 'normal' = supervisor should "
+                                    "check in when free. Defaults to 'normal'.",
+                    ),
+                },
+                required=["reason"],
+            ),
+        ),
+        types.FunctionDeclaration(
             name="end_call",
             description="Hang up the call. Use after the caller says goodbye and "
                         "you've spoken your closing line.",
@@ -476,6 +552,8 @@ def execute_tool(name: str, args: dict, ctx: dict) -> dict:
             return _t_reschedule_appointment(args.get("appointment_id") or "",
                                              args.get("new_date") or "",
                                              args.get("new_time") or "", ctx)
+        if name == "flag_for_supervisor":
+            return _t_flag_for_supervisor(args, ctx)
         if name == "end_call":
             return _t_end_call(args.get("reason") or "", ctx)
         return {"error": f"unknown tool: {name}"}
@@ -679,7 +757,13 @@ def _t_create_patient(args: dict, ctx: dict) -> dict:
     patients = snap.get("patients", [])
 
     name = (args.get("name") or "").strip()
-    phone = (args.get("phone") or "").strip()
+    # Whatever shape the caller said the phone in — "0501234567", "+966
+    # 50 123 4567", bare "501234567" — normalize to the canonical Saudi
+    # E.164 "+9665XXXXXXXX". Returns "" on an unrecognisable number so
+    # we don't pollute the record with garbage; reception fixes at the
+    # desk. The agent is told (in GUARDRAILS) to *ask* for the mobile,
+    # but this tool is the final authority on its format.
+    phone = _format_saudi_mobile(args.get("phone") or "")
     id_number = re.sub(r"\D", "", args.get("id_number") or "")
     dob = (args.get("date_of_birth") or "").strip()
     gender = (args.get("gender") or "").strip().lower()
@@ -785,6 +869,25 @@ def _t_create_appointment(args: dict, ctx: dict) -> dict:
         return {"error": "clinic is closed on this day"}
     if _is_break(time_str, day):
         return {"error": "slot falls inside the clinic's break window"}
+
+    # Hard slot-grid check: the requested time MUST be one of the slots
+    # that list_free_slots would have returned for this clinic on this
+    # day (30-minute grid, within open/close window). Catches off-grid
+    # times like "09:17" or "16:45" at the tool layer so the agent
+    # can't book them even if its prompt discipline slips. The list
+    # below comes from the exact same generator list_free_slots uses,
+    # so any discrepancy is structural, not heuristic.
+    valid_slots = _slots_for_day(day)
+    if time_str not in valid_slots:
+        return {
+            "error": (
+                f"slot {time_str} is not on this clinic's "
+                f"{SLOT_MIN}-minute grid for {date} "
+                f"({day.get('open_time')}-{day.get('close_time')}). "
+                f"Call list_free_slots(date={date!r}, clinic_id={clinic_id!r}) "
+                f"and pick from what it returns."
+            ),
+        }
 
     booked = _booked_slots(appts, date, clinic_id)
     blocked = _blocked_slots(overrides, date, clinic_id)
@@ -952,11 +1055,22 @@ def _t_reschedule_appointment(appointment_id: str, new_date: str,
         return {"error": "clinic is closed on the requested day"}
     if _is_break(new_time, day):
         return {"error": "requested slot falls inside the clinic's break window"}
-    # Ensure new_time is within the open window (avoid off-hours bookings).
-    if (_time_to_min(new_time) < _time_to_min(day.get("open_time", "09:00"))
-            or _time_to_min(new_time) + SLOT_MIN > _time_to_min(day.get("close_time", "17:00"))):
-        return {"error": f"requested time {new_time} is outside the clinic's hours "
-                         f"({day.get('open_time')}–{day.get('close_time')})"}
+    # Hard slot-grid check — must be one of list_free_slots's outputs
+    # for this clinic on this day (30-minute grid, within open window).
+    # Stricter than the old open-window check: also rejects off-grid
+    # times like "16:45" that fell inside the window but never showed
+    # up in list_free_slots's result.
+    valid_slots = _slots_for_day(day)
+    if new_time not in valid_slots:
+        return {
+            "error": (
+                f"requested time {new_time} is not on this clinic's "
+                f"{SLOT_MIN}-minute grid for {new_date} "
+                f"({day.get('open_time')}-{day.get('close_time')}). "
+                f"Call list_free_slots(date={new_date!r}, clinic_id={clinic_id!r}) "
+                f"and pick from what it returns."
+            ),
+        }
 
     booked = _booked_slots(
         [a for a in appts if a.get("id") != appointment_id], new_date, clinic_id,
@@ -998,3 +1112,24 @@ def _t_end_call(reason: str, ctx: dict) -> dict:
     logger.info("clinic call %s: end_call requested — reason: %s",
                 ctx.get("call_id"), reason or "(none)")
     return {"ok": True, "reason": reason}
+
+
+def _t_flag_for_supervisor(args: dict, ctx: dict) -> dict:
+    """Tell the CallSession to raise a supervisor flag. The session
+    stores it on itself (so snapshot replay shows it to dashboards that
+    connect later) and broadcasts a `supervisor_flag` WS event."""
+    reason = (args.get("reason") or "").strip() or "(no reason given)"
+    severity = (args.get("severity") or "").strip().lower()
+    if severity not in ("low", "normal", "high"):
+        severity = "normal"
+    set_flag = ctx.get("set_flag")
+    if not callable(set_flag):
+        # Backward-safety: shouldn't happen in production, but log loudly
+        # so a regression is obvious instead of silently swallowed.
+        logger.warning("clinic call %s: flag_for_supervisor invoked but ctx[set_flag] missing",
+                       ctx.get("call_id"))
+        return {"error": "flag handler not wired"}
+    set_flag({"reason": reason, "severity": severity, "source": "agent"})
+    logger.info("clinic call %s: supervisor flag raised (%s) — %s",
+                ctx.get("call_id"), severity, reason)
+    return {"ok": True, "reason": reason, "severity": severity}

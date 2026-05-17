@@ -1024,7 +1024,7 @@ Navigating between Dashboard / Patients / Configuration etc. no
 longer tears down the connection or wipes the in-flight transcript —
 state survives until the call ends (or the browser does a full reload).
 
-### Open follow-ups (not in this commit)
+### Open follow-ups (not in §6b)
 - **SIP CALLERID → AudioSocket UUID**: the agent doesn't currently
   receive the caller's phone number — `chan_audiosocket` only
   carries audio + a UUID. To enable `lookup_patient_by_phone` we
@@ -1045,6 +1045,296 @@ state survives until the call ends (or the browser does a full reload).
   collection (via `/api/demo/clinic/agent/ws` events that include
   the patient_id / appointment_id) so they show up live and remain
   cascade-deletable from the dashboard.
+
+---
+
+## 6c. Clinic Live Agent — supervisor escalation + dial-in (IMPLEMENTED)
+
+End-to-end "the agent flags a call, a human supervisor joins via AMI"
+feature. The dial-in supports three modes: **Listen** (silent monitor),
+**Whisper** (talk to the caller only), **Barge** (3-way — caller and
+agent both hear the supervisor). Built on top of §6b.
+
+### What the operator experiences
+
+1. On the **Dashboard** (`/demo/clinic/call-center/dashboard`), every
+   active call row has a 3-button group: `[👂 Listen | 💬 Whisper | 📣 Barge]`.
+   They sit in the Status column next to the duration counter.
+2. The agent can flag a call when the caller is angry, asks for a
+   manager, or the agent is stuck. Flagged rows paint **red** with a
+   banner showing the reason, plus the same 3-button group + an
+   **Acknowledge** button that clears the flag.
+3. Click any of the 3 buttons → backend issues an AMI Originate →
+   supervisor's phone rings → on answer they're in the live call with
+   the chosen audio policy.
+4. If AMI isn't reachable / creds are wrong, the button falls back to
+   **copy-to-clipboard** and surfaces the error in its tooltip — so the
+   demo never gets stuck.
+
+### Backend pieces
+
+| File | Purpose |
+| --- | --- |
+| `backend/app/demos/clinic/live_agent.py` | `DEFAULT_ESCALATION` constant + `load_escalation_config()` / `save_escalation_config()` for the operator-editable config persisted at `data/demos/clinic/escalation.json`. `CallSession.set_flag()` / `ack_flag()` + `active_flag` field. `_build_system_instruction()` injects the **ESCALATION** block (operator-saved keywords + scenarios) into every per-call prompt. |
+| `backend/app/demos/clinic/agent_tools.py` | `flag_for_supervisor(reason, severity)` function tool declaration + dispatch + `_t_flag_for_supervisor` handler. The handler calls `ctx["set_flag"](…)` which CallSession exposed. |
+| `backend/app/demos/clinic/ami.py` | **NEW.** Minimal pure-asyncio AMI client (no `panoramisk` dep). `AMICredentials` dataclass + `AMIClient.originate()` + `AMIClient.core_show_channels()` + `AMIService.dial_supervisor(call_id, ext, spy_mode)` which: (1) finds the channel running the AudioSocket application via `CoreShowChannels`, (2) originates `Local/{ext}@from-internal/n` with `Application: ChanSpy, Data: <target>,<opts>`, (3) falls back to ring+`Playback,beep` if no AudioSocket channel found. |
+| `backend/app/demos/clinic/router.py` | New endpoints: **`GET/POST /api/demo/clinic/agent/escalation`** (config read/write — partial PATCH allowed), **`POST /api/demo/clinic/agent/calls/{call_id}/acknowledge_flag`**, **`POST /api/demo/clinic/agent/calls/{call_id}/dial_supervisor?mode={listen,whisper,barge}`**. |
+
+WebSocket events on `/api/demo/clinic/agent/ws`:
+- `supervisor_flag` — `{call_id, flag: {reason, severity, source, ts}}`. Emitted by `CallSession.set_flag`.
+- `supervisor_flag_ack` — `{call_id}`. Emitted by `CallSession.ack_flag`.
+- Snapshot replay (sent on every connect) includes per-call `flag` so dashboards that come online AFTER a flag was raised still see the red row.
+
+### Frontend pieces
+
+| File | Purpose |
+| --- | --- |
+| `src/lib/liveAgentStore.ts` | New `SupervisorFlag` type + `supervisorFlags: Record<call_id, SupervisorFlag>` in store state. Handlers for `supervisor_flag` / `supervisor_flag_ack`. Exported `acknowledgeFlag(callId)` — optimistic remove + POST, restores on failure. `call_ended` cleans up any leftover flag. |
+| `src/routes/_app.call-center.dashboard.tsx` | Three new components: `LiveCallsTable` (replaced the old 2-card layout with a unified multi-call table; yellow/green/red tinting; click-to-expand inline transcript drawer), `FlagBanner` (red strip with reason + Ack + dial buttons), `DialModeButtons` / `DialModeOne` (the 3-button group with state machine: idle → calling → ringing → idle; copy-to-clipboard fallback on AMI error). Also `looksLikeGarbage(text)` — frontend filter that hides Gemini mis-transcriptions (CJK / Cyrillic / Greek in a Saudi-Arabic call) with an `[unintelligible audio]` placeholder. |
+| `src/routes/_app.call-center.configuration.tsx` | New self-contained `EscalationConfigCard` at the bottom of the Configuration page. Edits `escalation.json` via the GET/POST endpoint. Sections: **Supervisor extension** → **PBX integration (AMI)** subsection (host / port / username / secret) → **Keyword examples** EN/AR (illustrative, not exact-match triggers) → **Scenarios** (free-text rules the agent reads) → **Auto-detect** toggles (placeholders; auto-detect code itself is a future increment). |
+
+### Storage — `data/demos/clinic/escalation.json` (gitignored)
+
+```jsonc
+{
+  "keywords_en": ["manager", "supervisor", "speak to a human", ...],
+  "keywords_ar": ["مدير", "مديرة", "اريد بشر", ...],
+  "scenarios":   ["The caller has raised their voice...", ...],
+  "supervisor_extension": "1003",       // PBX ext that gets dialed
+  "ami_host":             "192.168.100.23",
+  "ami_port":             5038,
+  "ami_username":         "pwdemo-clinic",
+  "ami_secret":           "<40-char hex>",
+  "auto_keyword_match":   true,         // toggle reserved for future code
+  "auto_on_tool_errors":  true,         // ditto
+  "tool_error_threshold": 3
+}
+```
+
+This file is **per-machine**. Re-enter the AMI host / username / secret
+on each machine via the Configuration page — `data/` is gitignored, the
+secret never travels through git.
+
+### Per-machine setup checklist — FreePBX (one-time per PBX)
+
+The PBX-side bits aren't in our repo. Do them once per FreePBX
+deployment:
+
+**1. Asterisk Manager Interface (AMI) — bind address**
+
+By default FreePBX 16+ binds AMI to `127.0.0.1` only. Our backend lives
+on a different host, so this must change:
+
+- FreePBX UI: **Settings → Advanced Settings** → flip *"Display Readonly Settings"* + *"Override Readonly Settings"* to **Yes** → search `AMI` → set **AMI bind address** to `0.0.0.0` → **Submit** → red **Apply Config** bar.
+- Or SSH: edit `/etc/asterisk/manager.conf`, set `bindaddr = 0.0.0.0` in `[general]`, then `/usr/sbin/asterisk -rx "manager reload"`.
+
+Verify from the backend host: `Test-NetConnection <pbx-ip> -Port 5038`
+should return `TcpTestSucceeded : True`.
+
+**2. Manager user**
+
+- FreePBX UI: **Admin → Asterisk Manager Users → Add Manager**
+- **User Name:** `pwdemo-clinic`
+- **Secret:** strong (40+ char hex/base64)
+- **Deny:** `0.0.0.0/0.0.0.0`
+- **Permit:** the BACKEND's IP — e.g. `192.168.100.25/255.255.255.255`, OR the whole LAN `192.168.100.0/255.255.255.0`. ⚠️ **Gotcha:** `0.0.0.0/255.255.255.0` does NOT mean "everyone" — it means "the 0.0.0.0/24 network". Use the actual subnet.
+- **Read:** check `system, call, log, verbose, agent, user, config, command, dtmf, reporting, cdr, dialplan, originate, message`
+- **Write:** same set (originate is the strictly-required one for this feature)
+- **Submit → Apply Config**
+
+Verify auth: on the backend host run
+```bash
+echo -e "Action: Login\r\nUsername: pwdemo-clinic\r\nSecret: <secret>\r\n\r\nAction: Logoff\r\n\r\n" | nc <pbx-ip> 5038
+```
+You want `Response: Success`. If you get `Authentication failed` while
+the secret is right, almost always the Permit IP doesn't include the
+backend (check `/var/log/asterisk/full` for an `ACL` rejection line).
+
+**3. Dialplan — Local-pair wrap for ChanSpy**
+
+`AudioSocket()` run directly on the caller's channel works fine for the
+agent itself, BUT `ChanSpy` won't capture the write side (Gemini's
+voice) because AudioSocket doesn't expose those frames via the
+audiohook framework. Workaround: bridge the caller to a Local channel
+that runs AudioSocket in its other leg — then it's a normal bridge
+ChanSpy understands.
+
+Edit `/etc/asterisk/extensions_custom.conf`:
+
+```ini
+[pwdemo-clinic-agent]
+exten => s,1,NoOp(Clinic Live Agent — Layla)
+ same => n,Answer()
+ same => n,Wait(0.3)
+ same => n,Set(AUDIOSOCKET_UUID=33333333-3333-3333-3333-333333333333)
+ ; Caller is now bridged with a Local/* channel — ChanSpy works.
+ same => n,Dial(Local/${AUDIOSOCKET_UUID}@pwdemo-clinic-audiosocket/n)
+ same => n,Hangup()
+
+[pwdemo-clinic-audiosocket]
+exten => _.,1,NoOp(AudioSocket leg for ${EXTEN})
+ same => n,Answer()
+ same => n,AudioSocket(${EXTEN},192.168.100.25:8092)
+ same => n,Hangup()
+```
+
+(Replace `192.168.100.25` with your backend host's LAN IP.) Reload:
+```bash
+/usr/sbin/asterisk -rx "dialplan reload"
+```
+
+### Per-machine setup checklist — Clinic Configuration page
+
+Once FreePBX is ready, open `/demo/clinic/call-center/configuration` and
+scroll to **Supervisor escalation triggers**:
+
+1. **Supervisor extension** → the PBX extension the operator wants ringing on flag (e.g. `1003`).
+2. **PBX integration (AMI)** subsection:
+   - **AMI host** = FreePBX LAN IP
+   - **AMI port** = `5038`
+   - **AMI username** = `pwdemo-clinic` (or whatever you set above)
+   - **AMI secret** = the secret from step 2 (password-masked input)
+3. **Save** (top-right of the card).
+
+The button states `Saved — takes effect on the next call`. No restart
+needed — the service rereads `escalation.json` on every action.
+
+### How a dial-supervisor click flows end-to-end
+
+```
+[operator clicks Listen / Whisper / Barge]
+  → POST /api/demo/clinic/agent/calls/{call_id}/dial_supervisor?mode={mode}
+  → router.py reads escalation.json (ami_host/user/secret + supervisor_extension)
+  → ami.py AMIService.dial_supervisor():
+       1. Open TCP to ami_host:5038
+       2. Action: Login (drops conn + retries on failure)
+       3. Action: CoreShowChannels  → find channel running app=AudioSocket
+       4. Action: Originate Channel=Local/{ext}@from-internal/n
+                  Application=ChanSpy Data=<target>,<opts>
+                  where <opts> = qso (listen) | qsow (whisper) | qsoB (barge)
+       5. Action: Logoff
+  → returns {ok, mode, target_channel, raw, error}
+  → button shows "Ringing" for 3.5s, then idles
+  → supervisor's phone rings via FreePBX dialplan
+  → on answer, ChanSpy hooks them into the live call
+```
+
+ChanSpy options (`qso[Bw]`):
+
+| Letter | Effect |
+| --- | --- |
+| `q` | quiet — no beep before connecting |
+| `s` | skip the spoken channel-name announcement |
+| `o` | only this channel — don't loop to siblings if it ends |
+| `w` | **whisper** — supervisor's voice goes only to the spied (caller) leg |
+| `B` | **barge** — supervisor's voice goes to BOTH sides of the bridge |
+| (none of w/B) | silent listen — pure monitor |
+
+### Known limits / future work
+
+- **No audio in any mode** without the dialplan refactor above. Symptom: supervisor hears the caller but not Gemini. Fix: the Local-channel pair.
+- **Multi-concurrent calls**: the dial-in picks the most recently started AudioSocket channel. For ≤2 concurrent calls this is fine; for >2 you may need to extend `dial_supervisor` to filter by some per-call key (e.g. caller phone number injected via dialplan).
+- **Auto-detect (keyword match in transcripts + consecutive tool-error counter)** — the Configuration page has the toggles + threshold inputs and they persist, but the backend code that READS them and auto-fires `flag_for_supervisor` without the agent's involvement isn't wired yet. Today the agent decides to flag (per the persona's contextual ESCALATION rules); auto-detect is a server-side belt around those braces.
+
+---
+
+## 6d. Live Agent — recent persona + tool hardening (IMPLEMENTED)
+
+A batch of smaller fixes that landed alongside §6c, all driven by
+real-call regressions. Bundled here so the other machine knows what
+behaviour changed.
+
+### Echo gate + VAD sensitivity (sip_live_rep.py + clinic live_agent.py)
+
+Two services were both freezing for ~10 seconds mid-sentence and
+producing garbled input_audio_transcription output. Root cause: agent
+audio echoing back through speakerphone / weak echo-cancellation →
+caller mic → forwarded to Gemini → high-sensitivity VAD classified it
+as user speech → Gemini self-interrupted. Two changes per service:
+
+- **Echo gate is now always-on**. Caller audio is dropped for ~350ms past the end of the agent's last outgoing frame, regardless of `interruption_enabled`. The gate window is short enough that real barge-in still works — the caller's next syllable lands as soon as the agent stops talking.
+- **`start_of_speech_sensitivity` dropped from `HIGH` → `LOW`**. Faint echo / breathing / line noise no longer trips the speech classifier. End-of-speech sensitivity stays `HIGH` so the agent still notices when the caller stops.
+
+### Frontend transcript garbage filter (`looksLikeGarbage`)
+
+Even with the echo gate, Gemini occasionally hallucinates Korean /
+Chinese / German fragments out of low-energy audio. The Dashboard's
+`LiveCallsTable` filters caller turns where >40% of the non-whitespace
+characters fall outside Arabic + Latin scripts; flagged turns render as
+a dashed muted bubble reading `[unintelligible audio]`. Hides the
+symptom while we leave the upstream audio-quality work for later.
+
+### Persona — context-first escalation
+
+Earlier draft of the ESCALATION block was a keyword checklist. Rewrote
+to **judgment-first**: agent flags whenever the caller sounds angry /
+frustrated / asks for a human / repeats a request / threatens to
+complain / mentions a medical emergency — **interpret broadly, ignore
+exact wording**. Operator-saved keywords/scenarios are still injected
+but now framed as **"Operator-provided hints (illustrative, NOT a
+closed list)"**. The Configuration UI labels match: "Keyword examples"
+not "Keyword triggers".
+
+### Persona — re-flag is encouraged
+
+Earlier draft said "Flag ONCE per cause" — broke the demo when an
+operator acknowledged a flag and the caller again asked for a manager
+(agent thought it had already flagged that cause and stayed silent).
+New rule: **"Re-flag every time a trigger occurs again. Multiple flags
+on the same call signal escalating urgency and are NEVER spam."**
+
+### Persona — date awareness (today + tomorrow + day-after)
+
+Symptom: agent said "tomorrow is the 15th" when today was the 17th.
+Root cause: agent doing mental arithmetic on the weekday name.
+`_build_system_instruction()` now precomputes and injects the three
+absolute dates in `YYYY-MM-DD` form. New rule: *"When the caller says
+'tomorrow' / 'بكرة' / 'غداً', use the EXACT date from the 'Tomorrow'
+line. NEVER recompute from the weekday name."*
+
+### Persona — speak digits one at a time
+
+For phone numbers / national IDs / file numbers / appointment IDs:
+always **digit-by-digit** (`"A, seven, zero, zero"` not `"A seven
+hundred"`). Reason: callers transcribe digits reliably, cardinals
+ambiguously. Exception carved out for natural quantities — durations,
+ages, prices, dates.
+
+### Persona — gender: never ask
+
+Symptom: agent asked a male caller for their gender and recorded the
+answer wrong. New rule (in CRITICAL GUARDRAILS): **NEVER ASK the
+caller about gender**. Always infer from voice timbre + first name +
+honorifics. If genuinely unsure, leave empty — reception fills in at
+the desk. *"An empty gender is fine. A WRONG gender is not."*
+
+### Persona + tool — slot discipline (booking + reschedule)
+
+Symptom: agent offered times like 16:45 when the clinic runs on a
+30-minute grid (16:30, 17:00…), or off-hours like 18:30 when the
+clinic closes at 17:00. Defence in depth:
+
+- **Tool layer** (`agent_tools.py _t_create_appointment` + `_t_reschedule_appointment`): hard-rejected — `time` must be in `_slots_for_day(day)` (the same generator `list_free_slots` uses). The error message tells the agent to re-run `list_free_slots`.
+- **Persona layer** (`_GUARDRAILS`): explicit rule that the clinic runs on a fixed 30-minute grid; never round/snap silently; the last tool you should have called before any booking is `list_free_slots`; re-run if the caller drifts to a different day or specialty.
+
+### Tool — phone normalisation in `create_patient`
+
+`agent_tools.py` `_format_saudi_mobile(s)` canonicalises any reasonable
+Saudi-mobile shape to E.164 `+9665XXXXXXXX`:
+
+| Caller said | Stored as |
+| --- | --- |
+| `0501234567` | `+966501234567` |
+| `501234567` | `+966501234567` |
+| `+966 50 123 4567` | `+966501234567` |
+| `00966 501234567` | `+966501234567` |
+| `0601234567` (wrong prefix) | `""` (empty — reception fixes at desk) |
+| `+1 555 0100` (not Saudi) | `""` |
+
+Validation enforces exactly 9 digits after country code starting with
+`5`. Invalid input stores empty rather than raising — keeps the patient
+record creation succeeding even if the caller can't give a usable
+mobile. 10/10 unit-test cases pass.
 
 ---
 

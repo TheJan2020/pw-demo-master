@@ -277,11 +277,15 @@ class CallSession:
                     logger.warning("call %s: peer error: %r", self.call_id, payload)
                     continue
                 if msg_type == _AS_AUDIO and payload:
-                    # Half-duplex echo gate — only active when interruption
-                    # is OFF. When interruption is ON we always forward caller
-                    # audio so Gemini's VAD can detect speech and signal
-                    # barge-in; the phone network already does echo cancel.
-                    if not state.slr_interruption_enabled and time.time() < self.echo_until:
+                    # Half-duplex echo gate — always active. Caller audio is
+                    # dropped for ~350ms past the end of the agent's last
+                    # outgoing frame, regardless of interruption mode. The
+                    # gate window is short enough that real barge-in still
+                    # works (the caller's *next* syllable lands as soon as
+                    # the agent stops talking), but blocks the agent's own
+                    # voice from echoing back through speakerphone/weak
+                    # echo-cancellation paths and triggering Gemini's VAD.
+                    if time.time() < self.echo_until:
                         continue
                     pcm16k, self._upstate = audioop.ratecv(
                         payload, _SAMPLE_WIDTH, 1, 8000, 16000, self._upstate,
@@ -347,14 +351,17 @@ class CallSession:
             input_audio_transcription=types.AudioTranscriptionConfig(),
             output_audio_transcription=types.AudioTranscriptionConfig(),
             tools=[collect_tool] if collect_tool else None,
-            # Barge-in: with interruption ON we use HIGH start-of-speech
-            # sensitivity so the agent cuts itself off the instant the caller
-            # speaks. With interruption OFF we disable VAD altogether so the
-            # agent finishes its turn before listening.
+            # Barge-in: with interruption ON we use LOW start-of-speech
+            # sensitivity so faint echo/breathing/line-noise doesn't get
+            # mis-classified as speech and cause the agent to interrupt
+            # itself. Real caller speech still triggers reliably; the
+            # always-on echo gate above is the belt to LOW's braces.
+            # With interruption OFF we disable VAD altogether so the agent
+            # finishes its turn before listening.
             realtime_input_config=types.RealtimeInputConfig(
                 automatic_activity_detection=types.AutomaticActivityDetection(
                     disabled=not bool(state.slr_interruption_enabled),
-                    start_of_speech_sensitivity=types.StartSensitivity.START_SENSITIVITY_HIGH,
+                    start_of_speech_sensitivity=types.StartSensitivity.START_SENSITIVITY_LOW,
                     end_of_speech_sensitivity=types.EndSensitivity.END_SENSITIVITY_HIGH,
                     silence_duration_ms=600,
                     prefix_padding_ms=200,
