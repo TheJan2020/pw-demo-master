@@ -29,14 +29,15 @@ import logging
 import re
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Any, Optional
+from typing import Optional
 
 from google.genai import types
 
 logger = logging.getLogger("clinic_agent_tools")
 
-# Snapshot location — matches live_agent.py's _DATA_DIR.
-_DATA_DIR = Path(__file__).resolve().parents[3] / "data" / "demos" / "clinic"
+# Snapshot location — matches live_agent.py's _DATA_DIR (parents[4]
+# from this nested file: clinic→demos→app→backend→<project-root>).
+_DATA_DIR = Path(__file__).resolve().parents[4] / "data" / "demos" / "clinic"
 _SNAPSHOT_PATH = _DATA_DIR / "snapshot.json"
 
 # Booking buffer — don't offer today-slots within this many minutes of now.

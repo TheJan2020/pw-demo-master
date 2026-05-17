@@ -57,7 +57,7 @@ _GEMINI_API_VERSION = "v1alpha"
 # On-disk overrides — the Clinic SPA's KB / Persona pages POST here via
 # /api/demo/clinic/agent/prompt. Service rereads per call so the user
 # doesn't need to restart anything.
-_DATA_DIR = Path(__file__).resolve().parents[3] / "data" / "demos" / "clinic"
+_DATA_DIR = Path(__file__).resolve().parents[4] / "data" / "demos" / "clinic"
 _PERSONA_PATH = _DATA_DIR / "persona.txt"
 _KB_PATH      = _DATA_DIR / "kb.txt"
 _CALLS_DIR    = _DATA_DIR / "calls"
