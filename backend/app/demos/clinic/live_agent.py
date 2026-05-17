@@ -658,7 +658,15 @@ class CallSession:
         # tell legit recall from invention (mentioning the current time,
         # for example, should not trigger a warning).
         if self._issued_slot_times:
-            spoken_times: set[str] = set()
+            # Each spoken time match becomes a SET of plausible
+            # interpretations. A bare "4:30" with no AM/PM marker is
+            # ambiguous — the agent very likely meant 16:30 (clinics
+            # operate afternoons) but the transcription dropped the
+            # "PM". So we accept the match if ANY interpretation
+            # matches the whitelist. Previously the strict-24h read
+            # produced a false positive that told the agent to apologise
+            # for a booking that actually succeeded.
+            spoken_candidates: list[set[str]] = []
             for m in _TIME_AMPM.finditer(self.spoken_text):
                 h = int(m.group(1))
                 mins = int(m.group(2) or 0)
@@ -666,25 +674,36 @@ class CallSession:
                 if ampm == "p" and h < 12: h += 12
                 if ampm == "a" and h == 12: h = 0
                 if h > 23: continue
-                spoken_times.add(f"{h:02d}:{mins:02d}")
+                # AM/PM explicit → single interpretation.
+                spoken_candidates.append({f"{h:02d}:{mins:02d}"})
             for m in _TIME_24H.finditer(self.spoken_text):
-                spoken_times.add(f"{int(m.group(1)):02d}:{int(m.group(2)):02d}")
-            for t in spoken_times:
-                if t in self._issued_slot_times: continue
-                if t in self._corrected_times:   continue
-                # Tolerate ±15 min near a real slot — speech transcription
-                # sometimes mangles ":30" / ":00" and we don't want to
-                # nag for a close miss the caller and agent both agree on.
-                hh, mm = int(t[:2]), int(t[3:])
-                near = False
-                for real in self._issued_slot_times:
-                    rh, rm = int(real[:2]), int(real[3:])
-                    if abs((hh*60 + mm) - (rh*60 + rm)) <= 15:
-                        near = True
+                h = int(m.group(1)); mins = int(m.group(2))
+                options = {f"{h:02d}:{mins:02d}"}
+                if h < 12:
+                    options.add(f"{h + 12:02d}:{mins:02d}")
+                spoken_candidates.append(options)
+
+            def _within_15(a: str, b: str) -> bool:
+                ah, am = int(a[:2]), int(a[3:])
+                bh, bm = int(b[:2]), int(b[3:])
+                return abs((ah * 60 + am) - (bh * 60 + bm)) <= 15
+
+            for options in spoken_candidates:
+                accepted = False
+                for t in options:
+                    if t in self._issued_slot_times:
+                        accepted = True
                         break
-                if near: continue
-                self._corrected_times.add(t)
-                fabricated.append(("slot_time", t))
+                    if any(_within_15(t, real) for real in self._issued_slot_times):
+                        accepted = True
+                        break
+                if accepted:
+                    continue
+                # Pick the primary (sorted) interpretation for the warning.
+                primary = sorted(options)[0]
+                if primary in self._corrected_times: continue
+                self._corrected_times.add(primary)
+                fabricated.append(("slot_time", primary))
 
         if not fabricated:
             return
