@@ -732,10 +732,25 @@ Add to `/etc/asterisk/extensions_custom.conf` on the FreePBX box:
 [pwdemo-clinic-agent]
 exten => s,1,NoOp(Clinic Live Agent — Layla)
  same => n,Answer()
- same => n,Set(AUDIOSOCKET_UUID=clinic-demo-00000000-0000-0000-0000-000000000001)
+ same => n,Wait(0.3)
+ same => n,Set(AUDIOSOCKET_UUID=33333333-3333-3333-3333-333333333333)
  same => n,AudioSocket(${AUDIOSOCKET_UUID},192.168.100.89:8092)
  same => n,Hangup()
 ```
+
+**Two non-obvious things this dialplan gets right:**
+
+1. **The UUID must be a real 36-char UUID** (`8-4-4-4-12` hex with
+   dashes). `app_audiosocket` validates the format and silently
+   hangs up the call if it's anything else. With the per-vertical-port
+   model the UUID is just an opaque per-call id — pick any valid
+   value (we use repeated digits so they're easy to recognise in
+   the AudioSocket service logs: `1111-…` = admin SLA, `2222-…`
+   = admin SLR, `3333-…` = Clinic).
+2. **`Wait(0.3)` between `Answer()` and `AudioSocket(...)`** —
+   without it Asterisk's RTP isn't primed when the TCP connection
+   opens and the first 200–300 ms of audio drops, sometimes causing
+   the call to disconnect.
 
 (Replace `192.168.100.89` with the IP of the machine running
 PWDemoMaster.)
