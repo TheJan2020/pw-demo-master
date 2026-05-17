@@ -68,6 +68,15 @@ _GEMINI_API_VERSION = "v1alpha"
 _FILE_PATTERN = re.compile(r"\b([ABC])[\s\-]*([1-9])(?:[\s\-]*([0-9])){5}\b")
 # Appointment id format: APT-NNN (3+ digits).
 _APT_PATTERN = re.compile(r"\bAPT[\s\-]*[0-9]{3,}\b", re.IGNORECASE)
+# Clock-time spoken in English: "4 PM", "4:30 PM", "16:30", "9 AM",
+# "9:00 am" — captured so the fabrication detector can cross-check
+# against the set of slots list_free_slots actually returned.
+_TIME_AMPM = re.compile(
+    r"\b([01]?\d)(?::([0-5]\d))?\s*([AaPp])\.?\s*[Mm]\.?",
+)
+_TIME_24H = re.compile(
+    r"\b([01]?\d|2[0-3]):([0-5]\d)\b(?!\s*[AaPp])",
+)
 
 # On-disk overrides — the Clinic SPA's KB / Persona pages POST here via
 # /api/demo/clinic/agent/prompt. Service rereads per call so the user
@@ -246,6 +255,13 @@ You have function tools — always call them, never invent data:
 - create_patient(...) — call once after collecting required fields
 - create_appointment(patient_id, clinic_id, date, time) — call once
   after the caller confirms the slot
+- list_patient_appointments(patient_id) — call BEFORE any cancel
+  or reschedule so you have the real appointment_id
+- cancel_appointment(appointment_id, reason?) — call once after
+  the caller confirms the cancellation
+- reschedule_appointment(appointment_id, new_date, new_time) —
+  call once after the caller picks a new slot from a fresh
+  list_free_slots response
 - end_call(reason) — see above
 """
 
@@ -370,6 +386,11 @@ You MUST follow every rule in this block. They are non-negotiable.
   THIS call. Quoting a plausible-looking identifier ("A123456",
   "APT-001") that you made up — even one that matches the format —
   is forbidden.
+- The same rule applies to APPOINTMENT TIMES. Never quote a slot
+  like "4:30 PM" or "6:30 PM" unless `list_free_slots` returned
+  that exact HH:MM on this call. The clinic's hours are bounded —
+  if you haven't seen a slot in the tool output, it isn't
+  available. Run list_free_slots first; only offer what came back.
 - Specifically: NEVER tell the caller "your appointment is
   confirmed" / "تم حجز موعدك" UNLESS `create_appointment` just
   returned a response containing an `appointment_id`. If it
@@ -405,6 +426,28 @@ You MUST follow every rule in this block. They are non-negotiable.
 - For `name_ar`: write the exact Arabic spelling the caller gave.
 - For `gender`: infer from the voice / first name / honorifics.
   Only ask explicitly if you genuinely cannot tell.
+
+### Changing an existing booking
+- If the caller asks to CHANGE, MOVE, RESCHEDULE, or CANCEL an
+  appointment, do NOT confirm anything until you have:
+    1. Verified caller identity (lookup_patient_by_*).
+    2. Called `list_patient_appointments(patient_id)` to fetch
+       the actual appointment_ids the caller has. NEVER make up
+       an appointment_id.
+    3. Confirmed with the caller which one they mean (read back
+       the existing date/time).
+- To CANCEL: call `cancel_appointment(appointment_id, reason?)`
+  and only after a successful `{ok: true}` response say "تم
+  الإلغاء" / "your appointment is cancelled".
+- To RESCHEDULE: call `list_free_slots(new_date, clinic_id)`
+  first so the agent has REAL slots to offer. Pick from THAT
+  list — never invent a time. Then call
+  `reschedule_appointment(appointment_id, new_date, new_time)`.
+  Only after a successful `{ok: true}` response say "تم
+  التغيير" / "your appointment has been moved to …".
+- If `reschedule_appointment` returns an `error` (slot taken,
+  off-hours, in the break), say so honestly and offer another
+  slot from the list_free_slots result. Do NOT fake success.
 
 ### Required intake QUESTIONS — different from required tool fields
 The `create_patient` tool now requires only `name` so the record
@@ -563,10 +606,16 @@ class CallSession:
         self._issued_file_numbers:    set[str] = set()
         self._issued_appointment_ids: set[str] = set()
         self._issued_patient_ids:     set[str] = set()
+        # Times (HH:MM, 24-hour) that list_free_slots actually returned
+        # at some point on this call. The detector cross-references any
+        # clock-time the agent SPEAKS against this set — catches the
+        # "agent offered 6:30 PM when the clinic closes at 5" failure.
+        self._issued_slot_times:      set[str] = set()
         # Identifiers we've already nagged the model about — prevents
         # us from spamming corrections every chunk while the agent
         # repeats the same fabricated value mid-sentence.
         self._corrected_ids:          set[str] = set()
+        self._corrected_times:        set[str] = set()
         # Optional caller phone — populated if the dialplan ever passes
         # CALLERID via an out-of-band channel (TODO; see DEMOSITEMAP).
         self.caller_phone: Optional[str] = None
@@ -602,6 +651,40 @@ class CallSession:
             if canonical in self._corrected_ids:          continue
             self._corrected_ids.add(canonical)
             fabricated.append(("appointment_id", canonical))
+
+        # Clock times the agent SPOKE — we only check these once we have
+        # at least one set of slots from list_free_slots / appointment
+        # lookups to compare against. Without that whitelist we can't
+        # tell legit recall from invention (mentioning the current time,
+        # for example, should not trigger a warning).
+        if self._issued_slot_times:
+            spoken_times: set[str] = set()
+            for m in _TIME_AMPM.finditer(self.spoken_text):
+                h = int(m.group(1))
+                mins = int(m.group(2) or 0)
+                ampm = m.group(3).lower()
+                if ampm == "p" and h < 12: h += 12
+                if ampm == "a" and h == 12: h = 0
+                if h > 23: continue
+                spoken_times.add(f"{h:02d}:{mins:02d}")
+            for m in _TIME_24H.finditer(self.spoken_text):
+                spoken_times.add(f"{int(m.group(1)):02d}:{int(m.group(2)):02d}")
+            for t in spoken_times:
+                if t in self._issued_slot_times: continue
+                if t in self._corrected_times:   continue
+                # Tolerate ±15 min near a real slot — speech transcription
+                # sometimes mangles ":30" / ":00" and we don't want to
+                # nag for a close miss the caller and agent both agree on.
+                hh, mm = int(t[:2]), int(t[3:])
+                near = False
+                for real in self._issued_slot_times:
+                    rh, rm = int(real[:2]), int(real[3:])
+                    if abs((hh*60 + mm) - (rh*60 + rm)) <= 15:
+                        near = True
+                        break
+                if near: continue
+                self._corrected_times.add(t)
+                fabricated.append(("slot_time", t))
 
         if not fabricated:
             return
@@ -969,6 +1052,20 @@ class CallSession:
                                                     self._issued_file_numbers.add(str(sub["file_number"]))
                                                 if sub.get("patient_id"):
                                                     self._issued_patient_ids.add(str(sub["patient_id"]))
+                                            # list_free_slots → every free HH:MM
+                                            # returned, across every clinic, into
+                                            # the slot whitelist.
+                                            for c in (result.get("clinics") or []):
+                                                for slot in (c.get("free_slots") or []):
+                                                    self._issued_slot_times.add(str(slot))
+                                            # list_patient_appointments → existing
+                                            # appointment times are legit too.
+                                            for a in (result.get("appointments") or []):
+                                                t = a.get("time")
+                                                if t: self._issued_slot_times.add(str(t))
+                                            # Single-appointment results.
+                                            t = result.get("time")
+                                            if t: self._issued_slot_times.add(str(t))
                                         if fc.name.startswith("lookup_patient") and isinstance(result, dict) and result.get("found"):
                                             p = result.get("patient") or {}
                                             self.caller_phone = p.get("phone") or self.caller_phone

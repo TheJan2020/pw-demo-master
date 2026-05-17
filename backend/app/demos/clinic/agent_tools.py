@@ -370,6 +370,61 @@ def build_tools() -> list[types.Tool]:
             ),
         ),
         types.FunctionDeclaration(
+            name="list_patient_appointments",
+            description="List a patient's appointments (defaults to upcoming "
+                        "only). Use this when the caller wants to change, "
+                        "cancel, or reschedule a booking — you need the "
+                        "appointment_id from here before you can call "
+                        "cancel_appointment or reschedule_appointment.",
+            parameters=types.Schema(
+                type=types.Type.OBJECT,
+                properties={
+                    "patient_id":     types.Schema(type=types.Type.STRING),
+                    "include_past":   types.Schema(type=types.Type.BOOLEAN,
+                                                   description="Defaults to false — "
+                                                               "only upcoming appointments."),
+                },
+                required=["patient_id"],
+            ),
+        ),
+        types.FunctionDeclaration(
+            name="cancel_appointment",
+            description="Cancel an existing appointment (sets status to "
+                        "'cancelled'). Use AFTER the caller has confirmed "
+                        "they want to cancel this specific appointment. "
+                        "Look up the appointment_id with "
+                        "list_patient_appointments first.",
+            parameters=types.Schema(
+                type=types.Type.OBJECT,
+                properties={
+                    "appointment_id": types.Schema(type=types.Type.STRING),
+                    "reason":         types.Schema(type=types.Type.STRING,
+                                                   description="Optional short reason "
+                                                               "for the cancellation."),
+                },
+                required=["appointment_id"],
+            ),
+        ),
+        types.FunctionDeclaration(
+            name="reschedule_appointment",
+            description="Move an existing appointment to a new date+time. "
+                        "Same patient, same clinic — only date+time change. "
+                        "Re-verifies the new slot is free, within hours, "
+                        "and outside the 15-min booking buffer. Returns the "
+                        "new appointment record (same id, updated time).",
+            parameters=types.Schema(
+                type=types.Type.OBJECT,
+                properties={
+                    "appointment_id": types.Schema(type=types.Type.STRING),
+                    "new_date":       types.Schema(type=types.Type.STRING,
+                                                   description="YYYY-MM-DD"),
+                    "new_time":       types.Schema(type=types.Type.STRING,
+                                                   description="HH:MM (24-hour)"),
+                },
+                required=["appointment_id", "new_date", "new_time"],
+            ),
+        ),
+        types.FunctionDeclaration(
             name="end_call",
             description="Hang up the call. Use after the caller says goodbye and "
                         "you've spoken your closing line.",
@@ -411,6 +466,16 @@ def execute_tool(name: str, args: dict, ctx: dict) -> dict:
             return _t_create_patient(args, ctx)
         if name == "create_appointment":
             return _t_create_appointment(args, ctx)
+        if name == "list_patient_appointments":
+            return _t_list_patient_appointments(args.get("patient_id") or "",
+                                                bool(args.get("include_past")))
+        if name == "cancel_appointment":
+            return _t_cancel_appointment(args.get("appointment_id") or "",
+                                         args.get("reason") or "", ctx)
+        if name == "reschedule_appointment":
+            return _t_reschedule_appointment(args.get("appointment_id") or "",
+                                             args.get("new_date") or "",
+                                             args.get("new_time") or "", ctx)
         if name == "end_call":
             return _t_end_call(args.get("reason") or "", ctx)
         return {"error": f"unknown tool: {name}"}
@@ -767,6 +832,164 @@ def _t_create_appointment(args: dict, ctx: dict) -> dict:
         "duration_min":   duration,
         "clinic_name":    clinic.get("name"),
         "patient_name":   patient.get("name"),
+    }
+
+
+def _appt_for_agent(a: dict) -> dict:
+    """Trim an appointment record for the agent — keeps the response
+    compact and matches the field names the persona expects."""
+    return {
+        "appointment_id":  a.get("id"),
+        "patient_id":      a.get("patient_id"),
+        "patient_name":    a.get("patient_name"),
+        "patient_name_ar": a.get("patient_name_ar"),
+        "clinic_id":       a.get("department_id"),
+        "scheduled_at":    a.get("scheduled_at"),
+        "date":            (a.get("scheduled_at") or "")[:10],
+        "time":            (a.get("scheduled_at") or "")[11:16],
+        "duration_min":    a.get("duration_min"),
+        "status":          a.get("status"),
+        "notes":           a.get("notes"),
+    }
+
+
+def _t_list_patient_appointments(patient_id: str, include_past: bool) -> dict:
+    if not patient_id:
+        return {"error": "patient_id is required"}
+    snap = load_snapshot()
+    appts = snap.get("appointments", [])
+    today_ymd = datetime.now().strftime("%Y-%m-%d")
+    rows = [a for a in appts if a.get("patient_id") == patient_id]
+    if not include_past:
+        rows = [
+            a for a in rows
+            if (a.get("scheduled_at") or "")[:10] >= today_ymd
+            and a.get("status") not in ("cancelled", "no_show", "completed")
+        ]
+    rows.sort(key=lambda a: a.get("scheduled_at") or "")
+    return {
+        "count":        len(rows),
+        "appointments": [_appt_for_agent(a) for a in rows],
+    }
+
+
+def _t_cancel_appointment(appointment_id: str, reason: str, ctx: dict) -> dict:
+    if not appointment_id:
+        return {"error": "appointment_id is required"}
+    snap = load_snapshot()
+    appts = snap.get("appointments", [])
+    found = next((a for a in appts if a.get("id") == appointment_id), None)
+    if found is None:
+        return {"error": f"appointment {appointment_id} not found"}
+    if found.get("status") == "cancelled":
+        return {"error": f"appointment {appointment_id} is already cancelled"}
+
+    found["status"] = "cancelled"
+    found["notes"] = (
+        (found.get("notes") or "") + f" | Cancelled by Live Agent: {reason or '(no reason)'}"
+    ).strip(" |")
+    save_snapshot(snap)
+
+    broadcast = ctx.get("broadcast")
+    if callable(broadcast):
+        broadcast({
+            "type":        "tool_mutation",
+            "call_id":     ctx.get("call_id"),
+            "kind":        "appointment_cancelled",
+            "appointment": found,
+        })
+    return {
+        "ok":             True,
+        "appointment_id": appointment_id,
+        "status":         "cancelled",
+        "reason":         reason or None,
+    }
+
+
+def _t_reschedule_appointment(appointment_id: str, new_date: str,
+                              new_time: str, ctx: dict) -> dict:
+    if not (appointment_id and new_date and new_time):
+        return {"error": "appointment_id, new_date, new_time are all required"}
+    snap = load_snapshot()
+    appts = snap.get("appointments", [])
+    clinics = snap.get("clinics", [])
+    overrides = snap.get("slot_overrides", [])
+
+    target = next((a for a in appts if a.get("id") == appointment_id), None)
+    if target is None:
+        return {"error": f"appointment {appointment_id} not found"}
+    if target.get("status") in ("cancelled", "no_show", "completed"):
+        return {"error": f"appointment {appointment_id} is {target.get('status')} — "
+                         "cannot be rescheduled. Cancel and create a new one."}
+
+    clinic_id = target.get("department_id")
+    clinic = next((c for c in clinics if c.get("id") == clinic_id), None)
+    if clinic is None:
+        return {"error": f"clinic {clinic_id} no longer exists"}
+
+    # Re-verify the new slot against working hours, break, buffer,
+    # bookings + overrides — same gauntlet as create_appointment.
+    now = datetime.now()
+    today_ymd = now.strftime("%Y-%m-%d")
+    if new_date < today_ymd:
+        return {"error": "cannot reschedule to a past date"}
+    try:
+        slot_dt = datetime(*(int(x) for x in new_date.split("-")),
+                           _time_to_min(new_time) // 60,
+                           _time_to_min(new_time) % 60)
+    except Exception:
+        return {"error": f"invalid new_date / new_time ({new_date} {new_time})"}
+    if new_date == today_ymd and slot_dt < now + timedelta(minutes=BOOKING_BUFFER_MIN):
+        return {"error": f"new slot is within the {BOOKING_BUFFER_MIN}-minute booking buffer"}
+
+    wd = _sunday_indexed(*(int(x) for x in new_date.split("-")))
+    hours_list = clinic.get("working_hours")
+    if isinstance(hours_list, list) and len(hours_list) == 7:
+        day = hours_list[wd] or _default_working_hours_for_weekday(wd)
+    else:
+        day = _default_working_hours_for_weekday(wd)
+    if not day.get("open"):
+        return {"error": "clinic is closed on the requested day"}
+    if _is_break(new_time, day):
+        return {"error": "requested slot falls inside the clinic's break window"}
+    # Ensure new_time is within the open window (avoid off-hours bookings).
+    if (_time_to_min(new_time) < _time_to_min(day.get("open_time", "09:00"))
+            or _time_to_min(new_time) + SLOT_MIN > _time_to_min(day.get("close_time", "17:00"))):
+        return {"error": f"requested time {new_time} is outside the clinic's hours "
+                         f"({day.get('open_time')}–{day.get('close_time')})"}
+
+    booked = _booked_slots(
+        [a for a in appts if a.get("id") != appointment_id], new_date, clinic_id,
+    )
+    blocked = _blocked_slots(overrides, new_date, clinic_id)
+    if new_time in booked:  return {"error": "new slot is already booked"}
+    if new_time in blocked: return {"error": "new slot is blocked by the clinic"}
+
+    old_scheduled = target.get("scheduled_at")
+    target["scheduled_at"] = f"{new_date}T{new_time}:00"
+    target["status"] = "scheduled"
+    target["notes"] = (
+        (target.get("notes") or "") + f" | Rescheduled by Live Agent (was {old_scheduled})"
+    ).strip(" |")
+    save_snapshot(snap)
+
+    broadcast = ctx.get("broadcast")
+    if callable(broadcast):
+        broadcast({
+            "type":        "tool_mutation",
+            "call_id":     ctx.get("call_id"),
+            "kind":        "appointment_rescheduled",
+            "appointment": target,
+            "previous_scheduled_at": old_scheduled,
+        })
+    return {
+        "ok":             True,
+        "appointment_id": appointment_id,
+        "date":           new_date,
+        "time":           new_time,
+        "previous":       old_scheduled,
+        "clinic_name":    clinic.get("name"),
+        "patient_name":   target.get("patient_name"),
     }
 
 
