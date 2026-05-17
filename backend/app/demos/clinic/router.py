@@ -19,6 +19,7 @@ from .live_agent import (
     load_kb, load_persona, save_kb, save_persona,
     list_saved_calls, load_saved_call, call_audio_path, delete_saved_call,
 )
+from .agent_tools import load_snapshot, save_snapshot
 from ..auth import (
     clear_session,
     issue_session,
@@ -180,6 +181,42 @@ async def agent_delete_call(call_id: str) -> dict:
     if not delete_saved_call(call_id):
         raise HTTPException(404, "call not found")
     return {"ok": True}
+
+
+# ----- Data snapshot (clinic SPA → backend) ------------------------------
+# The agent's function tools read from data/demos/clinic/snapshot.json. The
+# Clinic SPA's Dashboard pushes the current localStorage state here on
+# mount (and after any SPA-side mutation) so the agent always has the live
+# patient + appointment data.
+
+@router.get("/data/snapshot")
+async def agent_get_snapshot() -> dict:
+    return load_snapshot()
+
+
+@router.post("/data/snapshot")
+async def agent_set_snapshot(payload: dict) -> dict:
+    """Accepts a full snapshot from the SPA — patients, appointments,
+    clinics, providers, slot_overrides. Stored as-is."""
+    if not isinstance(payload, dict):
+        raise HTTPException(400, "snapshot must be a JSON object")
+    # Only persist the keys we expect — keeps the file tidy and avoids
+    # accidentally storing UI-only state.
+    clean = {
+        "patients":       list(payload.get("patients") or []),
+        "appointments":   list(payload.get("appointments") or []),
+        "clinics":        list(payload.get("clinics") or []),
+        "providers":      list(payload.get("providers") or []),
+        "slot_overrides": list(payload.get("slot_overrides") or []),
+    }
+    save_snapshot(clean)
+    return {
+        "ok":              True,
+        "patient_count":   len(clean["patients"]),
+        "appt_count":      len(clean["appointments"]),
+        "clinic_count":    len(clean["clinics"]),
+        "override_count":  len(clean["slot_overrides"]),
+    }
 
 
 @router.websocket("/agent/ws")

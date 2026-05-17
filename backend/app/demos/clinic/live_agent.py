@@ -40,6 +40,7 @@ from google import genai
 from google.genai import types
 
 from ...core.state import state
+from .agent_tools import build_tools, execute_tool
 
 logger = logging.getLogger("clinic_live_agent")
 
@@ -78,12 +79,24 @@ Riyadh. You answer phone calls and route them politely and efficiently.
 - Use the caller's first name after they share it.
 - Sentences short. One question at a time.
 
+## Arabic gender — default to MASCULINE
+- Address the caller with masculine forms by default ("أنت" no kasra,
+  "تفضل", "تقدر"). Switch to feminine only after hearing a female
+  voice or a woman's name. Never assume feminine.
+
 ## Language — Arabic by default
 - Always greet in Arabic (Najdi / Hijazi).
 - Detect the caller's language from their first reply and switch
   smoothly (English, Urdu, Tagalog, French, or mixed Arabic-English).
-- Stay in that language for the rest of the call unless the caller
-  switches again.
+
+## Time
+- The system instruction below ends with the **current date and time**.
+  Treat that as truth — never invent a day.
+- Reference the present day as "اليوم" / "today" (add the day name
+  only in parentheses, e.g. "اليوم (الأحد)").
+- Never offer a slot whose time is in the past, or within 15 minutes
+  of the current time on today's date. The `list_free_slots` tool
+  already filters these — trust its output.
 
 ## Greeting (always Arabic)
 "السلام عليكم، عيادات برايم ميت. أنا ليلى. كيف أقدر أخدمك؟"
@@ -127,8 +140,25 @@ Establish who's calling before doing anything else.
 6. Read back the booking summary in both Arabic and English; ask
    the caller to confirm "yes" / "نعم" before finalising.
 
-## End of call
-"إن شاء الله نشوفك. شكراً للاتصال."
+## End of call — YOU must terminate
+When the caller says bye / مع السلامة / خلاص شكراً / thank you,
+that's all:
+1. Summarise the outcome in one short sentence.
+2. Say "إن شاء الله نشوفك. شكراً للاتصال."
+3. **Immediately call the `end_call` function tool** with a one-line
+   reason. The system will hang up. Do not wait for the caller.
+
+## Tools — use them, don't fake them
+You have function tools — always call them, never invent data:
+- lookup_patient_by_phone(phone)
+- lookup_patient_by_id_number(id_number)
+- lookup_patient_by_file_number(file_number)
+- list_free_slots(date, clinic_id=null) — already filters past times
+  and the 15-min booking buffer
+- create_patient(...) — call once after collecting required fields
+- create_appointment(patient_id, clinic_id, date, time) — call once
+  after the caller confirms the slot
+- end_call(reason) — see above
 """
 
 DEFAULT_KB = """# Primewave Mate Clinics — Riyadh (Knowledge Base)
@@ -216,7 +246,25 @@ def save_kb(text: str) -> None:
 
 
 def _build_system_instruction() -> str:
-    return f"{load_persona().strip()}\n\n{load_kb().strip()}"
+    # Inject the current date + time so the agent never has to invent a
+    # weekday or wonder whether 11:00 "today" has already passed. This
+    # block is regenerated on every inbound call.
+    now = time.localtime()
+    weekday_en = ["Sunday", "Monday", "Tuesday", "Wednesday",
+                  "Thursday", "Friday", "Saturday"][(now.tm_wday + 1) % 7]
+    weekday_ar = ["الأحد", "الإثنين", "الثلاثاء", "الأربعاء",
+                  "الخميس", "الجمعة", "السبت"][(now.tm_wday + 1) % 7]
+    current = (
+        "\n\n## CURRENT TIME (authoritative — do not invent a different day)\n"
+        f"- Today: {time.strftime('%Y-%m-%d', now)} ({weekday_en} / {weekday_ar})\n"
+        f"- Right now: {time.strftime('%H:%M', now)} ({time.tzname[0]})\n"
+        "- When referring to today say 'اليوم' / 'today' — never the\n"
+        "  weekday name on its own.\n"
+        "- The `list_free_slots` tool already filters past times and any\n"
+        "  slot within the 15-minute booking buffer. Quote ONLY what it\n"
+        "  returns."
+    )
+    return f"{load_persona().strip()}\n\n{load_kb().strip()}{current}"
 
 
 # ============================================================================
@@ -305,6 +353,15 @@ class CallSession:
         except Exception:
             pass
 
+    async def _delayed_stop(self, delay_s: float) -> None:
+        """Set stop_evt after a short delay — used by the end_call tool so
+        the agent's spoken goodbye actually leaves the wire before we
+        tear down the AudioSocket."""
+        try:
+            await asyncio.sleep(delay_s)
+        finally:
+            self.stop_evt.set()
+
     # ---- pumps -------------------------------------------------------------
     async def _read_loop(self) -> None:
         try:
@@ -383,6 +440,15 @@ class CallSession:
             http_options={"api_version": _GEMINI_API_VERSION},
         )
 
+        # Per-call context that tool implementations close over. Lets a
+        # tool set `end_requested = True` to terminate the call, or call
+        # `broadcast(event)` to push something to subscribers.
+        tool_ctx: dict = {
+            "call_id":        self.call_id,
+            "broadcast":      self.svc._broadcast,
+            "end_requested":  False,
+        }
+
         cfg = types.LiveConnectConfig(
             response_modalities=[types.Modality.AUDIO],
             system_instruction=types.Content(
@@ -406,6 +472,7 @@ class CallSession:
                     prefix_padding_ms=200,
                 ),
             ),
+            tools=build_tools(),
         )
 
         try:
@@ -475,6 +542,48 @@ class CallSession:
                                         "type": "transcript", "call_id": self.call_id,
                                         "who": "agent", "text": ot.text,
                                     })
+                            # Tool call → execute → return FunctionResponse.
+                            tc = getattr(resp, "tool_call", None)
+                            if tc:
+                                responses = []
+                                for fc in (tc.function_calls or []):
+                                    args = dict(fc.args or {})
+                                    logger.info("clinic call %s: tool_call %s(%s)",
+                                                self.call_id, fc.name, args)
+                                    self.svc._broadcast({
+                                        "type":     "tool_call",
+                                        "call_id":  self.call_id,
+                                        "name":     fc.name,
+                                        "args":     args,
+                                    })
+                                    # If the lookup succeeded, update the
+                                    # Dashboard's caller name + phone.
+                                    result = execute_tool(fc.name, args, tool_ctx)
+                                    if fc.name.startswith("lookup_patient") and isinstance(result, dict) and result.get("found"):
+                                        p = result.get("patient") or {}
+                                        self.caller_phone = p.get("phone") or self.caller_phone
+                                        self.svc._broadcast({
+                                            "type":    "caller_identified",
+                                            "call_id": self.call_id,
+                                            "name":    p.get("name") or p.get("name_ar"),
+                                            "phone":   p.get("phone"),
+                                        })
+                                    responses.append(types.FunctionResponse(
+                                        id=fc.id, name=fc.name,
+                                        response={"result": result},
+                                    ))
+                                if responses:
+                                    try:
+                                        await session.send_tool_response(function_responses=responses)
+                                    except Exception:
+                                        logger.exception("send_tool_response failed")
+                                # If a tool requested hangup, drop out cleanly
+                                # after the agent's closing line finishes.
+                                if tool_ctx.get("end_requested"):
+                                    # Give the agent ~3s to finish its
+                                    # spoken goodbye before we close the
+                                    # AudioSocket.
+                                    asyncio.create_task(self._delayed_stop(3.0))
 
                 feeder = asyncio.create_task(feed())
                 receiver = asyncio.create_task(receive())

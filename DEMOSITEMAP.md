@@ -839,25 +839,73 @@ on a new `/call-center/history` page:
   validated in the edit dialog. The Live Agent's intake flow now
   asks for this when verifying a returning caller.
 
-### Open follow-ups (not in this commit)
+### Function-call tools (IMPLEMENTED — Option B, SPA pushes snapshot)
 
-- **Function-call tools** for the agent — `lookup_patient_by_phone`,
-  `lookup_patient_by_name`, `lookup_patient_by_file_number`,
-  `lookup_patient_by_id_number`, `list_free_slots(date, clinic_id)`,
-  `create_appointment(...)`, `cancel_appointment(id)`,
-  `create_patient(...)`. Each one needs the backend to mirror /
-  query the clinic data layer; the SPA currently keeps everything
-  in the browser's localStorage, so the bridge is either:
-  (a) move the data to backend
-      (`data/demos/clinic/{patients,appointments}.json` with REST
-      endpoints; SPA syncs on dashboard load + after edits),
-  (b) have the SPA push snapshots to the backend on dashboard load
-      and after every mutation,
-  (c) keep agent stateless and surface only the persona + KB (today).
-  Option (a) is the productisation path; (b) is a useful interim;
-  (c) is the current MVP. The persona has been updated with the
-  intake-flow script so the agent already *asks* for the right
-  fields — it just can't *act on* them until the tools land.
+We went with **Option B** from the original three-way fork: the SPA
+remains the source of truth, but its Dashboard pushes a snapshot to
+the backend on every relevant mutation, and the agent's tools read
+(and mutate) that snapshot.
+
+**Tools** (`backend/app/demos/clinic/agent_tools.py`, declared via
+`build_tools()` and dispatched via `execute_tool(name, args, ctx)`):
+
+| Tool                              | What it does                                                                 |
+| --------------------------------- | ----------------------------------------------------------------------------- |
+| `lookup_patient_by_phone(phone)`  | Loose match — strips formatting + accepts ±966/0 prefix. Returns full patient |
+| `lookup_patient_by_id_number(id)` | Match against the 10-digit national/Iqama ID                                  |
+| `lookup_patient_by_file_number(f)`| Match against `A/B/C + 6 digits` clinic file #                                |
+| `list_free_slots(date, clinic_id?)` | Returns 'HH:MM' slot list per clinic. **Filters past times and the 15-min booking buffer for today.** |
+| `create_patient(...)`             | Creates a new Patient + assigns next file_number; broadcasts `tool_mutation` |
+| `create_appointment(...)`         | Books a slot after re-verifying free + non-break + within hours + outside buffer |
+| `end_call(reason)`                | Sets `end_requested` — receive loop schedules a 3 s delayed `stop_evt` so the agent's spoken goodbye lands before the AudioSocket closes |
+
+**Sync model — three flows**:
+
+1. **SPA → backend (snapshot push):** the Clinic SPA's Dashboard
+   useEffect POSTs the full `{patients, appointments, clinics,
+   providers, slot_overrides}` to `POST /api/demo/clinic/data/snapshot`
+   on mount and on any change to the local collections it reads.
+   Backend stores at `data/demos/clinic/snapshot.json`. The agent's
+   tools `load_snapshot()` from this file on every call.
+2. **Backend → SPA (tool_mutation events):** after a `create_patient`
+   or `create_appointment` tool succeeds, the backend broadcasts a
+   `tool_mutation` event over `/api/demo/clinic/agent/ws` containing
+   the new record. The SPA's `liveAgentStore` collects them; the
+   Dashboard's useEffect drains the buffer, mirrors the record into
+   the SPA's localStorage (so the Patients / Appointments / Calendar
+   pages show what the agent did), AND adds a matching row to the
+   existing agent_activity collection so per-row Delete-with-cascade
+   keeps working.
+3. **Caller identification:** after any `lookup_patient_by_*` returns
+   a match, the backend broadcasts a `caller_identified` event with
+   the resolved name + phone. The Dashboard's singleton WS store
+   updates the active call's `caller_name` and `caller_phone` so the
+   ActiveCallCard switches from "New patient" to the real name in
+   real time.
+
+**Time awareness:**
+`_build_system_instruction()` (in `live_agent.py`) appends a
+`## CURRENT TIME (authoritative …)` block to every system prompt
+with the local date, weekday in English + Arabic, and "Right now: HH:MM
+TZ". The persona instructs the agent never to invent a weekday and
+to trust `list_free_slots` for the past-time / 15-min-buffer filtering
+(matching what the tool actually enforces).
+
+**End-of-call behaviour:**
+Persona now explicitly says: "When the caller says bye, summarise →
+say the closing line → IMMEDIATELY call `end_call`." On `end_call`,
+`tool_ctx["end_requested"]` flips True, the receive loop schedules a
+3-second `asyncio.sleep` then sets `stop_evt`, giving the agent's
+goodbye audio time to leave the wire before the TCP/AudioSocket teardown.
+
+**Transcript persistence across SPA navigation:**
+`src/lib/liveAgentStore.ts` owns the WebSocket connection as a
+module-level singleton. Components subscribe via `useLiveAgentStore()`.
+Navigating between Dashboard / Patients / Configuration etc. no
+longer tears down the connection or wipes the in-flight transcript —
+state survives until the call ends (or the browser does a full reload).
+
+### Open follow-ups (not in this commit)
 - **SIP CALLERID → AudioSocket UUID**: the agent doesn't currently
   receive the caller's phone number — `chan_audiosocket` only
   carries audio + a UUID. To enable `lookup_patient_by_phone` we
