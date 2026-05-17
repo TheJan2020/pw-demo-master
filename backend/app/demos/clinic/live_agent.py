@@ -355,6 +355,13 @@ You MUST follow every rule in this block. They are non-negotiable.
   THIS call. Quoting a plausible-looking identifier ("A123456",
   "APT-001") that you made up — even one that matches the format —
   is forbidden.
+- Specifically: NEVER tell the caller "your appointment is
+  confirmed" / "تم حجز موعدك" UNLESS `create_appointment` just
+  returned a response containing an `appointment_id`. If it
+  returned an `error`, the booking did NOT happen — say so
+  honestly, fix whatever was wrong (wrong clinic_id, wrong
+  patient_id, slot just got taken), retry, and only then
+  confirm. Same rule for create_patient + file_number.
 - If `create_patient` or `create_appointment` returned an `error`,
   do NOT pretend it succeeded. Apologise briefly, explain in one
   sentence what was missing, and either retry the tool with the
@@ -362,6 +369,17 @@ You MUST follow every rule in this block. They are non-negotiable.
   complete the record on arrival.
 - Treat "I called the tool" and "the tool returned a value" as
   separate facts. The second is the only one you can quote from.
+
+### Time format — speak 12-hour, with AM/PM
+- Internally the tools use 24-hour time ("13:00", "16:30"). When
+  you SPEAK a time to the caller, convert to 12-hour:
+    English  → "1:00 PM", "4:30 PM", "9:00 AM"
+    Arabic   → "الواحدة بعد الظهر", "الرابعة والنصف عصراً",
+              "التاسعة صباحاً"
+  NEVER say "sixteen hundred", "16:00", "thirteen thirty" to a
+  caller — even though that's what the tool returned.
+- The same rule applies when reading back a freshly-booked slot
+  from create_appointment's response.
 
 ### Filling forms — agent-side, not caller-side
 - For `name` (English transliteration): the caller speaks their
@@ -376,6 +394,26 @@ You MUST follow every rule in this block. They are non-negotiable.
   they can't or won't supply it, pass an empty value through —
   the tool will accept the record and flag those fields for the
   reception desk to fill in. Do NOT block the booking on them.
+
+### Intake — ONE field at a time, confirm each before moving on
+- A phone caller cannot remember a list. NEVER ask "what's your
+  name, mobile, ID, date of birth, and city?" in one breath.
+- Ask ONE field. Wait for the answer. Read it back for
+  confirmation in the caller's language ("نعم، فهد العتيبي،
+  صح؟" / "Got it — Fahad Al-Otaibi, correct?"). Only after the
+  caller confirms, move to the next field.
+- Recommended order:
+    1. Full name (Arabic; you romanise to English yourself)
+    2. Mobile number (read back digit-by-digit for confirmation)
+    3. National / Iqama ID (10 digits — read back digit-by-digit;
+       if the caller doesn't have it ready, skip with "OK, we'll
+       collect it at reception")
+    4. Date of birth (year / month / day)
+    5. City
+    6. Reason for visit (one short phrase)
+- The same one-field-at-a-time discipline applies when collecting
+  the appointment details (clinic / specialty → preferred day →
+  pick one slot from the list you got back from list_free_slots).
 """
 
 
@@ -748,6 +786,22 @@ class CallSession:
                                     # If the lookup succeeded, update the
                                     # Dashboard's caller name + phone.
                                     result = execute_tool(fc.name, args, tool_ctx)
+                                    # Always broadcast the outcome so the
+                                    # Dashboard can flag tool errors
+                                    # (e.g. create_appointment failing with
+                                    # "patient not found") instead of the
+                                    # user only finding out when the
+                                    # appointment doesn't appear.
+                                    has_error = isinstance(result, dict) and bool(result.get("error"))
+                                    self.svc._broadcast({
+                                        "type":     "tool_result",
+                                        "call_id":  self.call_id,
+                                        "name":     fc.name,
+                                        "args":     args,
+                                        "ok":       (not has_error),
+                                        "error":    (result.get("error") if has_error else None),
+                                        "result":   None if has_error else result,
+                                    })
                                     if fc.name.startswith("lookup_patient") and isinstance(result, dict) and result.get("found"):
                                         p = result.get("patient") or {}
                                         self.caller_phone = p.get("phone") or self.caller_phone
