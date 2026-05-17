@@ -29,6 +29,7 @@ import asyncio
 import audioop
 import json
 import logging
+import re
 import struct
 import time
 import uuid
@@ -53,6 +54,20 @@ _AS_AUDIO  = 0x10
 
 _SAMPLE_WIDTH = 2  # signed-linear 16-bit
 _GEMINI_API_VERSION = "v1alpha"
+
+# Fabrication detector — patterns the agent is forbidden to speak
+# unless the matching identifier was returned by a successful tool call
+# on the SAME call. The agent has been repeatedly observed inventing
+# plausible-looking IDs even with strong persona discipline, so we
+# verify in real time and inject a correction back into the live
+# session the moment we see one.
+#
+# File number format (matches _t_create_patient): A/B/C + 6 digits, first
+# digit 1-9. We accept any whitespace / hyphen the speech transcription
+# might insert ("A 123456", "A-1 2 3 4 5 6", etc.) and normalise.
+_FILE_PATTERN = re.compile(r"\b([ABC])[\s\-]*([1-9])(?:[\s\-]*([0-9])){5}\b")
+# Appointment id format: APT-NNN (3+ digits).
+_APT_PATTERN = re.compile(r"\bAPT[\s\-]*[0-9]{3,}\b", re.IGNORECASE)
 
 # On-disk overrides — the Clinic SPA's KB / Persona pages POST here via
 # /api/demo/clinic/agent/prompt. Service rereads per call so the user
@@ -526,9 +541,99 @@ class CallSession:
         self._caller_pcm8k: list[bytes] = []
         self._agent_pcm8k:  list[tuple[float, bytes]] = []
         self.turns: list[dict] = []   # [{role, text, ts}]
+        # ---- Fabrication detector state ---------------------------------
+        # Whitelist of identifiers actually returned by successful tool
+        # calls on THIS call. Anything the agent SPEAKS that matches an
+        # identifier pattern but isn't in here is a fabrication, and we
+        # send a correction to the model immediately.
+        self._issued_file_numbers:    set[str] = set()
+        self._issued_appointment_ids: set[str] = set()
+        self._issued_patient_ids:     set[str] = set()
+        # Identifiers we've already nagged the model about — prevents
+        # us from spamming corrections every chunk while the agent
+        # repeats the same fabricated value mid-sentence.
+        self._corrected_ids:          set[str] = set()
         # Optional caller phone — populated if the dialplan ever passes
         # CALLERID via an out-of-band channel (TODO; see DEMOSITEMAP).
         self.caller_phone: Optional[str] = None
+
+    async def _check_fabrications(self, session) -> None:
+        """Scan the agent's accumulated transcribed speech for
+        identifier patterns (file_number, appointment_id) and, for any
+        match NOT in our per-call whitelist of tool-issued IDs, inject
+        a correction back into the Gemini Live session AND broadcast a
+        warning so the dashboard surfaces the silent failure."""
+        fabricated: list[tuple[str, str]] = []  # [(kind, normalised_id), ...]
+
+        for m in _FILE_PATTERN.finditer(self.spoken_text):
+            # Recompose the id without the whitespace/hyphens the
+            # transcription may have inserted between digits.
+            raw = m.group(0)
+            normalised = re.sub(r"[\s\-]", "", raw).upper()
+            if len(normalised) != 7:
+                continue
+            if normalised in self._issued_file_numbers: continue
+            if normalised in self._corrected_ids:       continue
+            self._corrected_ids.add(normalised)
+            fabricated.append(("file_number", normalised))
+
+        for m in _APT_PATTERN.finditer(self.spoken_text):
+            raw = m.group(0)
+            normalised = re.sub(r"[\s\-]", "-", raw).upper()
+            # Normalise to APT-NNN form.
+            digits = re.sub(r"\D", "", normalised)
+            if not digits: continue
+            canonical = f"APT-{digits}"
+            if canonical in self._issued_appointment_ids: continue
+            if canonical in self._corrected_ids:          continue
+            self._corrected_ids.add(canonical)
+            fabricated.append(("appointment_id", canonical))
+
+        if not fabricated:
+            return
+
+        for kind, ident in fabricated:
+            logger.warning(
+                "clinic call %s: fabrication detected — agent spoke %s '%s' "
+                "that was never returned by a tool on this call",
+                self.call_id, kind, ident,
+            )
+            self.svc._broadcast({
+                "type":     "fabrication",
+                "call_id":  self.call_id,
+                "kind":     kind,
+                "value":    ident,
+            })
+
+        # Build a single concise correction prompt — sending many in
+        # quick succession just confuses the model.
+        bullets = "\n".join(
+            f"- You said {kind} '{ident}' — no tool returned that value."
+            for kind, ident in fabricated
+        )
+        correction = (
+            "(system override) STOP. You just spoke an identifier you "
+            "did NOT receive from any tool on this call:\n"
+            f"{bullets}\n"
+            "That is fabrication. The caller's record was NOT actually "
+            "created. Right now you must either:\n"
+            "  (a) call the correct tool (create_patient / "
+            "create_appointment) with the data you've collected so far, "
+            "OR\n"
+            "  (b) apologise to the caller in their language, tell them "
+            "the system did not save the record, and ask reception to "
+            "complete it on arrival.\n"
+            "Do NOT repeat the fabricated value. Do NOT pretend the "
+            "previous statement was correct."
+        )
+        try:
+            await session.send_client_content(
+                turns=types.Content(role="user", parts=[types.Part(text=correction)]),
+                turn_complete=True,
+            )
+        except Exception:
+            logger.exception("clinic call %s: failed to send fabrication correction",
+                             self.call_id)
 
     def _append_turn(self, role: str, text: str) -> None:
         # Extend the last turn if the speaker hasn't switched, else start a
@@ -792,6 +897,14 @@ class CallSession:
                                             "type": "transcript", "call_id": self.call_id,
                                             "who": "agent", "text": ot.text,
                                         })
+                                        # Fabrication check — scan everything
+                                        # the agent has said so far against
+                                        # the whitelist of IDs returned by
+                                        # tools on this call. The model's
+                                        # transcription may chunk the ID
+                                        # across messages, so we re-scan the
+                                        # full spoken_text each time.
+                                        await self._check_fabrications(session)
                                 # Tool call → execute → return FunctionResponse.
                                 tc = getattr(resp, "tool_call", None)
                                 if tc:
@@ -825,6 +938,23 @@ class CallSession:
                                             "error":    (result.get("error") if has_error else None),
                                             "result":   None if has_error else result,
                                         })
+                                        # Whitelist any IDs the tool actually issued
+                                        # on this call so the fabrication detector
+                                        # knows they're real.
+                                        if not has_error and isinstance(result, dict):
+                                            fn = result.get("file_number")
+                                            if fn: self._issued_file_numbers.add(str(fn))
+                                            aid = result.get("appointment_id")
+                                            if aid: self._issued_appointment_ids.add(str(aid))
+                                            pid = result.get("patient_id")
+                                            if pid: self._issued_patient_ids.add(str(pid))
+                                            # Lookups return the patient under "patient"
+                                            sub = result.get("patient")
+                                            if isinstance(sub, dict):
+                                                if sub.get("file_number"):
+                                                    self._issued_file_numbers.add(str(sub["file_number"]))
+                                                if sub.get("patient_id"):
+                                                    self._issued_patient_ids.add(str(sub["patient_id"]))
                                         if fc.name.startswith("lookup_patient") and isinstance(result, dict) and result.get("found"):
                                             p = result.get("patient") or {}
                                             self.caller_phone = p.get("phone") or self.caller_phone
