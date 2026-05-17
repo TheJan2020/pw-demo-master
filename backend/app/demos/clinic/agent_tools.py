@@ -101,13 +101,15 @@ def _phones_equal(a: str, b: str) -> bool:
     return False
 
 
-def _next_id(existing: list[dict], prefix: str, width: int = 4) -> str:
+# Matches the SPA's nextId() widths: PAT = 4 digits, everything else = 3.
+def _next_id(existing: list[dict], prefix: str) -> str:
     max_n = 0
     pat = re.compile(rf"^{prefix}-(\d+)$")
     for x in existing:
         m = pat.match(str(x.get("id") or ""))
         if m:
             max_n = max(max_n, int(m.group(1)))
+    width = 4 if prefix == "PAT" else 3
     return f"{prefix}-{str(max_n + 1).zfill(width)}"
 
 
@@ -568,7 +570,12 @@ def _t_create_appointment(args: dict, ctx: dict) -> dict:
     if time_str in blocked: return {"error": "slot is blocked by the clinic"}
 
     new_id = _next_id(appts, "APT")
-    scheduled = f"{date}T{time_str}:00.000"
+    # ISO datetime stored as LOCAL wall-clock without a Z suffix — JS
+    # new Date(s) parses this as local time, matching how the SPA's
+    # Appointments / Calendar pages read it. (Adding Z would shift the
+    # displayed time by the TZ offset.) Includes seconds so .slice(11,16)
+    # always lands exactly on HH:MM.
+    scheduled = f"{date}T{time_str}:00"
     record = {
         "id":              new_id,
         "patient_id":      patient.get("id"),
