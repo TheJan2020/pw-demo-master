@@ -75,6 +75,17 @@ async def app_health() -> dict:
 # `/demo/clinic/assets/...` requests hit the vertical's built bundle, not
 # the main admin app's frontend folder.
 if (DEMOS_DIR / "clinic").is_dir():
+    # A bare GET /demo/clinic (no trailing slash) doesn't match the StaticFiles
+    # mount (which only catches /demo/clinic/<sub-path>), so without this
+    # explicit redirect the request falls through to the root `/` mount and
+    # serves the admin app's index.html by mistake. The vite base is also
+    # /demo/clinic/, so the SPA needs the trailing slash for relative paths.
+    from fastapi.responses import RedirectResponse  # local — avoids top-import sprawl
+
+    @app.get("/demo/clinic", include_in_schema=False)
+    async def _redirect_to_clinic_slash() -> RedirectResponse:
+        return RedirectResponse(url="/demo/clinic/", status_code=308)
+
     app.mount(
         "/demo/clinic",
         StaticFiles(directory=str(DEMOS_DIR / "clinic"), html=True),

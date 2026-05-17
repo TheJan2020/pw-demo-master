@@ -1,0 +1,1 @@
+import{u as o,j as e}from"./index-DiXr71vJ.js";import{P as s}from"./Placeholder-tiV2jDKU.js";import"./createLucideIcon-ifm-2FKK.js";function m(){const{t}=o();return e.jsx(s,{title:t("settings")})}export{m as component};
