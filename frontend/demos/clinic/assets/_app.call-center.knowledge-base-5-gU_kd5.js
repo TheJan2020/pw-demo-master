@@ -1,1 +1,0 @@
-import{u as o,j as t}from"./index-DiXr71vJ.js";import{P as r}from"./Placeholder-tiV2jDKU.js";import"./createLucideIcon-ifm-2FKK.js";function p(){const{t:e}=o();return t.jsx(r,{title:`${e("callCenter")} · ${e("knowledgeBase")}`})}export{p as component};
