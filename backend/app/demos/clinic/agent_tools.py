@@ -589,7 +589,8 @@ def execute_tool(name: str, args: dict, ctx: dict) -> dict:
             return _t_create_appointment(args, ctx)
         if name == "list_patient_appointments":
             return _t_list_patient_appointments(args.get("patient_id") or "",
-                                                bool(args.get("include_past")))
+                                                bool(args.get("include_past")),
+                                                ctx)
         if name == "cancel_appointment":
             return _t_cancel_appointment(args.get("appointment_id") or "",
                                          args.get("reason") or "", ctx)
@@ -1003,9 +1004,38 @@ def _appt_for_agent(a: dict) -> dict:
     }
 
 
-def _t_list_patient_appointments(patient_id: str, include_past: bool) -> dict:
+def _owned_by_caller(appointment: dict, ctx: dict) -> bool:
+    """Return True if this appointment's patient_id is in the set of
+    patient_ids the agent has verified on this call (via successful
+    lookup_patient_* or create_patient). When the call is fresh and
+    nobody has been identified yet, the set is empty — we DENY in that
+    case rather than allow, so an unidentified caller can't reach into
+    another patient's record by guessing IDs."""
+    ids = ctx.get("identified_patient_ids") or set()
+    if not ids:
+        return False
+    return appointment.get("patient_id") in ids
+
+
+def _t_list_patient_appointments(patient_id: str, include_past: bool,
+                                  ctx: Optional[dict] = None) -> dict:
     if not patient_id:
         return {"error": "patient_id is required"}
+    # Authorisation: only the identified caller's appointments are
+    # returnable. Without this, the agent could pass an arbitrary
+    # patient_id and see another caller's bookings.
+    if ctx is not None:
+        ids = ctx.get("identified_patient_ids") or set()
+        if not ids:
+            return {"error": "Caller is not yet identified on this call. "
+                             "Run lookup_patient_by_phone / _by_id_number / "
+                             "_by_file_number first, or create_patient, "
+                             "BEFORE listing appointments."}
+        if patient_id not in ids:
+            return {"error": f"patient_id {patient_id} is not the "
+                             f"identified caller on this call. Refusing for "
+                             f"privacy. Only the caller's own patient_id "
+                             f"may be queried."}
     snap = load_snapshot()
     appts = snap.get("appointments", [])
     today_ymd = datetime.now().strftime("%Y-%m-%d")
@@ -1031,6 +1061,14 @@ def _t_cancel_appointment(appointment_id: str, reason: str, ctx: dict) -> dict:
     found = next((a for a in appts if a.get("id") == appointment_id), None)
     if found is None:
         return {"error": f"appointment {appointment_id} not found"}
+    if not _owned_by_caller(found, ctx):
+        return {"error": f"appointment {appointment_id} does NOT belong to "
+                         f"the identified caller (patient_id "
+                         f"{found.get('patient_id')!r}). REFUSED for privacy. "
+                         f"Always call list_patient_appointments(patient_id) "
+                         f"with the IDENTIFIED caller's patient_id first, and "
+                         f"only cancel an appointment_id that came back from "
+                         f"that list."}
     if found.get("status") == "cancelled":
         return {"error": f"appointment {appointment_id} is already cancelled"}
 
@@ -1068,6 +1106,14 @@ def _t_reschedule_appointment(appointment_id: str, new_date: str,
     target = next((a for a in appts if a.get("id") == appointment_id), None)
     if target is None:
         return {"error": f"appointment {appointment_id} not found"}
+    if not _owned_by_caller(target, ctx):
+        return {"error": f"appointment {appointment_id} does NOT belong to "
+                         f"the identified caller (patient_id "
+                         f"{target.get('patient_id')!r}). REFUSED for privacy. "
+                         f"Always call list_patient_appointments(patient_id) "
+                         f"with the IDENTIFIED caller's patient_id first, and "
+                         f"only reschedule an appointment_id that came back "
+                         f"from that list."}
     if target.get("status") in ("cancelled", "no_show", "completed"):
         return {"error": f"appointment {appointment_id} is {target.get('status')} — "
                          "cannot be rescheduled. Cancel and create a new one."}
@@ -1212,11 +1258,26 @@ def _t_send_whatsapp_template(args: dict, ctx: dict) -> dict:
         return {"error": rendered.get("error") or "template render failed"}
     text = rendered["text"]
 
-    # to_phone: explicit arg → ctx caller_phone → error.
+    # to_phone resolution order:
+    #   1. explicit arg `to_phone`
+    #   2. ctx['caller_phone'] (set by a successful lookup_patient_*)
+    #   3. fallback: any identified patient's phone in the snapshot
+    #      (covers the case where create_patient ran without a phone
+    #      lookup beforehand, so caller_phone is still empty even
+    #      though we have a patient_id).
     raw_phone = (args.get("to_phone") or "").strip() or (ctx.get("caller_phone") or "")
     if not raw_phone:
+        ids = ctx.get("identified_patient_ids") or set()
+        if ids:
+            snap = load_snapshot()
+            for p in snap.get("patients", []):
+                if p.get("id") in ids and p.get("phone"):
+                    raw_phone = str(p.get("phone")).strip()
+                    break
+    if not raw_phone:
         return {"error": "No phone to send to — caller_phone unknown on this "
-                         "call, pass to_phone explicitly."}
+                         "call and no identified patient has a phone on file. "
+                         "Pass to_phone explicitly."}
     phone = _wa_norm(raw_phone)
     if not phone:
         return {"error": f"Phone {raw_phone!r} could not be parsed."}

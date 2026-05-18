@@ -586,6 +586,51 @@ identifiers, not quantities.
   is not — patients find it embarrassing and unprofessional. When in
   doubt, leave it empty; never guess just to fill the field.
 
+### Arabic gender — DEFAULT MASCULINE, switch ONLY on hard evidence
+This rule keeps tripping up. RE-READ IT EVERY TURN before speaking
+Arabic.
+
+- Default to MASCULINE forms for the caller in every Arabic
+  sentence: "أنت" (no kasra), "حضرتك", "تفضل", "تقدر",
+  "أهلاً وسهلاً بك" (not "بكِ"), "كيف حالك" (not "حالكِ"),
+  "شكراً لك" (not "لكِ"), etc.
+- Switch to feminine ONLY after one of these:
+    1. The caller's voice on this call is unambiguously female
+       (consistently high pitch across multiple utterances).
+    2. The caller explicitly stated a female name (Sara, Fatima,
+       Nora, Layla, etc.) or used a feminine self-reference
+       ("أنا فاطمة", "زوجتي" doesn't count — that refers to
+       someone else).
+    3. The caller used a feminine verb form for themselves
+       ("أنا حابة", "أبغى" without a masculine marker doesn't
+       count — it's ambiguous).
+- Layla (you) being female does NOT change the caller's gender.
+  YOU are the agent; your output_audio voice is feminine because
+  that's the persona; the caller is a separate person.
+- If you're unsure, MASCULINE wins. Asking the caller their
+  gender is rude — infer from voice / context, default masculine
+  on insufficient evidence.
+
+### NEVER touch another caller's appointment
+The cancel/reschedule/list-appointments tools NOW refuse on the
+backend if the appointment_id doesn't belong to the identified
+caller's patient_id — but you should never even try. The flow is
+ALWAYS:
+
+  1. lookup_patient_by_phone / _by_id_number / _by_file_number →
+     returns a patient_id.
+  2. list_patient_appointments(patient_id=<that_one>) → returns
+     ONLY the caller's appointments. Read them to the caller to
+     confirm which one they mean.
+  3. cancel_appointment / reschedule_appointment with one of THOSE
+     appointment_ids — never a guessed one, never one you remember
+     from a previous call, never one with a "similar" patient name.
+
+If the caller asks to change someone else's appointment ("my
+wife's", "my son's"): you MUST decline and ask that the actual
+patient call themselves. The same-household exception does not
+exist for this demo.
+
 ### NO scheduling tool without a real patient_id
 Every scheduling tool — `list_free_slots`, `create_appointment`,
 `list_patient_appointments`, `cancel_appointment`,
@@ -1299,6 +1344,15 @@ class CallSession:
         # Per-call context that tool implementations close over. Lets a
         # tool set `end_requested = True` to terminate the call, or call
         # `broadcast(event)` to push something to subscribers.
+        #
+        # `identified_patient_ids` is the set of patient_ids the agent
+        # has actually verified on THIS call (via successful
+        # lookup_patient_* or create_patient). cancel/reschedule tools
+        # refuse to operate on appointments that don't belong to one of
+        # these — without this, the agent could silently mutate
+        # another patient's record. The set is mutated in-place from
+        # the receive loop as new tools land, so all subsequent tool
+        # calls see the latest membership.
         tool_ctx: dict = {
             "call_id":        self.call_id,
             "broadcast":      self.svc._broadcast,
@@ -1306,6 +1360,8 @@ class CallSession:
             # Exposed so `flag_for_supervisor` can mutate the session
             # state + broadcast in one shot (see CallSession.set_flag).
             "set_flag":       self.set_flag,
+            "caller_phone":   self.caller_phone or "",
+            "identified_patient_ids": self._issued_patient_ids,
         }
 
         cfg = types.LiveConnectConfig(
@@ -1493,6 +1549,12 @@ class CallSession:
                                         if fc.name.startswith("lookup_patient") and isinstance(result, dict) and result.get("found"):
                                             p = result.get("patient") or {}
                                             self.caller_phone = p.get("phone") or self.caller_phone
+                                            # Mirror into tool_ctx so the
+                                            # next tool call (e.g.
+                                            # send_whatsapp_template) can
+                                            # read the phone without
+                                            # touching the session object.
+                                            tool_ctx["caller_phone"] = self.caller_phone or ""
                                             self.svc._broadcast({
                                                 "type":    "caller_identified",
                                                 "call_id": self.call_id,
