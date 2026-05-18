@@ -24,6 +24,7 @@ from .ami import AMIService, AMICredentials
 from .wasender import build_client as build_wasender_client
 from . import whatsapp_inbox
 from . import whatsapp_templates
+from . import whatsapp_contacts
 from .agent_tools import load_snapshot, save_snapshot
 from ..auth import (
     clear_session,
@@ -362,6 +363,22 @@ async def whatsapp_send(payload: WhatsAppSendIn) -> dict:
         raise HTTPException(400, "text is required")
     if not (payload.to or "").strip():
         raise HTTPException(400, "to is required")
+    # Refuse LID targets up front — Wasender's send-message endpoint
+    # expects a phone number, and the LID doesn't resolve to one in
+    # this account's contact data. Better to surface the impossibility
+    # than send to "233908264300569" thinking it's a Ghana mobile.
+    if whatsapp_contacts.is_lid_jid(payload.to):
+        return {
+            "ok":    False,
+            "status": 0,
+            "error": (
+                "Cannot send to a WhatsApp LID (privacy ID). The sender "
+                "hasn't exposed their phone number — replies via the "
+                "send-message API need a real phone. Wait for them to "
+                "message you with their phone in-band, or ask them to "
+                "disable WhatsApp Business / privacy ID mode."
+            ),
+        }
     cfg = load_escalation_config()
     api_key  = str(cfg.get("wasender_api_key") or "").strip()
     personal = str(cfg.get("wasender_personal_token") or "").strip()
@@ -654,17 +671,28 @@ async def whatsapp_chats(limit: int = 300) -> dict:
         rec = grouped.setdefault(jid, {
             "jid":           jid,
             "name":          _jid_display_name(jid),
+            "display_name":  None,   # push-name from contacts cache (filled below)
+            "is_lid":        whatsapp_contacts.is_lid_jid(jid),
+            "is_group":      whatsapp_contacts.is_group_jid(jid),
             "last_text":     "",
             "last_ts":       0,
             "last_from_me":  False,
             "msg_count":     0,
-            "is_group":      jid.endswith("@g.us"),
         })
         rec["msg_count"] += 1
         if ts >= rec["last_ts"]:
             rec["last_ts"]      = ts
             rec["last_text"]    = text
             rec["last_from_me"] = _msg_from_me(m, our_digits)
+
+    # Fill in display_name from Wasender's contacts cache so a LID
+    # chat renders as the contact's push name ("Ahmed") instead of
+    # the raw 15-digit LID. Non-LID phone JIDs also benefit when the
+    # contact has a saved name.
+    for rec in grouped.values():
+        pretty = await whatsapp_contacts.display_name_for(rec["jid"])
+        if pretty:
+            rec["display_name"] = pretty
 
     chats = sorted(grouped.values(), key=lambda x: x["last_ts"], reverse=True)
     return {"ok": True, "chats": chats, "our_digits": our_digits,
