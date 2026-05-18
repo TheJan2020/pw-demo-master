@@ -439,9 +439,20 @@ def _msg_text(m: dict) -> str:
     return ""
 
 
-def _msg_from_me(m: dict) -> bool:
-    """Heuristics for which side sent the message."""
-    for k in ("fromMe", "from_me", "is_outgoing", "isOutgoing", "outgoing"):
+_OUTBOUND_STATUSES = {"sent", "delivered", "read", "playing", "played", "pending"}
+
+
+def _msg_from_me(m: dict, our_digits: str = "") -> bool:
+    """Heuristics for which side sent the message — tried in order of
+    increasing fragility.
+
+    `our_digits` is the digits-only form of our paired WhatsApp number,
+    auto-detected from the batch (see _detect_our_phone). When supplied
+    it lets us settle the direction by comparing m.from to our number,
+    which is much more reliable than the other signals."""
+    # 1. Explicit boolean fields.
+    for k in ("fromMe", "from_me", "is_outgoing", "isOutgoing",
+              "outgoing", "is_sent_by_me", "sentByMe"):
         v = m.get(k)
         if isinstance(v, bool):
             return v
@@ -450,18 +461,58 @@ def _msg_from_me(m: dict) -> bool:
         for k in ("fromMe", "from_me"):
             if isinstance(key.get(k), bool):
                 return key[k]
-    direction = str(m.get("direction") or m.get("dir") or "").lower()
+    # 2. Direction-marker string fields.
+    direction = str(m.get("direction") or m.get("dir")
+                    or m.get("messageDirection") or m.get("flow") or "").lower()
     if direction in ("out", "outgoing", "outbound", "sent", "send"):
         return True
     if direction in ("in", "incoming", "inbound", "received", "receive"):
         return False
-    # Last resort — Wasender sometimes flags outbound rows with a
-    # status of "sent" / "delivered" / "read" and inbound with just
-    # "received" — but this is too fragile to rely on, so default to
-    # treating unknown direction as inbound (caller side) so the
-    # operator sees them rather than mistakes their own outbound
-    # for the caller's.
+    # 3. Status-based — only outbound rows ever reach delivered/read.
+    status = str(m.get("status") or m.get("messageStatus") or "").lower()
+    if status in _OUTBOUND_STATUSES:
+        return True
+    # 4. Compare m.from digits to our paired number's digits.
+    if our_digits:
+        import re as _re_inner
+        for k in ("from", "sender", "from_number", "fromPhone", "from_jid"):
+            v = m.get(k)
+            if not isinstance(v, str): continue
+            d = _re_inner.sub(r"\D", "", v)
+            if d:
+                return d == our_digits
     return False
+
+
+def _detect_our_phone(items: list) -> str:
+    """Across all message rows, the phone number that appears in the
+    most rows is almost certainly our paired WhatsApp number — it's in
+    every conversation, the partner numbers each appear in only one.
+    Returns digits-only, or "" if we can't tell."""
+    from collections import Counter
+    import re as _re_inner
+    counts: Counter = Counter()
+    for m in items or []:
+        if not isinstance(m, dict): continue
+        for key in ("from", "to", "sender", "recipient",
+                    "from_number", "to_number", "from_jid", "to_jid"):
+            v = m.get(key)
+            if isinstance(v, str):
+                d = _re_inner.sub(r"\D", "", v)
+                if len(d) >= 8:    # ignore obvious non-phone numerics
+                    counts[d] += 1
+        # Also check key.remoteJid + key.participant if present.
+        key_obj = m.get("key")
+        if isinstance(key_obj, dict):
+            for kk in ("remoteJid", "participant"):
+                v = key_obj.get(kk)
+                if isinstance(v, str):
+                    d = _re_inner.sub(r"\D", "", v)
+                    if len(d) >= 8:
+                        counts[d] += 1
+    if not counts:
+        return ""
+    return counts.most_common(1)[0][0]
 
 
 def _jid_display_name(jid: str) -> str:
@@ -491,8 +542,11 @@ async def whatsapp_chats(limit: int = 300) -> dict:
     if not result.get("ok"):
         return {"ok": False, "chats": [], "error": result.get("error")}
 
+    items = result.get("items") or []
+    our_digits = _detect_our_phone(items)
+
     grouped: dict[str, dict] = {}
-    for m in (result.get("items") or []):
+    for m in items:
         if not isinstance(m, dict):
             continue
         jid = _msg_jid(m)
@@ -513,10 +567,11 @@ async def whatsapp_chats(limit: int = 300) -> dict:
         if ts >= rec["last_ts"]:
             rec["last_ts"]      = ts
             rec["last_text"]    = text
-            rec["last_from_me"] = _msg_from_me(m)
+            rec["last_from_me"] = _msg_from_me(m, our_digits)
 
     chats = sorted(grouped.values(), key=lambda x: x["last_ts"], reverse=True)
-    return {"ok": True, "chats": chats, "total_messages": len(result.get("items") or [])}
+    return {"ok": True, "chats": chats, "our_digits": our_digits,
+            "total_messages": len(items)}
 
 
 @router.get("/whatsapp/messages")
@@ -541,8 +596,13 @@ async def whatsapp_messages(jid: str, limit: int = 300) -> dict:
     def _digits(s: str) -> str:
         return _re.sub(r"\D", "", s or "")
     target_digits = _digits(jid)
+    items = result.get("items") or []
+    # Auto-detect our paired number across the WHOLE batch (not just
+    # rows that match this chat) — gives the from/to comparison its
+    # best chance of being right.
+    our_digits = _detect_our_phone(items)
     rows = []
-    for m in (result.get("items") or []):
+    for m in items:
         if not isinstance(m, dict):
             continue
         row_jid = _msg_jid(m)
@@ -551,13 +611,14 @@ async def whatsapp_messages(jid: str, limit: int = 300) -> dict:
         rows.append({
             "id":       m.get("id") or (m.get("key") or {}).get("id"),
             "ts":       _msg_ts(m),
-            "from_me":  _msg_from_me(m),
+            "from_me":  _msg_from_me(m, our_digits),
             "text":     _msg_text(m),
             # Raw type tag for icons / styling
             "type":     m.get("messageType") or m.get("type") or "text",
         })
     rows.sort(key=lambda r: r["ts"])
-    return {"ok": True, "messages": rows, "count": len(rows)}
+    return {"ok": True, "messages": rows, "count": len(rows),
+            "our_digits": our_digits}
 
 
 @router.get("/whatsapp/raw")
