@@ -568,6 +568,20 @@ def execute_tool(name: str, args: dict, ctx: dict) -> dict:
     we use it to set `end_requested = True` for end_call, and to expose
     a `broadcast(event)` callable for tool_mutation events.
     """
+    # Compact dispatch log — appears in the Debug page so you can see
+    # at a glance which tools the agent invoked, with which args. We
+    # strip very long values (like full patient lists) so the line
+    # stays readable.
+    try:
+        compact_args = {
+            k: (v if not isinstance(v, str) or len(v) < 80 else f"{v[:77]}…")
+            for k, v in args.items()
+        }
+        logger.info("dispatch %s args=%s call_id=%s ids=%s",
+                    name, compact_args, ctx.get("call_id"),
+                    sorted(ctx.get("identified_patient_ids") or []))
+    except Exception:
+        pass
     try:
         if name == "lookup_patient_by_phone":
             return _t_lookup_phone(args.get("phone") or "")
@@ -855,6 +869,18 @@ def _t_create_patient(args: dict, ctx: dict) -> dict:
     patients.append(record)
     snap["patients"] = patients
     save_snapshot(snap)
+    logger.info("create_patient SAVED id=%s file=%s name=%r phone=%r",
+                new_id, file_number, name, phone)
+
+    # Mirror into the identified-set on this call so subsequent
+    # cancel/reschedule tools recognise the caller as the owner.
+    ids = ctx.get("identified_patient_ids")
+    if isinstance(ids, set):
+        ids.add(new_id)
+    # And keep ctx['caller_phone'] in sync so the auto-send below
+    # (and any later send_whatsapp_template call) finds the number.
+    if phone and not ctx.get("caller_phone"):
+        ctx["caller_phone"] = phone
 
     broadcast = ctx.get("broadcast")
     if callable(broadcast):
@@ -1057,13 +1083,19 @@ def _auto_send_template(template_id: str, ctx: dict, variables: dict,
         "language":    (language or ctx.get("call_language") or "ar"),
     }
     args.update({k: v for k, v in variables.items() if v not in (None, "")})
+    logger.info("auto-send WhatsApp template=%s to=%s lang=%s",
+                template_id, args.get("to_phone"), args.get("language"))
     try:
         result = _t_send_whatsapp_template(args, ctx)
         if isinstance(result, dict) and result.get("error"):
-            logger.info(
-                "auto-send WhatsApp %s skipped: %s",
+            logger.warning(
+                "auto-send WhatsApp %s FAILED: %s",
                 template_id, result.get("error"),
             )
+        else:
+            logger.info("auto-send WhatsApp %s OK (message_id=%s)",
+                        template_id,
+                        (result or {}).get("message_id") if isinstance(result, dict) else None)
     except Exception:
         logger.exception("auto-send WhatsApp %s crashed (non-fatal)",
                           template_id)

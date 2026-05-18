@@ -2195,3 +2195,66 @@ def delete_saved_call(call_id: str) -> bool:
 
 
 clinic_live_agent_service = ClinicLiveAgentService()
+
+
+# ============================================================================
+# Debug log → WebSocket fan-out
+# ============================================================================
+# Attaches a logging.Handler to every clinic-module logger so anything
+# we already write via logger.info / .warning / .exception is also
+# broadcast to dashboards subscribed to `/agent/ws` as a `debug` event.
+# The SPA's Call Center → Debug page subscribes and renders the stream
+# in real time. Cheap: only the events the operator opens the page for
+# are processed by them; backend cost is the format() of the record +
+# a dict put on a Queue.
+
+class _DebugBroadcastHandler(logging.Handler):
+    def __init__(self) -> None:
+        super().__init__(level=logging.INFO)
+        # Plain message — keep payload small. Timestamp + level + logger
+        # already travel as structured fields.
+        self.setFormatter(logging.Formatter("%(message)s"))
+
+    def emit(self, record: logging.LogRecord) -> None:
+        try:
+            msg = self.format(record)
+            exc_text: Optional[str] = None
+            if record.exc_info and self.formatter:
+                try:
+                    exc_text = self.formatter.formatException(record.exc_info)
+                except Exception:
+                    exc_text = None
+            clinic_live_agent_service._broadcast({
+                "type":    "debug",
+                "ts":      record.created,
+                "level":   record.levelname,
+                "logger":  record.name,
+                "message": msg,
+                "exc":     exc_text,
+            })
+        except Exception:
+            # Never let logging crash the app.
+            pass
+
+
+def _install_debug_handler() -> None:
+    """Attach the broadcast handler to all clinic loggers once at
+    import. Safe to call repeatedly — duplicates are filtered."""
+    targets = (
+        "clinic_live_agent",
+        "clinic_agent_tools",
+        "demo_clinic",
+        "demo_clinic.wasender",
+        "demo_clinic.whatsapp_inbox",
+        "demo_clinic.whatsapp_templates",
+    )
+    handler = _DebugBroadcastHandler()
+    for name in targets:
+        lg = logging.getLogger(name)
+        # Avoid duplicate handlers on hot-reload.
+        if not any(isinstance(h, _DebugBroadcastHandler) for h in lg.handlers):
+            lg.addHandler(handler)
+            lg.setLevel(logging.INFO)
+
+
+_install_debug_handler()
