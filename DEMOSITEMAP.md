@@ -1238,6 +1238,70 @@ ChanSpy options (`qso[Bw]`):
 
 ---
 
+## 6e. WhatsApp inbox — receiving messages via webhook (IMPLEMENTED)
+
+WasenderApi's `GET /api/whatsapp-sessions/{id}/message-logs` is
+**outbound-only**. To see incoming messages on the WhatsApp page
+the operator has to wire Wasender's webhook to call into our
+backend, which persists each row locally and merges them into the
+inbox view.
+
+### Backend pieces
+
+- `backend/app/demos/clinic/whatsapp_inbox.py` — tiny file-backed
+  ring buffer (`data/demos/clinic/whatsapp_inbox.json`, capped at
+  2000 rows, gitignored because it carries caller PII). Exposes
+  `store_webhook(payload)`, `list_inbox()`, `clear_inbox()`.
+- `POST /api/demo/clinic/whatsapp/webhook` (in `router.py`) —
+  accepts any JSON Wasender sends, deep-walks for message-row
+  dicts, dedupes on `id`, stamps each with `received_at`, persists.
+- `GET /api/demo/clinic/whatsapp/inbox?limit=50` — read-back of
+  the stored rows; useful sanity check that the webhook is
+  actually reaching us.
+- `DELETE /api/demo/clinic/whatsapp/inbox` — wipe the store.
+- `/whatsapp/chats` and `/whatsapp/messages` now concat
+  `outbound_logs + list_inbox()` before grouping / filtering. The
+  same direction-detection heuristics handle both sides; the new
+  `received_at` field is picked up by `_msg_ts`.
+
+### Wiring Wasender's webhook (one-time per machine, per Wasender account)
+
+1. Run the backend somewhere reachable from the public internet.
+   For local demos a tunnel is fine — `ngrok http 8080` (or
+   `cloudflared tunnel --url http://localhost:8080`) gives you
+   `https://something.ngrok-free.app/`.
+2. WasenderApi dashboard → Webhooks → Add webhook.
+   - URL: `https://<public-host>/api/demo/clinic/whatsapp/webhook`
+   - Events: tick "Message Received" (and Personal / Group
+     variants if your tier shows them separately).
+   - Secret: leave blank for the demo; signature verification
+     isn't wired yet.
+3. Send yourself a test WhatsApp message TO the paired number.
+   Within ~2s the row should appear in
+   `GET /api/demo/clinic/whatsapp/inbox?limit=5` and within the
+   next chat-list poll tick (~15 s) in the SPA's WhatsApp page.
+
+If nothing shows: tunnel down, Wasender webhook misconfigured, or
+your account doesn't have webhooks on its plan tier. Use
+`uvicorn --log-level debug` and watch for the
+`WhatsApp webhook stored N new message(s)` log line — it fires on
+every successful webhook hit.
+
+### Patient linking on the WhatsApp page
+
+The chat list and chat header look up each conversation's phone
+number against the local Patients registry (`useDemoCollection`
+on `patients`). When the last 9 digits match a patient, the chat
+title swaps to the patient's name (Arabic when `lang === "ar"`),
+an emerald file-number badge appears, and the file-number badge
+in the chat header links to `/patients`. Lookup is purely
+client-side — no extra API calls — and updates live whenever the
+patient list changes (other tabs included, via the same
+`pwdemo:clinic:data-change` window event the rest of the SPA
+uses).
+
+---
+
 ## 6d. Live Agent — recent persona + tool hardening (IMPLEMENTED)
 
 A batch of smaller fixes that landed alongside §6c, all driven by

@@ -22,6 +22,7 @@ from .live_agent import (
 )
 from .ami import AMIService, AMICredentials
 from .wasender import build_client as build_wasender_client
+from . import whatsapp_inbox
 from .agent_tools import load_snapshot, save_snapshot
 from ..auth import (
     clear_session,
@@ -258,7 +259,57 @@ async def whatsapp_status() -> dict:
     # Expose the PAT-availability flag so the SPA can grey out the
     # inbox tab with a useful hint instead of just showing the raw
     # Wasender error.
-    return {"configured": True, "personal_token_configured": bool(personal), **result}
+    inbox = whatsapp_inbox.inbox_stats()
+    return {
+        "configured": True,
+        "personal_token_configured": bool(personal),
+        "inbox_stored":   inbox["count"],
+        "inbox_last_ts":  inbox["last_ts"],
+        **result,
+    }
+
+
+# --- Incoming-message webhook ---------------------------------------------
+# WasenderApi's /whatsapp-sessions/{id}/message-logs only returns OUTBOUND
+# messages — incoming arrives via webhooks the operator wires up on the
+# WasenderApi dashboard (Webhooks → Add webhook → URL: this endpoint,
+# events: messages.upsert / Message Received). We accept whatever Wasender
+# posts, deep-search for message rows, and persist them locally so the
+# inbox UI can merge them with the outbound logs.
+
+@router.post("/whatsapp/webhook")
+async def whatsapp_webhook(request: Request) -> dict:
+    try:
+        payload = await request.json()
+    except Exception:
+        # Some Wasender variants post form-encoded; fall back to raw.
+        try:
+            body = (await request.body()).decode("utf-8", "ignore")
+            payload = json.loads(body) if body.strip().startswith(("{", "[")) else {"raw": body}
+        except Exception:
+            payload = {}
+    added = whatsapp_inbox.store_webhook(payload if isinstance(payload, dict) else {"payload": payload})
+    if added:
+        logger.info("WhatsApp webhook stored %d new message(s)", added)
+    return {"ok": True, "added": added}
+
+
+@router.get("/whatsapp/inbox")
+async def whatsapp_inbox_dump(limit: int = 50) -> dict:
+    """Read-back of the locally-stored incoming messages — useful for
+    confirming the Wasender webhook is actually hitting us."""
+    rows = whatsapp_inbox.list_inbox()
+    return {
+        "ok":    True,
+        "count": len(rows),
+        "rows":  rows[-max(1, min(500, int(limit))):],
+    }
+
+
+@router.delete("/whatsapp/inbox")
+async def whatsapp_inbox_clear() -> dict:
+    removed = whatsapp_inbox.clear_inbox()
+    return {"ok": True, "removed": removed}
 
 
 @router.post("/whatsapp/send")
@@ -323,7 +374,8 @@ def _msg_jid(m: dict) -> str:
 def _msg_ts(m: dict) -> int:
     """Best-effort epoch-seconds timestamp. Falls back to 0 so unparseable
     rows don't crash the sort."""
-    for k in ("messageTimestamp", "timestamp", "ts", "createdAt", "created_at"):
+    for k in ("messageTimestamp", "timestamp", "ts",
+              "createdAt", "created_at", "received_at"):
         v = m.get(k)
         if v is None:
             continue
@@ -542,7 +594,12 @@ async def whatsapp_chats(limit: int = 300) -> dict:
     if not result.get("ok"):
         return {"ok": False, "chats": [], "error": result.get("error")}
 
-    items = result.get("items") or []
+    # Outbound (from Wasender's message-logs) + inbound (webhook-fed,
+    # stored locally). Wasender's logs are sent-only — without the
+    # local inbox the operator would never see incoming messages.
+    outbound = result.get("items") or []
+    inbound  = whatsapp_inbox.list_inbox()
+    items    = list(outbound) + list(inbound)
     our_digits = _detect_our_phone(items)
 
     grouped: dict[str, dict] = {}
@@ -596,7 +653,11 @@ async def whatsapp_messages(jid: str, limit: int = 300) -> dict:
     def _digits(s: str) -> str:
         return _re.sub(r"\D", "", s or "")
     target_digits = _digits(jid)
-    items = result.get("items") or []
+    # Same merge as /whatsapp/chats — Wasender's logs are outbound-only
+    # so we splice the locally-stored inbound rows in here.
+    outbound = result.get("items") or []
+    inbound  = whatsapp_inbox.list_inbox()
+    items    = list(outbound) + list(inbound)
     # Auto-detect our paired number across the WHOLE batch (not just
     # rows that match this chat) — gives the from/to comparison its
     # best chance of being right.
