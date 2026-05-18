@@ -2280,6 +2280,7 @@ def _install_debug_handler() -> None:
         "clinic_live_agent",
         "clinic_agent_tools",
         "demo_clinic",
+        "demo_clinic.ami",
         "demo_clinic.wasender",
         "demo_clinic.whatsapp_inbox",
         "demo_clinic.whatsapp_templates",

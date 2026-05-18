@@ -265,13 +265,34 @@ class AMIService:
              least knows the integration fired.
         """
         creds = self._load_creds()
+        # Entry log — shows up on the Debug page so the operator can see
+        # the click reached the backend, with which (non-secret) creds
+        # and target extension. The early-exit returns below don't log
+        # otherwise.
+        logger.info(
+            "dial_supervisor ENTRY call_id=%s ext=%r mode=%s creds_complete=%s "
+            "host=%r port=%s user=%r secret_set=%s",
+            call_id, extension, spy_mode, creds.is_complete(),
+            creds.host, creds.port, creds.username, bool(creds.secret),
+        )
         if not creds.is_complete():
-            return {
-                "ok": False,
-                "error": "AMI credentials are incomplete. Fill in host / username / secret in Call Center → Configuration → PBX integration.",
-            }
+            err = (
+                "AMI credentials are incomplete (host / port / username / "
+                "secret all required). Open Call Center → Configuration → "
+                "PBX integration on THIS machine — escalation.json is "
+                "per-machine (gitignored), so the values from the other "
+                "machine don't sync."
+            )
+            logger.warning("dial_supervisor BAIL: %s", err)
+            return {"ok": False, "error": err}
         if not extension:
-            return {"ok": False, "error": "supervisor_extension not configured"}
+            err = (
+                "supervisor_extension not configured. Open Call Center → "
+                "Configuration → Supervisor escalation triggers on THIS "
+                "machine and set it."
+            )
+            logger.warning("dial_supervisor BAIL: %s", err)
+            return {"ok": False, "error": err}
 
         # Normalise spy_mode → ChanSpy option string. Bad value falls
         # back to barge silently (safer than failing on a typo).
