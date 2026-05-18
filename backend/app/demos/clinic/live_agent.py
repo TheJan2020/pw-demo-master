@@ -576,6 +576,29 @@ identifiers, not quantities.
   is not — patients find it embarrassing and unprofessional. When in
   doubt, leave it empty; never guess just to fill the field.
 
+### NO scheduling tool without a real patient_id
+Every scheduling tool — `list_free_slots`, `create_appointment`,
+`list_patient_appointments`, `cancel_appointment`,
+`reschedule_appointment` — requires a real `patient_id` that
+came from a SUCCESSFUL `create_patient` or `lookup_patient_*`
+response on this call. Trying to schedule without one is one of
+the most common failures the runtime catches:
+
+- For a NEW caller: finish intake (name minimum — every other
+  field can be empty), call `create_patient`, read its
+  `patient_id` out of the response, THEN call scheduling tools.
+- For a RETURNING caller: call `lookup_patient_by_phone` /
+  `_by_id_number` / `_by_file_number` until you have a match,
+  then use that `patient_id`.
+- If `create_patient` returned an error, the patient was NOT
+  saved. Fix and retry; do NOT proceed to scheduling on the
+  assumption that "the agent collected the info, that's enough".
+
+If you skip this and call a scheduling tool, the runtime will
+interrupt the call with a system override telling you to fix it.
+That correction will be visible to the operator on the Dashboard,
+so the cleaner pattern is "create first, schedule second".
+
 ### Changing an existing booking
 - If the caller asks to CHANGE, MOVE, RESCHEDULE, or CANCEL an
   appointment, do NOT confirm anything until you have:
@@ -843,6 +866,11 @@ class CallSession:
         # repeats the same fabricated value mid-sentence.
         self._corrected_ids:          set[str] = set()
         self._corrected_times:        set[str] = set()
+        # Set once we've nudged the agent that it tried to schedule
+        # without a patient_id — prevents spamming the same correction
+        # on every subsequent list_free_slots call before the agent has
+        # had a chance to act on it.
+        self._nudged_no_patient_ctx:  bool = False
         # Optional caller phone — populated if the dialplan ever passes
         # CALLERID via an out-of-band channel (TODO; see DEMOSITEMAP).
         self.caller_phone: Optional[str] = None
@@ -884,6 +912,58 @@ class CallSession:
             "call_id": self.call_id,
         })
         return True
+
+    async def _nudge_no_patient_context(self, session, tool_name: str) -> None:
+        """Agent invoked a scheduling tool without ever obtaining a
+        patient_id from create_patient or lookup_patient_*. The booking
+        flow can't complete — create_appointment will 404 on the
+        invented patient_id, and even if we don't get that far, the
+        patient record will silently never be created. Inject a system
+        override and reset the nudged-flag when the agent finally does
+        get a real patient_id (see whitelist populator above)."""
+        if self._nudged_no_patient_ctx:
+            return
+        self._nudged_no_patient_ctx = True
+        logger.warning(
+            "clinic call %s: nudge — agent called %s with no patient_id",
+            self.call_id, tool_name,
+        )
+        self.svc._broadcast({
+            "type":    "no_patient_context",
+            "call_id": self.call_id,
+            "tool":    tool_name,
+        })
+        msg = (
+            "(system override) STOP. You just called "
+            f"`{tool_name}` but you have NOT yet created or identified "
+            "this caller — no `create_patient` and no `lookup_patient_*` "
+            "tool has returned a patient_id on this call. Any "
+            "appointment you try to book now WILL fail, and the "
+            "details the caller just shared will NOT be saved.\n\n"
+            "Do this RIGHT NOW, in order:\n"
+            "  1. If you just finished collecting NEW-patient details "
+            "(name + whatever else they gave you), call "
+            "`create_patient` with that data. Only `name` is strictly "
+            "required — pass empty strings for anything the caller "
+            "didn't share.\n"
+            "  2. If this is a RETURNING caller you should have "
+            "already looked up, call `lookup_patient_by_phone` (or by "
+            "id_number / file_number) now.\n"
+            "  3. Once you have a real patient_id from the tool's "
+            "response, THEN re-call the scheduling tool.\n\n"
+            "Do not quote any slot times or appointment confirmations "
+            "until step 3 has succeeded. If you already mentioned a "
+            "time to the caller, that time is NOT booked — correct "
+            "yourself."
+        )
+        try:
+            await session.send_client_content(
+                turns=types.Content(role="user", parts=[types.Part(text=msg)]),
+                turn_complete=True,
+            )
+        except Exception:
+            logger.exception("clinic call %s: failed to send no-patient nudge",
+                             self.call_id)
 
     async def _check_fabrications(self, session) -> None:
         """Scan the agent's accumulated transcribed speech for
@@ -1385,6 +1465,28 @@ class CallSession:
                                             await session.send_tool_response(function_responses=responses)
                                         except Exception:
                                             logger.exception("send_tool_response failed")
+                                    # Structural nudge: if the agent moved
+                                    # into scheduling without first
+                                    # creating or identifying the caller,
+                                    # block here. Past failures we caught
+                                    # this way: intake done + confirmed +
+                                    # agent jumps to list_free_slots
+                                    # without calling create_patient, so
+                                    # the would-be record is never saved
+                                    # and the subsequent create_appointment
+                                    # would 404 anyway.
+                                    scheduling_tools = (
+                                        "list_free_slots",
+                                        "create_appointment",
+                                        "list_patient_appointments",
+                                        "cancel_appointment",
+                                        "reschedule_appointment",
+                                    )
+                                    for fc in (tc.function_calls or []):
+                                        if (fc.name in scheduling_tools
+                                                and not self._issued_patient_ids):
+                                            await self._nudge_no_patient_context(session, fc.name)
+                                            break
                                     # If a tool requested hangup, drop out cleanly
                                     # after the agent's closing line finishes.
                                     if tool_ctx.get("end_requested"):
