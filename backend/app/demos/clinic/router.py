@@ -284,12 +284,40 @@ async def whatsapp_send(payload: WhatsAppSendIn) -> dict:
 
 def _msg_jid(m: dict) -> str:
     """Pick the chat-key (remoteJid) from a message-log row. WasenderApi
-    has used `remoteJid`, `chatJid`, and `jid` interchangeably across
-    versions — accept all three."""
-    return (
-        m.get("remoteJid") or m.get("chatJid") or m.get("jid")
-        or m.get("from") or m.get("to") or ""
-    )
+    has used several different field names across plans + versions —
+    accept all the candidates we've seen, and as a last resort scan
+    string values for an `@s.whatsapp.net` / `@g.us` suffix and take
+    the first one that isn't our own paired number."""
+    # Direct keys.
+    for k in ("remoteJid", "chatJid", "jid", "chat_id", "chatId",
+              "from", "to", "sender", "recipient", "phone", "number"):
+        v = m.get(k)
+        if isinstance(v, str) and v.strip():
+            # Normalise bare-digits to a JID so grouping is consistent.
+            if "@" not in v and v.strip().isdigit():
+                return f"{v.strip()}@s.whatsapp.net"
+            return v.strip()
+    # Nested key.{remoteJid}
+    key = m.get("key")
+    if isinstance(key, dict):
+        v = key.get("remoteJid") or key.get("jid")
+        if isinstance(v, str) and v.strip():
+            return v.strip()
+    # Deep fallback — any string that looks like a JID.
+    def walk(node, depth: int = 0) -> str:
+        if depth > 5: return ""
+        if isinstance(node, str) and ("@s.whatsapp.net" in node or "@g.us" in node):
+            return node
+        if isinstance(node, dict):
+            for v in node.values():
+                r = walk(v, depth + 1)
+                if r: return r
+        elif isinstance(node, list):
+            for v in node:
+                r = walk(v, depth + 1)
+                if r: return r
+        return ""
+    return walk(m)
 
 
 def _msg_ts(m: dict) -> int:
@@ -316,16 +344,71 @@ def _msg_ts(m: dict) -> int:
     return 0
 
 
+# Keys we'll never accept as the message body even if they happen to
+# contain a string. Anything else string-shaped is a candidate.
+_NON_TEXT_KEYS = {
+    "id", "messageId", "message_id", "key", "remoteJid", "chatJid",
+    "jid", "from", "to", "sender", "recipient", "phone", "number",
+    "messageTimestamp", "timestamp", "ts", "createdAt", "created_at",
+    "updatedAt", "updated_at", "sessionId", "session_id", "session",
+    "status", "ack", "direction", "fromMe", "from_me",
+    "messageType", "type", "kind", "mediaType",
+    "remoteJidServer", "participant",
+}
+
+
+def _deep_find_text(node, depth: int = 0) -> str:
+    """Recursively dig for a plausible message body inside an arbitrary
+    JSON shape. Returns the LONGEST non-whitelisted string found —
+    real message bodies are almost always the largest free-text value
+    in the row."""
+    if depth > 6:
+        return ""
+    best = ""
+    if isinstance(node, dict):
+        for k, v in node.items():
+            if k in _NON_TEXT_KEYS:
+                continue
+            if isinstance(v, str):
+                # Skip ISO timestamps + JIDs + WhatsApp IDs (heuristic
+                # — they look stringy but aren't message bodies).
+                stripped = v.strip()
+                if not stripped: continue
+                if "@s.whatsapp.net" in v or "@g.us" in v: continue
+                if len(stripped) > len(best):
+                    best = stripped
+            elif isinstance(v, (dict, list)):
+                deeper = _deep_find_text(v, depth + 1)
+                if len(deeper) > len(best):
+                    best = deeper
+    elif isinstance(node, list):
+        for item in node:
+            deeper = _deep_find_text(item, depth + 1)
+            if len(deeper) > len(best):
+                best = deeper
+    return best
+
+
 def _msg_text(m: dict) -> str:
-    """Pull the displayable text out of a message-log row. WhatsApp
-    messages can be in many envelopes — text, image+caption, etc. We
-    return whatever string-y body we find, plus a [type] tag for media."""
-    # Direct text field on common shapes
-    for k in ("text", "body", "message", "content"):
+    """Pull the displayable text out of a message-log row. Tries the
+    common explicit paths first, then falls back to a recursive deep
+    search for the longest plausible string. Returns the text, or a
+    `[type]` tag for media-only messages, or empty string."""
+    # Direct text field on common shapes (Wasender flat + a few common
+    # third-party shapes).
+    for k in ("text", "body", "message", "content",
+              "messageText", "messageContent", "message_body",
+              "text_body", "msg", "msg_text", "caption"):
         v = m.get(k)
         if isinstance(v, str) and v.strip():
             return v
-    # Nested under `message.text` / `message.conversation` (Baileys-ish)
+        # Some shapes nest the actual body one level deeper:
+        if isinstance(v, dict):
+            for inner in ("text", "body", "content", "caption", "conversation"):
+                vv = v.get(inner)
+                if isinstance(vv, str) and vv.strip():
+                    return vv
+    # Baileys-ish: message.{conversation,extendedTextMessage.text,…}
     msg = m.get("message")
     if isinstance(msg, dict):
         for k in ("conversation", "extendedTextMessage", "text"):
@@ -337,11 +420,19 @@ def _msg_text(m: dict) -> str:
                 if isinstance(txt, str) and txt.strip():
                     return txt
         # Image / video / document → show a placeholder
-        for kind in ("imageMessage", "videoMessage", "audioMessage", "documentMessage", "stickerMessage"):
+        for kind in ("imageMessage", "videoMessage", "audioMessage",
+                     "documentMessage", "stickerMessage"):
             if kind in msg:
                 caption = (msg[kind] or {}).get("caption") if isinstance(msg[kind], dict) else None
                 label = kind.replace("Message", "")
                 return f"[{label}]" + (f" {caption}" if caption else "")
+
+    # Recursive fallback — covers Wasender variants we haven't enumerated
+    # explicitly. Cheap because rows are small.
+    deep = _deep_find_text(m)
+    if deep:
+        return deep
+
     mtype = m.get("messageType") or m.get("type")
     if mtype:
         return f"[{mtype}]"
@@ -350,18 +441,26 @@ def _msg_text(m: dict) -> str:
 
 def _msg_from_me(m: dict) -> bool:
     """Heuristics for which side sent the message."""
-    if isinstance(m.get("fromMe"), bool):
-        return m["fromMe"]
-    if isinstance(m.get("from_me"), bool):
-        return m["from_me"]
+    for k in ("fromMe", "from_me", "is_outgoing", "isOutgoing", "outgoing"):
+        v = m.get(k)
+        if isinstance(v, bool):
+            return v
     key = m.get("key")
-    if isinstance(key, dict) and isinstance(key.get("fromMe"), bool):
-        return key["fromMe"]
-    direction = (m.get("direction") or "").lower()
-    if direction in ("out", "outgoing", "outbound", "sent"):
+    if isinstance(key, dict):
+        for k in ("fromMe", "from_me"):
+            if isinstance(key.get(k), bool):
+                return key[k]
+    direction = str(m.get("direction") or m.get("dir") or "").lower()
+    if direction in ("out", "outgoing", "outbound", "sent", "send"):
         return True
-    if direction in ("in", "incoming", "inbound", "received"):
+    if direction in ("in", "incoming", "inbound", "received", "receive"):
         return False
+    # Last resort — Wasender sometimes flags outbound rows with a
+    # status of "sent" / "delivered" / "read" and inbound with just
+    # "received" — but this is too fragile to rely on, so default to
+    # treating unknown direction as inbound (caller side) so the
+    # operator sees them rather than mistakes their own outbound
+    # for the caller's.
     return False
 
 
@@ -435,11 +534,19 @@ async def whatsapp_messages(jid: str, limit: int = 300) -> dict:
     if not result.get("ok"):
         return {"ok": False, "messages": [], "error": result.get("error")}
 
+    # Compare on digits-only — a message row might store the JID as
+    # "9665…@s.whatsapp.net", "9665…", or "+9665 …" depending on the
+    # endpoint. Matching on digits sidesteps all of that.
+    import re as _re
+    def _digits(s: str) -> str:
+        return _re.sub(r"\D", "", s or "")
+    target_digits = _digits(jid)
     rows = []
     for m in (result.get("items") or []):
         if not isinstance(m, dict):
             continue
-        if _msg_jid(m) != jid:
+        row_jid = _msg_jid(m)
+        if _digits(row_jid) != target_digits and row_jid != jid:
             continue
         rows.append({
             "id":       m.get("id") or (m.get("key") or {}).get("id"),
@@ -451,6 +558,26 @@ async def whatsapp_messages(jid: str, limit: int = 300) -> dict:
         })
     rows.sort(key=lambda r: r["ts"])
     return {"ok": True, "messages": rows, "count": len(rows)}
+
+
+@router.get("/whatsapp/raw")
+async def whatsapp_raw(limit: int = 5) -> dict:
+    """Return the first `limit` message-log rows VERBATIM from
+    WasenderApi — bypasses our normalisation. Used to diagnose
+    "messages show as [text]" / "I sent a reply and it doesn't appear"
+    issues. The shape Wasender returns varies per plan tier, and the
+    only way to know what field your account uses for the body is to
+    look at the raw row."""
+    cfg = load_escalation_config()
+    api_key    = str(cfg.get("wasender_api_key") or "").strip()
+    personal   = str(cfg.get("wasender_personal_token") or "").strip()
+    session_id = str(cfg.get("wasender_session_id") or "").strip()
+    client = build_wasender_client(api_key, personal)
+    result = await client.list_messages(session_id, limit=max(1, min(20, int(limit))))
+    if not result.get("ok"):
+        return {"ok": False, "error": result.get("error")}
+    items = (result.get("items") or [])[:max(1, min(20, int(limit)))]
+    return {"ok": True, "count": len(items), "items": items}
 
 
 # ----- Saved-call History --------------------------------------------------
