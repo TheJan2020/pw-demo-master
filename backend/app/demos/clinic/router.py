@@ -23,6 +23,7 @@ from .live_agent import (
 from .ami import AMIService, AMICredentials
 from .wasender import build_client as build_wasender_client
 from . import whatsapp_inbox
+from . import whatsapp_templates
 from .agent_tools import load_snapshot, save_snapshot
 from ..auth import (
     clear_session,
@@ -310,6 +311,45 @@ async def whatsapp_inbox_dump(limit: int = 50) -> dict:
 async def whatsapp_inbox_clear() -> dict:
     removed = whatsapp_inbox.clear_inbox()
     return {"ok": True, "removed": removed}
+
+
+# --- WhatsApp templates ----------------------------------------------------
+# Five pre-canned message templates the Live Agent fires during a call
+# (e.g. confirm a booking, share the clinic's location). Stored merged
+# with the defaults on every GET; only operator-edited bodies persist to
+# disk so the JSON file stays small + diffable.
+
+class WhatsAppTemplatesIn(BaseModel):
+    # {template_id: {en?: str, ar?: str}} — partial updates allowed.
+    templates: dict
+
+
+@router.get("/whatsapp/templates")
+async def whatsapp_templates_get() -> dict:
+    """Returns the live (defaults + operator overrides) view of every
+    template plus the metadata the SPA renders (name, description,
+    variables)."""
+    resolved = whatsapp_templates.resolved_templates()
+    return {
+        "ok":        True,
+        "order":     list(whatsapp_templates.TEMPLATE_ORDER),
+        "templates": resolved,
+    }
+
+
+@router.post("/whatsapp/templates")
+async def whatsapp_templates_set(payload: WhatsAppTemplatesIn) -> dict:
+    """Persist operator edits. Body shape:
+        { templates: { "<template_id>": { en?: str, ar?: str } } }
+    Returns the merged live view so the SPA can refresh from the
+    response without a follow-up GET."""
+    if not isinstance(payload.templates, dict):
+        raise HTTPException(400, "templates must be an object")
+    whatsapp_templates.save_overrides(payload.templates)
+    return {
+        "ok":        True,
+        "templates": whatsapp_templates.resolved_templates(),
+    }
 
 
 @router.post("/whatsapp/send")

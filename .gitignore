@@ -12,16 +12,19 @@ data/state.json
 
 # Per-vertical demo runtime state. Most of this stays per-machine
 # (recordings have caller PII, snapshot.json has patient PII,
-# escalation.json has the AMI password + Wasender API key). The
-# exceptions are persona.txt and kb.txt — they're content, not state
-# or secrets, written by the SPA's "Apply to Live Agent" button — so
-# they ARE tracked by git, which keeps both machines in sync without
-# anyone having to re-click Apply after a pull. See CLAUDE.md.
+# escalation.json has the AMI password + Wasender API key, inbox.json
+# stores received WhatsApp messages with caller PII). The exceptions
+# are persona.txt, kb.txt, and whatsapp_templates.json — they're
+# content, not state or secrets, written by the SPA's editor pages —
+# so they ARE tracked by git, which keeps both machines in sync
+# without anyone having to re-edit them after a pull. See CLAUDE.md.
 data/demos/*/calls/
 data/demos/*/snapshot.json
 data/demos/*/snapshot.json.tmp
 data/demos/*/escalation.json
 data/demos/*/escalation.json.tmp
+data/demos/*/whatsapp_inbox.json
+data/demos/*/whatsapp_inbox.json.tmp
 
 # AI-Camera runtime — snapshot images + iteration logs accumulate
 # constantly; not source.

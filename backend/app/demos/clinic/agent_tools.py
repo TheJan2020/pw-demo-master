@@ -501,6 +501,51 @@ def build_tools() -> list[types.Tool]:
             ),
         ),
         types.FunctionDeclaration(
+            name="send_whatsapp_template",
+            description=(
+                "Fire one of the pre-configured WhatsApp templates to the "
+                "caller (or to any phone you pass explicitly). Pick "
+                "template_id from this exact list:\n"
+                "  - clinic_location           (share the clinic's address)\n"
+                "  - file_creation             (confirm a brand-new patient file)\n"
+                "  - appointment_creation      (confirm a freshly-booked slot)\n"
+                "  - appointment_reschedule    (confirm a moved slot)\n"
+                "  - appointment_cancellation  (confirm a cancellation)\n"
+                "language is 'en' or 'ar' — pick what the caller has been "
+                "speaking. to_phone is OPTIONAL — leave it unset to use "
+                "the caller's own WhatsApp number from the session. Any "
+                "other named arg is interpolated into the template body "
+                "as a {variable}. Run this AFTER the matching tool that "
+                "produced the data (e.g. send appointment_creation only "
+                "AFTER create_appointment returned its appointment_id), "
+                "and only ONCE per event."
+            ),
+            parameters=types.Schema(
+                type=types.Type.OBJECT,
+                properties={
+                    "template_id": types.Schema(type=types.Type.STRING),
+                    "language":    types.Schema(type=types.Type.STRING,
+                                                description="'en' or 'ar'"),
+                    "to_phone":    types.Schema(type=types.Type.STRING,
+                                                description="Optional — defaults to caller phone."),
+                    "patient_name":      types.Schema(type=types.Type.STRING),
+                    "patient_name_ar":   types.Schema(type=types.Type.STRING),
+                    "file_number":       types.Schema(type=types.Type.STRING),
+                    "appointment_id":    types.Schema(type=types.Type.STRING),
+                    "appointment_date":  types.Schema(type=types.Type.STRING),
+                    "appointment_time":  types.Schema(type=types.Type.STRING),
+                    "previous_date":     types.Schema(type=types.Type.STRING),
+                    "previous_time":     types.Schema(type=types.Type.STRING),
+                    "clinic_name":       types.Schema(type=types.Type.STRING),
+                    "clinic_name_ar":    types.Schema(type=types.Type.STRING),
+                    "clinic_location":   types.Schema(type=types.Type.STRING),
+                    "clinic_location_ar": types.Schema(type=types.Type.STRING),
+                    "maps_link":         types.Schema(type=types.Type.STRING),
+                },
+                required=["template_id", "language"],
+            ),
+        ),
+        types.FunctionDeclaration(
             name="end_call",
             description="Hang up the call. Use after the caller says goodbye and "
                         "you've spoken your closing line.",
@@ -554,6 +599,8 @@ def execute_tool(name: str, args: dict, ctx: dict) -> dict:
                                              args.get("new_time") or "", ctx)
         if name == "flag_for_supervisor":
             return _t_flag_for_supervisor(args, ctx)
+        if name == "send_whatsapp_template":
+            return _t_send_whatsapp_template(args, ctx)
         if name == "end_call":
             return _t_end_call(args.get("reason") or "", ctx)
         return {"error": f"unknown tool: {name}"}
@@ -1133,3 +1180,104 @@ def _t_flag_for_supervisor(args: dict, ctx: dict) -> dict:
     logger.info("clinic call %s: supervisor flag raised (%s) — %s",
                 ctx.get("call_id"), severity, reason)
     return {"ok": True, "reason": reason, "severity": severity}
+
+
+def _t_send_whatsapp_template(args: dict, ctx: dict) -> dict:
+    """Fire a pre-configured WhatsApp template via WasenderApi.
+
+    Pulls the template body from data/demos/clinic/whatsapp_templates.json
+    (operator-editable on the SPA's WhatsApp Templates page) in the
+    requested language, interpolates the named arg dict as {variables},
+    sends the rendered text via the Wasender per-session API key, and
+    broadcasts a `whatsapp_template_sent` mutation event so the
+    Dashboard's activity feed shows what fired.
+    """
+    import httpx as _httpx_sync
+    from .whatsapp_templates import render
+    from .live_agent import load_escalation_config
+    from .wasender import normalize_phone as _wa_norm, WASENDER_BASE_URL
+
+    template_id = (args.get("template_id") or "").strip()
+    language    = (args.get("language") or "ar").strip().lower()
+    if not template_id:
+        return {"error": "template_id is required"}
+
+    # Variables — everything that isn't a control field goes through to
+    # the interpolator.
+    control = {"template_id", "language", "to_phone"}
+    variables = {k: v for k, v in args.items() if k not in control}
+
+    rendered = render(template_id, language, variables)
+    if not rendered.get("ok"):
+        return {"error": rendered.get("error") or "template render failed"}
+    text = rendered["text"]
+
+    # to_phone: explicit arg → ctx caller_phone → error.
+    raw_phone = (args.get("to_phone") or "").strip() or (ctx.get("caller_phone") or "")
+    if not raw_phone:
+        return {"error": "No phone to send to — caller_phone unknown on this "
+                         "call, pass to_phone explicitly."}
+    phone = _wa_norm(raw_phone)
+    if not phone:
+        return {"error": f"Phone {raw_phone!r} could not be parsed."}
+
+    # Read the live API key (operator may have updated it between calls).
+    cfg = load_escalation_config()
+    api_key = str(cfg.get("wasender_api_key") or "").strip()
+    if not api_key:
+        return {"error": "WhatsApp API key not configured on Configuration page."}
+
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type":  "application/json",
+        "Accept":        "application/json",
+    }
+    body = {"to": phone, "messageType": "text", "text": text}
+    try:
+        with _httpx_sync.Client(timeout=10.0) as client:
+            r = client.post(f"{WASENDER_BASE_URL}/send-message",
+                            headers=headers, json=body)
+    except _httpx_sync.RequestError as e:
+        return {"error": f"network: {e}"}
+
+    try:
+        payload = r.json()
+    except Exception:
+        payload = {}
+    if not (200 <= r.status_code < 300):
+        err = (
+            (isinstance(payload, dict) and (
+                payload.get("error") or payload.get("message") or payload.get("detail")
+            ))
+            or f"HTTP {r.status_code}"
+        )
+        return {"error": err}
+
+    message_id = ""
+    if isinstance(payload, dict):
+        data = payload.get("data") or {}
+        if isinstance(data, dict):
+            message_id = str(data.get("message_id") or "")
+
+    # Broadcast so the Dashboard activity feed shows the fire.
+    broadcast = ctx.get("broadcast")
+    if callable(broadcast):
+        broadcast({
+            "type":        "tool_mutation",
+            "call_id":     ctx.get("call_id"),
+            "kind":        "whatsapp_template_sent",
+            "template_id": template_id,
+            "language":    language,
+            "to":          phone,
+            "text":        text,
+            "message_id":  message_id,
+        })
+
+    return {
+        "ok":          True,
+        "template_id": template_id,
+        "language":    language,
+        "to":          phone,
+        "message_id":  message_id,
+        "text":        text,
+    }
