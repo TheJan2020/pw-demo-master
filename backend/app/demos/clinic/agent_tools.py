@@ -582,6 +582,43 @@ def execute_tool(name: str, args: dict, ctx: dict) -> dict:
                     sorted(ctx.get("identified_patient_ids") or []))
     except Exception:
         pass
+    result = _execute_tool_inner(name, args, ctx)
+    # Result log — without this, errors like
+    # "create_appointment: slot falls inside the clinic's break window"
+    # are invisible on the Debug page even though the dispatch is
+    # logged. Same compact-summary treatment as the dispatch line.
+    try:
+        if isinstance(result, dict):
+            if result.get("error"):
+                logger.warning("result %s ERROR: %s", name, result.get("error"))
+            else:
+                # Summarise success — pull only fields useful to a human
+                # debugger. Skip 'text', 'turns', etc that would blow up
+                # the line.
+                summary = {
+                    k: result[k] for k in
+                    ("ok", "patient_id", "file_number",
+                     "appointment_id", "date", "time", "previous",
+                     "count", "is_today", "now", "buffer_minutes",
+                     "to", "message_id", "language", "template_id",
+                     "status", "found", "whatsapp_sent")
+                    if k in result
+                }
+                # Add list-shape hints without dumping the full list.
+                for k in ("clinics", "providers", "appointments"):
+                    if k in result and isinstance(result[k], list):
+                        summary[f"{k}_count"] = len(result[k])
+                logger.info("result %s ok summary=%s", name, summary)
+        else:
+            logger.info("result %s (non-dict): %r", name, result)
+    except Exception:
+        pass
+    return result
+
+
+def _execute_tool_inner(name: str, args: dict, ctx: dict) -> dict:
+    """The original dispatch logic — wrapped by execute_tool so we get
+    consistent before/after logging without duplicating every return."""
     try:
         if name == "lookup_patient_by_phone":
             return _t_lookup_phone(args.get("phone") or "")
