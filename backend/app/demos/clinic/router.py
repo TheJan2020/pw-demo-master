@@ -724,22 +724,39 @@ async def whatsapp_messages(jid: str, limit: int = 300) -> dict:
 
 @router.get("/whatsapp/raw")
 async def whatsapp_raw(limit: int = 5) -> dict:
-    """Return the first `limit` message-log rows VERBATIM from
-    WasenderApi — bypasses our normalisation. Used to diagnose
-    "messages show as [text]" / "I sent a reply and it doesn't appear"
-    issues. The shape Wasender returns varies per plan tier, and the
-    only way to know what field your account uses for the body is to
-    look at the raw row."""
+    """Return up to `limit` message-log rows VERBATIM from WasenderApi —
+    bypasses our normalisation. Used to diagnose "messages show as
+    [text]", "sender shown as LID", "reply doesn't appear" issues —
+    Wasender's payload shape varies by plan tier and the only way to
+    know what your account returns is to look at the raw row.
+
+    Honours the upstream Wasender pagination — pass `limit=500` and
+    we'll bump our internal request to match. Wasender itself may
+    still page-cap (default ~10/page on Laravel paginators); the
+    `raw` property of the inner result echoes whatever wrapper Wasender
+    sent so you can see pagination metadata."""
     cfg = load_escalation_config()
     api_key    = str(cfg.get("wasender_api_key") or "").strip()
     personal   = str(cfg.get("wasender_personal_token") or "").strip()
     session_id = str(cfg.get("wasender_session_id") or "").strip()
     client = build_wasender_client(api_key, personal)
-    result = await client.list_messages(session_id, limit=max(1, min(20, int(limit))))
+    # Bumped from min(20) → min(500) so the operator can see enough
+    # rows to spot the inbound LID row (Wasender's first page is
+    # usually 10 outbound rows for a fresh setup).
+    n = max(1, min(500, int(limit)))
+    result = await client.list_messages(session_id, limit=n)
     if not result.get("ok"):
         return {"ok": False, "error": result.get("error")}
-    items = (result.get("items") or [])[:max(1, min(20, int(limit)))]
-    return {"ok": True, "count": len(items), "items": items}
+    items = (result.get("items") or [])[:n]
+    return {
+        "ok":          True,
+        "count":       len(items),
+        "items":       items,
+        # Pagination metadata: lets the operator see if there are
+        # more pages (last_page, total, next_page_url, etc.) when
+        # Wasender wraps results.
+        "raw_wrapper": result.get("raw"),
+    }
 
 
 # ----- Saved-call History --------------------------------------------------
