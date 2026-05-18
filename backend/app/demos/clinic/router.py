@@ -722,6 +722,47 @@ async def whatsapp_messages(jid: str, limit: int = 300) -> dict:
             "our_digits": our_digits}
 
 
+@router.get("/whatsapp/raw_contacts")
+async def whatsapp_raw_contacts(limit: int = 50) -> dict:
+    """Dump Wasender's raw /contacts response. Diagnostic only — used
+    to figure out which fields are in a contact (jid? phone? lid?
+    push_name?) so we can resolve incoming LIDs to real phone numbers."""
+    import httpx as _hx
+    cfg = load_escalation_config()
+    api_key  = str(cfg.get("wasender_api_key") or "").strip()
+    if not api_key:
+        return {"ok": False, "error": "wasender_api_key not configured"}
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Accept":        "application/json",
+    }
+    try:
+        async with _hx.AsyncClient(timeout=15.0) as client:
+            r = await client.get(
+                "https://www.wasenderapi.com/api/contacts",
+                headers=headers,
+            )
+    except _hx.RequestError as e:
+        return {"ok": False, "error": f"network: {e}"}
+    try:
+        payload = r.json()
+    except Exception:
+        return {"ok": False, "status": r.status_code,
+                "raw_text": r.text[:500]}
+    # Try to slice the actual contact array out for a compact response,
+    # but also echo the wrapper so we can see pagination / count fields.
+    contacts = payload.get("data") if isinstance(payload, dict) else None
+    if not isinstance(contacts, list):
+        contacts = payload if isinstance(payload, list) else []
+    return {
+        "ok":           200 <= r.status_code < 300,
+        "status":       r.status_code,
+        "wrapper_keys": list(payload.keys()) if isinstance(payload, dict) else None,
+        "count":        len(contacts),
+        "items":        contacts[:max(1, min(50, int(limit)))],
+    }
+
+
 @router.get("/whatsapp/raw")
 async def whatsapp_raw(limit: int = 5) -> dict:
     """Return up to `limit` message-log rows VERBATIM from WasenderApi —
