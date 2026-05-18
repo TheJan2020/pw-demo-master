@@ -659,6 +659,15 @@ async def whatsapp_chats(limit: int = 300) -> dict:
     items    = list(outbound) + list(inbound)
     our_digits = _detect_our_phone(items)
 
+    # Patient-name index — used to fold a LID chat into the patient's
+    # phone chat when the LID's push name matches a patient on record.
+    # Same WhatsApp user often appears under two JIDs (phone for our
+    # outbound, LID for their inbound when privacy mode is on); this
+    # stitches them back together.
+    from .agent_tools import load_snapshot as _load_snap
+    patients_for_merge = (_load_snap() or {}).get("patients") or []
+    name_index = whatsapp_contacts.build_patient_name_index(patients_for_merge)
+
     grouped: dict[str, dict] = {}
     for m in items:
         if not isinstance(m, dict):
@@ -666,6 +675,11 @@ async def whatsapp_chats(limit: int = 300) -> dict:
         jid = _msg_jid(m)
         if not jid:
             continue
+        # Fold this row into its canonical JID if we can prove it's
+        # the same person — see whatsapp_contacts.canonical_jid_for.
+        canon = await whatsapp_contacts.canonical_jid_for(jid, name_index)
+        if canon != jid:
+            jid = canon
         ts   = _msg_ts(m)
         text = _msg_text(m)
         rec = grouped.setdefault(jid, {
@@ -730,12 +744,26 @@ async def whatsapp_messages(jid: str, limit: int = 300) -> dict:
     # rows that match this chat) — gives the from/to comparison its
     # best chance of being right.
     our_digits = _detect_our_phone(items)
+
+    # Same LID→phone canonicalisation as /chats — so opening the
+    # merged phone-JID chat pulls in messages that arrived under the
+    # LID. Otherwise the operator clicks "Zeyad Ibrahim" (now the
+    # merged chat under 966591697226@s.whatsapp.net) and only sees
+    # the outbound half because the LID rows still carry the LID jid.
+    from .agent_tools import load_snapshot as _load_snap
+    patients_for_merge = (_load_snap() or {}).get("patients") or []
+    name_index = whatsapp_contacts.build_patient_name_index(patients_for_merge)
+
     rows = []
     for m in items:
         if not isinstance(m, dict):
             continue
         row_jid = _msg_jid(m)
-        if _digits(row_jid) != target_digits and row_jid != jid:
+        # Canonicalise THIS row's JID. If it's a LID that maps to a
+        # phone, treat it as if it had arrived under that phone.
+        canon_row = await whatsapp_contacts.canonical_jid_for(row_jid, name_index)
+        if _digits(canon_row) != target_digits and canon_row != jid and \
+           _digits(row_jid) != target_digits and row_jid != jid:
             continue
         rows.append({
             "id":       m.get("id") or (m.get("key") or {}).get("id"),

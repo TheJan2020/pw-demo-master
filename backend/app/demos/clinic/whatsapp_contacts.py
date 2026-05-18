@@ -165,6 +165,65 @@ async def display_name_for(jid: str | None) -> Optional[str]:
     return None
 
 
+# ----------------------------------------------------------------------
+# LID → phone canonicalisation
+# ----------------------------------------------------------------------
+# A single WhatsApp user can show up in Wasender twice on the same
+# conversation — once as a phone JID (used when WE send a message TO
+# them) and once as a LID (the opaque identifier WhatsApp uses when
+# THEY message us with privacy mode on). The chat list otherwise
+# splits this into two separate rows for the same person.
+#
+# We can stitch them back together when we have enough metadata to
+# prove they're the same: the LID's push name (from /contacts) lines
+# up with a patient's name on file (Arabic or English), AND we know
+# that patient's phone. The patient's phone JID becomes the "canonical"
+# JID; the LID chat is merged into it.
+#
+# Build the name → patient lookup once per request from the snapshot
+# (see _build_name_index below), then pass it to canonical_jid_for()
+# for each candidate JID.
+
+
+def _name_key(s: str | None) -> str:
+    """Normalise a name for case/whitespace-insensitive comparison."""
+    return re.sub(r"\s+", " ", (s or "").strip()).lower()
+
+
+def build_patient_name_index(patients: list[dict]) -> dict[str, str]:
+    """{normalised_name: phone_jid} from the patient registry. Both the
+    English and Arabic spellings index to the same patient's phone."""
+    out: dict[str, str] = {}
+    for p in patients or []:
+        phone_digits = re.sub(r"\D", "", str(p.get("phone") or ""))
+        if not phone_digits:
+            continue
+        phone_jid = f"{phone_digits}{_PHONE_SUFFIX}"
+        for nm in (p.get("name"), p.get("name_ar")):
+            k = _name_key(nm)
+            if k:
+                out[k] = phone_jid
+    return out
+
+
+async def canonical_jid_for(jid: str, name_index: dict[str, str]) -> str:
+    """Return the phone-JID equivalent of this JID if we can prove it
+    belongs to a known patient via the contact's push name; else the
+    JID itself unchanged.
+
+    Only kicks in for LID JIDs — phone JIDs and group JIDs are returned
+    as-is."""
+    if not is_lid_jid(jid):
+        return jid
+    if not name_index:
+        return jid
+    push_name = await display_name_for(jid)
+    if not push_name:
+        return jid
+    canonical = name_index.get(_name_key(push_name))
+    return canonical or jid
+
+
 def cache_stats() -> dict:
     """For diagnostics — exposed via /whatsapp/raw_contacts or similar."""
     return {
