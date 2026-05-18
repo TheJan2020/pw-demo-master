@@ -10,11 +10,18 @@ __pycache__/
 # Project state — contains tokens & API keys, must not be committed
 data/state.json
 
-# Per-vertical demo runtime state — call recordings, patient snapshots,
-# escalation.json (AMI secret + WhatsApp API key). Per-machine, never
-# travels through git. The other machine re-enters credentials via the
-# Configuration page; see TOCOPY.md.
-data/demos/
+# Per-vertical demo runtime state. Most of this stays per-machine
+# (recordings have caller PII, snapshot.json has patient PII,
+# escalation.json has the AMI password + Wasender API key). The
+# exceptions are persona.txt and kb.txt — they're content, not state
+# or secrets, written by the SPA's "Apply to Live Agent" button — so
+# they ARE tracked by git, which keeps both machines in sync without
+# anyone having to re-click Apply after a pull. See CLAUDE.md.
+data/demos/*/calls/
+data/demos/*/snapshot.json
+data/demos/*/snapshot.json.tmp
+data/demos/*/escalation.json
+data/demos/*/escalation.json.tmp
 
 # AI-Camera runtime — snapshot images + iteration logs accumulate
 # constantly; not source.

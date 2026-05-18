@@ -115,6 +115,12 @@ brief for *you*.
 
 - The README is for the user. CLAUDE.md (this file) is for you.
 - `data/state.json` is gitignored — never tell the user to commit it.
+- `data/demos/*/persona.txt` and `data/demos/*/kb.txt` ARE tracked
+  by git (they're content the SPA's "Apply to Live Agent" writes —
+  not secrets, and we want them in sync across machines). Everything
+  else under `data/demos/` stays per-machine: `calls/`, `snapshot.json`,
+  `escalation.json` (which holds the AMI password + Wasender API key).
+  See `.gitignore` for the exact carve-out.
 - Don't run destructive git commands (`reset --hard`, `push --force`, etc.)
   without explicit user authorization for that specific action.
 - Don't introduce a build step. The frontend deliberately ships as static
