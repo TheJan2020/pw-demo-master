@@ -865,11 +865,32 @@ def _t_create_patient(args: dict, ctx: dict) -> dict:
             "patient": record,
         })
 
+    # Auto-fire the file_creation WhatsApp template — used to be the
+    # agent's job (persona step 8) but it forgot too often. Now we
+    # send from the runtime on every successful create_patient.
+    # Pick the first active clinic as a generic display value for
+    # {clinic_name}; the operator can edit the template to remove
+    # the clinic line if they prefer a fully generic body.
+    first_clinic = next(
+        (c for c in (snap.get("clinics") or [])
+         if c.get("active", True)),
+        None,
+    )
+    _auto_send_template("file_creation", ctx, variables={
+        "to_phone":        phone,
+        "patient_name":    name,
+        "patient_name_ar": (args.get("name_ar") or "").strip(),
+        "file_number":     file_number,
+        "clinic_name":     (first_clinic or {}).get("name") or "Primewave Mate Clinics",
+        "clinic_name_ar":  (first_clinic or {}).get("name_ar") or "عيادات برايم ميت",
+    })
+
     return {
         "ok":           True,
         "patient_id":   new_id,
         "file_number":  file_number,
         "name":         name,
+        "whatsapp_sent": True,  # Hint to the agent: don't re-send.
     }
 
 
@@ -975,6 +996,22 @@ def _t_create_appointment(args: dict, ctx: dict) -> dict:
             "appointment": record,
         })
 
+    # Auto-fire appointment_creation WhatsApp template — runtime
+    # guarantees the caller gets a written confirmation even when
+    # the agent forgets to call send_whatsapp_template.
+    _auto_send_template("appointment_creation", ctx, variables={
+        "to_phone":           patient.get("phone") or "",
+        "patient_name":       patient.get("name") or "",
+        "patient_name_ar":    patient.get("name_ar") or "",
+        "appointment_id":     new_id,
+        "appointment_date":   date,
+        "appointment_time":   time_str,
+        "clinic_name":        clinic.get("name") or "",
+        "clinic_name_ar":     clinic.get("name_ar") or "",
+        "clinic_location":    clinic.get("location") or "",
+        "clinic_location_ar": clinic.get("location_ar") or "",
+    })
+
     return {
         "ok":             True,
         "appointment_id": new_id,
@@ -983,6 +1020,7 @@ def _t_create_appointment(args: dict, ctx: dict) -> dict:
         "duration_min":   duration,
         "clinic_name":    clinic.get("name"),
         "patient_name":   patient.get("name"),
+        "whatsapp_sent":  True,
     }
 
 
@@ -1002,6 +1040,33 @@ def _appt_for_agent(a: dict) -> dict:
         "status":          a.get("status"),
         "notes":           a.get("notes"),
     }
+
+
+def _auto_send_template(template_id: str, ctx: dict, variables: dict,
+                         language: Optional[str] = None) -> None:
+    """Fire a WhatsApp template AS A SIDE-EFFECT of a successful mutation
+    tool — the agent doesn't have to remember to call
+    send_whatsapp_template separately. Errors are logged but never
+    raised, so a WhatsApp failure can't roll back the underlying
+    record write. Variables come from the tool's own result, plus we
+    inject a sensible language default ('ar', matching the persona's
+    Arabic-first stance) when the agent hasn't told us otherwise.
+    """
+    args = {
+        "template_id": template_id,
+        "language":    (language or ctx.get("call_language") or "ar"),
+    }
+    args.update({k: v for k, v in variables.items() if v not in (None, "")})
+    try:
+        result = _t_send_whatsapp_template(args, ctx)
+        if isinstance(result, dict) and result.get("error"):
+            logger.info(
+                "auto-send WhatsApp %s skipped: %s",
+                template_id, result.get("error"),
+            )
+    except Exception:
+        logger.exception("auto-send WhatsApp %s crashed (non-fatal)",
+                          template_id)
 
 
 def _owned_by_caller(appointment: dict, ctx: dict) -> bool:
@@ -1086,11 +1151,29 @@ def _t_cancel_appointment(appointment_id: str, reason: str, ctx: dict) -> dict:
             "kind":        "appointment_cancelled",
             "appointment": found,
         })
+
+    # Auto-fire appointment_cancellation WhatsApp template.
+    clinic_id = found.get("department_id")
+    clinic = next((c for c in snap.get("clinics", [])
+                   if c.get("id") == clinic_id), {}) or {}
+    sched = found.get("scheduled_at") or ""
+    _auto_send_template("appointment_cancellation", ctx, variables={
+        "to_phone":        found.get("patient_phone") or "",
+        "patient_name":    found.get("patient_name") or "",
+        "patient_name_ar": found.get("patient_name_ar") or "",
+        "appointment_id":  appointment_id,
+        "appointment_date": sched[:10],
+        "appointment_time": sched[11:16],
+        "clinic_name":     clinic.get("name") or "",
+        "clinic_name_ar":  clinic.get("name_ar") or "",
+    })
+
     return {
         "ok":             True,
         "appointment_id": appointment_id,
         "status":         "cancelled",
         "reason":         reason or None,
+        "whatsapp_sent":  True,
     }
 
 
@@ -1189,6 +1272,23 @@ def _t_reschedule_appointment(appointment_id: str, new_date: str,
             "appointment": target,
             "previous_scheduled_at": old_scheduled,
         })
+
+    # Auto-fire appointment_reschedule WhatsApp template.
+    _auto_send_template("appointment_reschedule", ctx, variables={
+        "to_phone":           target.get("patient_phone") or "",
+        "patient_name":       target.get("patient_name") or "",
+        "patient_name_ar":    target.get("patient_name_ar") or "",
+        "appointment_id":     appointment_id,
+        "previous_date":      (old_scheduled or "")[:10],
+        "previous_time":      (old_scheduled or "")[11:16],
+        "appointment_date":   new_date,
+        "appointment_time":   new_time,
+        "clinic_name":        clinic.get("name") or "",
+        "clinic_name_ar":     clinic.get("name_ar") or "",
+        "clinic_location":    clinic.get("location") or "",
+        "clinic_location_ar": clinic.get("location_ar") or "",
+    })
+
     return {
         "ok":             True,
         "appointment_id": appointment_id,
@@ -1197,6 +1297,7 @@ def _t_reschedule_appointment(appointment_id: str, new_date: str,
         "previous":       old_scheduled,
         "clinic_name":    clinic.get("name"),
         "patient_name":   target.get("patient_name"),
+        "whatsapp_sent":  True,
     }
 
 
