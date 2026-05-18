@@ -1087,21 +1087,34 @@ def _t_create_appointment(args: dict, ctx: dict) -> dict:
     }
 
 
-def _appt_for_agent(a: dict) -> dict:
+def _appt_for_agent(a: dict, clinics_by_id: Optional[dict] = None) -> dict:
     """Trim an appointment record for the agent — keeps the response
-    compact and matches the field names the persona expects."""
+    compact and matches the field names the persona expects.
+
+    Pass `clinics_by_id` so the agent gets the clinic's NAME inline,
+    not just `clinic_id`. Without the name, the agent has to
+    cross-reference the system instruction's roster block to figure
+    out what "DEP-003" actually is, and that's where it occasionally
+    picks the wrong clinic. When name is right next to the time in
+    the same response, drift is much less likely.
+    """
+    clinic = (clinics_by_id or {}).get(a.get("department_id")) or {}
     return {
-        "appointment_id":  a.get("id"),
-        "patient_id":      a.get("patient_id"),
-        "patient_name":    a.get("patient_name"),
-        "patient_name_ar": a.get("patient_name_ar"),
-        "clinic_id":       a.get("department_id"),
-        "scheduled_at":    a.get("scheduled_at"),
-        "date":            (a.get("scheduled_at") or "")[:10],
-        "time":            (a.get("scheduled_at") or "")[11:16],
-        "duration_min":    a.get("duration_min"),
-        "status":          a.get("status"),
-        "notes":           a.get("notes"),
+        "appointment_id":   a.get("id"),
+        "patient_id":       a.get("patient_id"),
+        "patient_name":     a.get("patient_name"),
+        "patient_name_ar":  a.get("patient_name_ar"),
+        "clinic_id":        a.get("department_id"),
+        "clinic_name":      clinic.get("name"),
+        "clinic_name_ar":   clinic.get("name_ar"),
+        "clinic_location":  clinic.get("location"),
+        "clinic_location_ar": clinic.get("location_ar"),
+        "scheduled_at":     a.get("scheduled_at"),
+        "date":             (a.get("scheduled_at") or "")[:10],
+        "time":             (a.get("scheduled_at") or "")[11:16],
+        "duration_min":     a.get("duration_min"),
+        "status":           a.get("status"),
+        "notes":            a.get("notes"),
     }
 
 
@@ -1172,6 +1185,10 @@ def _t_list_patient_appointments(patient_id: str, include_past: bool,
                              f"may be queried."}
     snap = load_snapshot()
     appts = snap.get("appointments", [])
+    # Lookup table by id so each appointment row can carry its
+    # clinic's name inline (otherwise the agent gets "clinic_id:
+    # DEP-003" and has to cross-reference, occasionally wrong).
+    clinics_by_id = {c.get("id"): c for c in (snap.get("clinics") or [])}
     today_ymd = datetime.now().strftime("%Y-%m-%d")
     rows = [a for a in appts if a.get("patient_id") == patient_id]
     if not include_past:
@@ -1183,7 +1200,7 @@ def _t_list_patient_appointments(patient_id: str, include_past: bool,
     rows.sort(key=lambda a: a.get("scheduled_at") or "")
     return {
         "count":        len(rows),
-        "appointments": [_appt_for_agent(a) for a in rows],
+        "appointments": [_appt_for_agent(a, clinics_by_id) for a in rows],
     }
 
 
