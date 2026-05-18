@@ -247,13 +247,18 @@ async def whatsapp_status() -> dict:
     without sending a real message. Returns:
       {configured: bool, ok: bool, status: int, error?: str, contact_count?: int}
     """
-    api_key = str(load_escalation_config().get("wasender_api_key") or "").strip()
+    cfg = load_escalation_config()
+    api_key  = str(cfg.get("wasender_api_key") or "").strip()
+    personal = str(cfg.get("wasender_personal_token") or "").strip()
     if not api_key:
         return {"configured": False, "ok": False, "status": 0,
                 "error": "WhatsApp API key not configured"}
-    client = build_wasender_client(api_key)
+    client = build_wasender_client(api_key, personal)
     result = await client.ping()
-    return {"configured": True, **result}
+    # Expose the PAT-availability flag so the SPA can grey out the
+    # inbox tab with a useful hint instead of just showing the raw
+    # Wasender error.
+    return {"configured": True, "personal_token_configured": bool(personal), **result}
 
 
 @router.post("/whatsapp/send")
@@ -266,8 +271,10 @@ async def whatsapp_send(payload: WhatsAppSendIn) -> dict:
         raise HTTPException(400, "text is required")
     if not (payload.to or "").strip():
         raise HTTPException(400, "to is required")
-    api_key = str(load_escalation_config().get("wasender_api_key") or "").strip()
-    client = build_wasender_client(api_key)
+    cfg = load_escalation_config()
+    api_key  = str(cfg.get("wasender_api_key") or "").strip()
+    personal = str(cfg.get("wasender_personal_token") or "").strip()
+    client = build_wasender_client(api_key, personal)
     return await client.send_text(payload.to, payload.text)
 
 
@@ -378,8 +385,9 @@ async def whatsapp_chats(limit: int = 300) -> dict:
     """
     cfg = load_escalation_config()
     api_key    = str(cfg.get("wasender_api_key") or "").strip()
+    personal   = str(cfg.get("wasender_personal_token") or "").strip()
     session_id = str(cfg.get("wasender_session_id") or "").strip()
-    client = build_wasender_client(api_key)
+    client = build_wasender_client(api_key, personal)
     result = await client.list_messages(session_id, limit=limit)
     if not result.get("ok"):
         return {"ok": False, "chats": [], "error": result.get("error")}
@@ -420,8 +428,9 @@ async def whatsapp_messages(jid: str, limit: int = 300) -> dict:
         raise HTTPException(400, "jid is required")
     cfg = load_escalation_config()
     api_key    = str(cfg.get("wasender_api_key") or "").strip()
+    personal   = str(cfg.get("wasender_personal_token") or "").strip()
     session_id = str(cfg.get("wasender_session_id") or "").strip()
-    client = build_wasender_client(api_key)
+    client = build_wasender_client(api_key, personal)
     result = await client.list_messages(session_id, limit=limit)
     if not result.get("ok"):
         return {"ok": False, "messages": [], "error": result.get("error")}

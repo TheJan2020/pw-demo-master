@@ -37,10 +37,32 @@ _DIGITS = re.compile(r"\D+")
 
 @dataclass
 class WasenderCredentials:
-    api_key: str
+    """Two Bearer tokens — Wasender splits auth by endpoint scope.
 
-    def is_complete(self) -> bool:
+    api_key:           per-session token (Settings → WhatsApp Sessions →
+                       your paired number → "API Key"). Authorises
+                       POST /send-message and GET /contacts.
+
+    personal_token:    account-level Personal Access Token (Settings →
+                       Personal Access Tokens). Required for everything
+                       under /whatsapp-sessions/{id}/* — message logs,
+                       session metadata, etc. Without it those endpoints
+                       return "This endpoint requires a valid personal
+                       access token."
+
+    A demo can leave personal_token empty and still send messages; the
+    inbox simply won't populate.
+    """
+    api_key:        str
+    personal_token: str = ""
+
+    def can_send(self) -> bool:
         return bool(self.api_key)
+
+    def can_read_inbox(self) -> bool:
+        # Try PAT first, fall back to api_key — some Wasender plans
+        # accept the session key for message-logs too.
+        return bool(self.personal_token) or bool(self.api_key)
 
 
 def normalize_phone(s: str) -> str:
@@ -74,9 +96,20 @@ class WasenderClient:
         self.creds = creds
         self.timeout = timeout_s
 
-    def _headers(self) -> dict[str, str]:
+    def _headers(self, *, prefer: str = "api_key") -> dict[str, str]:
+        """Pick the right Bearer token for the endpoint.
+
+        prefer="api_key"  → per-session key first, PAT as fallback. Use
+                            for /send-message, /contacts.
+        prefer="personal" → PAT first, per-session key as fallback. Use
+                            for /whatsapp-sessions/{id}/* endpoints.
+        """
+        if prefer == "personal":
+            token = self.creds.personal_token or self.creds.api_key
+        else:
+            token = self.creds.api_key or self.creds.personal_token
         return {
-            "Authorization": f"Bearer {self.creds.api_key}",
+            "Authorization": f"Bearer {token}",
             "Content-Type":  "application/json",
             "Accept":        "application/json",
         }
@@ -85,7 +118,7 @@ class WasenderClient:
         """Returns a normalised result dict:
             {ok: bool, message_id: str?, status: int, error: str?, raw: dict}
         Never raises — UI shows the error in-band."""
-        if not self.creds.is_complete():
+        if not self.creds.can_send():
             return {"ok": False, "status": 0, "error": "WhatsApp API key not configured"}
         phone = normalize_phone(to)
         if not phone:
@@ -95,7 +128,7 @@ class WasenderClient:
             async with httpx.AsyncClient(timeout=self.timeout) as client:
                 r = await client.post(
                     f"{WASENDER_BASE_URL}/send-message",
-                    headers=self._headers(),
+                    headers=self._headers(prefer="api_key"),
                     json=body,
                 )
         except httpx.RequestError as e:
@@ -140,8 +173,9 @@ class WasenderClient:
         the API; the SPA + the chats endpoint do the normalisation since
         the response shape varies a bit by plan tier.
         """
-        if not self.creds.is_complete():
-            return {"ok": False, "items": [], "error": "API key not configured"}
+        if not self.creds.can_read_inbox():
+            return {"ok": False, "items": [],
+                    "error": "Neither API key nor Personal Access Token configured"}
         if not session_id:
             return {"ok": False, "items": [],
                     "error": "WhatsApp session ID not configured"}
@@ -150,7 +184,7 @@ class WasenderClient:
             async with httpx.AsyncClient(timeout=self.timeout) as client:
                 r = await client.get(
                     f"{WASENDER_BASE_URL}/whatsapp-sessions/{session_id}/message-logs",
-                    headers=self._headers(),
+                    headers=self._headers(prefer="personal"),
                     params=params,
                 )
         except httpx.RequestError as e:
@@ -188,13 +222,13 @@ class WasenderClient:
         Returns {ok, status, contact_count?, error?}. Used by the SPA's
         status pill so the operator knows whether the key is good
         without having to send a real message."""
-        if not self.creds.is_complete():
+        if not self.creds.can_send():
             return {"ok": False, "status": 0, "error": "API key not configured"}
         try:
             async with httpx.AsyncClient(timeout=self.timeout) as client:
                 r = await client.get(
                     f"{WASENDER_BASE_URL}/contacts",
-                    headers=self._headers(),
+                    headers=self._headers(prefer="api_key"),
                 )
         except httpx.RequestError as e:
             return {"ok": False, "status": 0, "error": f"network: {e}"}
@@ -212,5 +246,9 @@ class WasenderClient:
         return {"ok": False, "status": r.status_code, "error": err}
 
 
-def build_client(api_key: Optional[str]) -> WasenderClient:
-    return WasenderClient(WasenderCredentials(api_key=(api_key or "").strip()))
+def build_client(api_key: Optional[str],
+                 personal_token: Optional[str] = None) -> WasenderClient:
+    return WasenderClient(WasenderCredentials(
+        api_key=(api_key or "").strip(),
+        personal_token=(personal_token or "").strip(),
+    ))

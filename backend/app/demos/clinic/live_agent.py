@@ -388,15 +388,25 @@ DEFAULT_ESCALATION = {
     "ami_port":                 5038,
     "ami_username":             "",
     "ami_secret":               "",
-    # WhatsApp via WasenderApi (https://wasenderapi.com). Per-session
-    # API key — the WhatsApp number is paired once on the WasenderApi
-    # dashboard, after which this key authorises send-message calls.
-    # `wasender_session_id` is needed for the inbox view (message-logs
-    # endpoint takes a session id in its path). Find it on the
-    # WasenderApi dashboard under your paired WhatsApp number; sending
-    # works without it, the inbox does not.
+    # WhatsApp via WasenderApi (https://wasenderapi.com). Three knobs,
+    # because Wasender splits auth between two scopes:
+    #   wasender_api_key  — per-session key. Authorises POST /send-message
+    #                       and GET /contacts for the paired number.
+    #   wasender_personal_token — account-level Personal Access Token
+    #                       from Settings → Personal Access Tokens.
+    #                       REQUIRED for /whatsapp-sessions/{id}/...
+    #                       (message logs, single-session metadata).
+    #                       Without it the WhatsApp inbox returns:
+    #                       "This endpoint requires a valid personal
+    #                       access token."
+    #   wasender_session_id — UUID of the paired session, used to scope
+    #                       message-log reads. Find it next to the
+    #                       paired number on the WasenderApi dashboard.
+    # Sending works on just the api_key + a phone number (no session id
+    # needed); the inbox needs all three.
     # See backend/app/demos/clinic/wasender.py for the wrapper.
     "wasender_api_key":         "",
+    "wasender_personal_token":  "",
     "wasender_session_id":      "",
     # Tunables for the backend's auto-detection passes — kept here so the
     # whole escalation config is editable from a single page.
